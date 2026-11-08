@@ -1,5 +1,5 @@
 Name:           zimbra-spam-monitor
-Version:        1.1.1
+Version:        1.1.2
 Release:        1
 Summary:        Zimbra Outbound Email Spam Monitor & Alert System (Telegram + Email)
 License:        MIT
@@ -33,7 +33,7 @@ mkdir -p /var/lib/zimbra-spam-monitor
 touch /var/log/zimbra-spam-monitor.log
 chmod 0640 /var/log/zimbra-spam-monitor.log
 echo "======================================================================"
-echo " [OK] Installed successfully: zimbra-spam-monitor v1.1.0"
+echo " [OK] Installed successfully: zimbra-spam-monitor v1.1.2"
 echo " -> Run the command below to open the Interactive Control Panel:"
 echo "      zimbra-spam-monitor"
 echo "======================================================================"

@@ -41,14 +41,15 @@ ascii_files = [
     root / "packaging" / "cron.d" / "zimbra-spam-monitor",
     root / "packaging" / "logrotate.d" / "zimbra-spam-monitor",
     root / "packaging" / "zimbra-spam-monitor.spec",
+    root / "README.md",
 ]
 for f in ascii_files:
     raw = f.read_bytes()
     non_ascii = [b for b in raw if b > 127]
     assert not non_ascii, f"Non-ASCII bytes found in {f}"
 
-deb_path = root / "zimbra-spam-monitor_1.1.1-1_all.deb"
-rpm_path = root / "zimbra-spam-monitor-1.1.1-1.noarch.rpm"
+deb_path = root / "zimbra-spam-monitor_1.1.2-1_all.deb"
+rpm_path = root / "zimbra-spam-monitor-1.1.2-1.noarch.rpm"
 
 assert deb_path.exists() and deb_path.stat().st_size > 5000, "Missing or empty .deb"
 assert rpm_path.exists() and rpm_path.stat().st_size > 5000, "Missing or empty .rpm"
@@ -218,12 +219,20 @@ echo " -> [PASS] Whitelist bypassed marketing@company.com properly."
 grep -q "hacked_user@company.com" "$FAKE_MAIL_OUT"
 grep -q "warn_user@company.com" "$FAKE_MAIL_OUT"
 grep -q "203.0.113.99" "$FAKE_MAIL_OUT"
+grep -q "ACCOUNT SPAM VOLUME" "$FAKE_MAIL_OUT"
+grep -q "Total Spam    : 210 emails" "$FAKE_MAIL_OUT"
+grep -q "Sent: 0 | Deferred: 210 | Bounced: 0" "$FAKE_MAIL_OUT"
 grep -q "SYSTEM TOTAL TRAFFIC" "$FAKE_MAIL_OUT"
+grep -q "Total Traffic : 555 emails" "$FAKE_MAIL_OUT"
 grep -q "Sent: 345 | Deferred: 210 | Bounced: 0" "$FAKE_MAIL_OUT"
 grep -q "REMAINING MAIL QUEUE" "$FAKE_MAIL_OUT"
 grep -q "Spam Time" "$FAKE_MAIL_OUT"
 if grep -q "Automated Action" "$FAKE_MAIL_OUT" || grep -q "Target Domains" "$FAKE_MAIL_OUT"; then
     echo " -> [FAIL] Removed fields still present in alert!"
+    exit 1
+fi
+if grep -q "Last 10 mins" "$FAKE_MAIL_OUT" || grep -q "System (10m)" "$FAKE_MAIL_OUT"; then
+    echo " -> [FAIL] Legacy 10m/60m rows still present in alert!"
     exit 1
 fi
 grep -q "hacked_user@company.com" "$FAKE_TG_OUT"

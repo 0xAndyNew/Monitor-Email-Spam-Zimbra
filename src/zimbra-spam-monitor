@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # ==============================================================================
 # ZIMBRA OUTBOUND SPAM MONITOR & ALERT SYSTEM (zimbra-spam-monitor)
-# Version: 1.1.0
+# Version: 1.1.2
 # Supported OS: RHEL / CentOS / Rocky / AlmaLinux (.rpm) & Ubuntu / Debian (.deb)
 #
 # Features:
@@ -14,7 +14,7 @@
 
 set -u
 
-VERSION="1.1.1"
+VERSION="1.1.2"
 DEFAULT_CONFIG_FILE="/etc/zimbra-spam-monitor/config.conf"
 CONFIG_FILE="${ZSM_CONFIG_FILE:-$DEFAULT_CONFIG_FILE}"
 CRON_FILE="${ZSM_CRON_FILE:-/etc/cron.d/zimbra-spam-monitor}"
@@ -24,7 +24,7 @@ CRON_FILE="${ZSM_CRON_FILE:-/etc/cron.d/zimbra-spam-monitor}"
 # ==============================================================================
 MONITOR_ENABLED="true"
 ZIMBRA_LOG_FILE="/var/log/zimbra.log"
-LOG_TAIL_LINES=100000
+LOG_TAIL_LINES=200000
 COUNT_INTERNAL_TO_INTERNAL="false"
 INTERNAL_DOMAINS="auto"
 
@@ -617,7 +617,7 @@ analyze_zimbra_log() {
     local sys_sum_file="${2:-}"
     : > "$out_file"
     if [[ -n "$sys_sum_file" ]]; then
-        echo "0|0|0|0|0|0|0|0" > "$sys_sum_file"
+        echo "0|0|0|0" > "$sys_sum_file"
     fi
 
     if [[ ! -f "$ZIMBRA_LOG_FILE" ]]; then
@@ -640,8 +640,7 @@ analyze_zimbra_log() {
     BEGIN {
         win_cutoff = now_epoch - (win_mins * 60)
         hour_cutoff = now_epoch - 3600
-        sys_wt = 0; sys_ws = 0; sys_wd = 0; sys_wb = 0
-        sys_ht = 0; sys_hs = 0; sys_hd = 0; sys_hb = 0
+        sys_tot = 0; sys_snt = 0; sys_def = 0; sys_bnc = 0
 
         split("Jan Feb Mar Apr May Jun Jul Aug Sep Oct Nov Dec", mnames, " ")
         for (i = 1; i <= 12; i++) {
@@ -693,7 +692,6 @@ analyze_zimbra_log() {
         if (index($0, "postfix/") == 0) next
 
         ts = parse_epoch($0)
-        if (ts > 0 && ts < hour_cutoff) next
 
         if (index($0, "sasl_username=") > 0) {
             qid = ""
@@ -767,17 +765,18 @@ analyze_zimbra_log() {
                 st = substr($0, RSTART + 7, RLENGTH - 7)
             }
 
+            # Current cumulative totals up to alert time
             all_senders[sender] = 1
-            hour_total[sender]++
-            sys_ht++
-            if (st == "sent") { hour_sent[sender]++; sys_hs++ }
-            else if (st == "deferred") { hour_def[sender]++; sys_hd++ }
-            else if (st == "bounced") { hour_bnc[sender]++; sys_hb++ }
+            cur_total[sender]++
+            sys_tot++
+            if (st == "sent") { cur_sent[sender]++; sys_snt++ }
+            else if (st == "deferred") { cur_def[sender]++; sys_def++ }
+            else if (st == "bounced") { cur_bnc[sender]++; sys_bnc++ }
 
             ev_hms = (line_hms != "" ? line_hms : q_hms[qid])
             if (ev_hms != "") {
-                if (!(sender in hr_first_hms)) hr_first_hms[sender] = ev_hms
-                hr_last_hms[sender] = ev_hms
+                if (!(sender in cur_first_hms)) cur_first_hms[sender] = ev_hms
+                cur_last_hms[sender] = ev_hms
             }
 
             if ((qid in q_ip) && q_ip[qid] != "") {
@@ -788,13 +787,12 @@ analyze_zimbra_log() {
                 }
             }
 
+            # Rate-detection windows (used to trigger active alerts)
+            if (ts >= hour_cutoff) {
+                hour_total[sender]++
+            }
             if (ts >= win_cutoff) {
                 win_total[sender]++
-                sys_wt++
-                if (st == "sent") { win_sent[sender]++; sys_ws++ }
-                else if (st == "deferred") { win_def[sender]++; sys_wd++ }
-                else if (st == "bounced") { win_bnc[sender]++; sys_wb++ }
-
                 if (ev_hms != "") {
                     if (!(sender in win_first_hms)) win_first_hms[sender] = ev_hms
                     win_last_hms[sender] = ev_hms
@@ -804,28 +802,24 @@ analyze_zimbra_log() {
     }
     END {
         if (sys_file != "") {
-            printf "%d|%d|%d|%d|%d|%d|%d|%d\n", sys_wt, sys_ws, sys_wd, sys_wb, sys_ht, sys_hs, sys_hd, sys_hb > sys_file
+            printf "%d|%d|%d|%d\n", sys_tot, sys_snt, sys_def, sys_bnc > sys_file
         }
         for (s in all_senders) {
+            ct = cur_total[s] + 0
+            cs = cur_sent[s] + 0
+            cd = cur_def[s] + 0
+            cb = cur_bnc[s] + 0
             wt = win_total[s] + 0
-            ws = win_sent[s] + 0
-            wd = win_def[s] + 0
-            wb = win_bnc[s] + 0
             ht = hour_total[s] + 0
-            hs = hour_sent[s] + 0
-            hd = hour_def[s] + 0
-            hb = hour_bnc[s] + 0
             ips = (sender_ips[s] != "" ? sender_ips[s] : "local/webmail")
             tspan = "-"
-            if (s in win_first_hms) {
-                tspan = win_first_hms[s] " -> " win_last_hms[s]
-            } else if (s in hr_first_hms) {
-                tspan = hr_first_hms[s] " -> " hr_last_hms[s]
+            if (s in cur_first_hms) {
+                tspan = cur_first_hms[s] " -> " cur_last_hms[s]
             }
-            printf "%s|%d|%d|%d|%d|%d|%d|%d|%d|%s|%s\n", s, wt, ws, wd, wb, ht, hs, hd, hb, ips, tspan
+            printf "%s|%d|%d|%d|%d|%d|%d|%s|%s\n", s, ct, cs, cd, cb, wt, ht, ips, tspan
         }
     }
-    ' | sort -t'|' -k2,2nr -k6,6nr > "$out_file"
+    ' | sort -t'|' -k6,6nr -k2,2nr > "$out_file"
 }
 
 analyze_postfix_queue() {
@@ -913,9 +907,9 @@ run_monitor_cycle() {
     analyze_zimbra_log "$tmp_log_stats" "$tmp_sys_sum"
     analyze_postfix_queue "$tmp_q_stats" "$tmp_q_sum"
 
-    local sys_summary sys_wt sys_ws sys_wd sys_wb sys_ht sys_hs sys_hd sys_hb
-    sys_summary=$(cat "$tmp_sys_sum" 2>/dev/null || echo "0|0|0|0|0|0|0|0")
-    IFS='|' read -r sys_wt sys_ws sys_wd sys_wb sys_ht sys_hs sys_hd sys_hb <<< "$sys_summary"
+    local sys_summary sys_tot sys_snt sys_def sys_bnc
+    sys_summary=$(cat "$tmp_sys_sum" 2>/dev/null || echo "0|0|0|0")
+    IFS='|' read -r sys_tot sys_snt sys_def sys_bnc <<< "$sys_summary"
 
     local q_summary total_queue active_queue def_queue hold_queue
     q_summary=$(cat "$tmp_q_sum" 2>/dev/null || echo "0|0|0|0")
@@ -926,9 +920,9 @@ run_monitor_cycle() {
         s = $1
         if (s == "") next
         users[s] = 1
-        wt[s] = $2; ws[s] = $3; wd[s] = $4; wb[s] = $5
-        ht[s] = $6; hs[s] = $7; hd[s] = $8; hb[s] = $9
-        ips[s] = $10; tspan[s] = $11
+        ct[s] = $2; cs[s] = $3; cd[s] = $4; cb[s] = $5
+        wt[s] = $6; ht[s] = $7
+        ips[s] = $8; tspan[s] = $9
         next
     }
     {
@@ -939,16 +933,16 @@ run_monitor_cycle() {
     }
     END {
         for (u in users) {
-            printf "%s|%d|%d|%d|%d|%d|%d|%d|%d|%d|%s|%s\n",
+            printf "%s|%d|%d|%d|%d|%d|%d|%d|%s|%s\n",
                 u,
-                wt[u]+0, ws[u]+0, wd[u]+0, wb[u]+0,
-                ht[u]+0, hs[u]+0, hd[u]+0, hb[u]+0,
+                ct[u]+0, cs[u]+0, cd[u]+0, cb[u]+0,
+                wt[u]+0, ht[u]+0,
                 qc[u]+0,
                 (ips[u] != "" ? ips[u] : "queued/unknown"),
                 (tspan[u] != "" ? tspan[u] : "-")
         }
     }
-    ' "$tmp_log_stats" "$tmp_q_stats" | sort -t'|' -k2,2nr -k10,10nr > "$tmp_merged"
+    ' "$tmp_log_stats" "$tmp_q_stats" | sort -t'|' -k6,6nr -k8,8nr > "$tmp_merged"
 
     local srv_host srv_ip now_epoch now_str now_date
     srv_host=$(get_server_hostname)
@@ -958,7 +952,7 @@ run_monitor_cycle() {
     now_date=$(date -d "@$now_epoch" '+%Y-%m-%d' 2>/dev/null || date '+%Y-%m-%d')
     local alerts_triggered=0
 
-    while IFS='|' read -r sender win_tot win_snt win_def win_bnc hr_tot hr_snt hr_def hr_bnc q_cnt s_ips s_tspan; do
+    while IFS='|' read -r sender cur_tot cur_snt cur_def cur_bnc win_tot hr_tot q_cnt s_ips s_tspan; do
         [[ -z "$sender" ]] && continue
 
         if is_whitelisted "$sender"; then
@@ -1008,22 +1002,21 @@ run_monitor_cycle() {
             spam_time_str="${now_date} (${s_tspan})"
         fi
 
-        log_msg "$severity" "Outbound spam detected: user=$sender | time=${spam_time_str} | ${LOOKBACK_MINUTES}m=${win_tot} | 60m=${hr_tot} | queue=${q_cnt} | action=${action_taken}"
+        log_msg "$severity" "Outbound spam detected: user=$sender | time=${spam_time_str} | total=${cur_tot} | queue=${q_cnt} | action=${action_taken}"
 
         local tg_msg
         tg_msg=$(cat <<EOF
 <b>[ZIMBRA SPAM ${severity}]</b>
 <code>==============================</code>
 <b>Server       :</b> <code>$(html_escape "$srv_host")</code> (${srv_ip})
+<b>Alert Time   :</b> ${now_str}
 <b>Spam Time    :</b> $(html_escape "$spam_time_str")
 <b>Spam Account :</b> <code>$(html_escape "$sender")</code>
 <b>Source IPs   :</b> <code>$(html_escape "$s_ips")</code>
 
 <b>[1] ACCOUNT SPAM VOLUME</b>
-<b>Last ${LOOKBACK_MINUTES} mins :</b> <b>${win_tot}</b> emails
-  <code>Sent: ${win_snt} | Deferred: ${win_def} | Bounced: ${win_bnc}</code>
-<b>Last 60 mins :</b> <b>${hr_tot}</b> emails
-  <code>Sent: ${hr_snt} | Deferred: ${hr_def} | Bounced: ${hr_bnc}</code>
+<b>Total Spam   :</b> <b>${cur_tot}</b> emails
+  <code>Sent: ${cur_snt} | Deferred: ${cur_def} | Bounced: ${cur_bnc}</code>
 
 <b>[2] REMAINING MAIL QUEUE</b>
 <b>Account Queue:</b> <b>${q_cnt}</b> emails
@@ -1031,15 +1024,13 @@ run_monitor_cycle() {
   <code>Active: ${active_queue} | Deferred: ${def_queue} | Hold: ${hold_queue}</code>
 
 <b>[3] SYSTEM TOTAL TRAFFIC</b>
-<b>System (${LOOKBACK_MINUTES}m) :</b> <b>${sys_wt}</b> emails
-  <code>Sent: ${sys_ws} | Deferred: ${sys_wd} | Bounced: ${sys_wb}</code>
-<b>System (60m) :</b> <b>${sys_ht}</b> emails
-  <code>Sent: ${sys_hs} | Deferred: ${sys_hd} | Bounced: ${sys_hb}</code>
+<b>Total Traffic:</b> <b>${sys_tot}</b> emails
+  <code>Sent: ${sys_snt} | Deferred: ${sys_def} | Bounced: ${sys_bnc}</code>
 <code>==============================</code>
 EOF
 )
 
-        local mail_subj="[Zimbra Spam ${severity}] ${sender} (${win_tot} emails / ${LOOKBACK_MINUTES}m) on ${srv_host}"
+        local mail_subj="[Zimbra Spam ${severity}] ${sender} (${cur_tot} emails) on ${srv_host}"
         local mail_body
         mail_body=$(cat <<EOF
 ============================================================
@@ -1054,11 +1045,8 @@ Source IPs    : ${s_ips}
 ------------------------------------------------------------
 [1] ACCOUNT SPAM VOLUME
 ------------------------------------------------------------
-Last ${LOOKBACK_MINUTES} mins  : ${win_tot} emails
-                Sent: ${win_snt} | Deferred: ${win_def} | Bounced: ${win_bnc}
-
-Last 60 mins  : ${hr_tot} emails
-                Sent: ${hr_snt} | Deferred: ${hr_def} | Bounced: ${hr_bnc}
+Total Spam    : ${cur_tot} emails
+                Sent: ${cur_snt} | Deferred: ${cur_def} | Bounced: ${cur_bnc}
 
 ------------------------------------------------------------
 [2] REMAINING MAIL QUEUE
@@ -1070,11 +1058,8 @@ System Queue  : ${total_queue} emails
 ------------------------------------------------------------
 [3] SYSTEM TOTAL TRAFFIC
 ------------------------------------------------------------
-System (${LOOKBACK_MINUTES}m)  : ${sys_wt} emails
-                Sent: ${sys_ws} | Deferred: ${sys_wd} | Bounced: ${sys_wb}
-
-System (60m)  : ${sys_ht} emails
-                Sent: ${sys_hs} | Deferred: ${sys_hd} | Bounced: ${sys_hb}
+Total Traffic : ${sys_tot} emails
+                Sent: ${sys_snt} | Deferred: ${sys_def} | Bounced: ${sys_bnc}
 ============================================================
 EOF
 )
@@ -1099,10 +1084,8 @@ EOF
   <code>Active: ${active_queue} | Deferred: ${def_queue} | Hold: ${hold_queue}</code>
 
 <b>[2] SYSTEM TOTAL TRAFFIC</b>
-<b>System (${LOOKBACK_MINUTES}m) :</b> <b>${sys_wt}</b> emails
-  <code>Sent: ${sys_ws} | Deferred: ${sys_wd} | Bounced: ${sys_wb}</code>
-<b>System (60m) :</b> <b>${sys_ht}</b> emails
-  <code>Sent: ${sys_hs} | Deferred: ${sys_hd} | Bounced: ${sys_hb}</code>
+<b>Total Traffic:</b> <b>${sys_tot}</b> emails
+  <code>Sent: ${sys_snt} | Deferred: ${sys_def} | Bounced: ${sys_bnc}</code>
 <code>==============================</code>
 EOF
 )
@@ -1123,11 +1106,8 @@ System Queue  : ${total_queue} emails (Limit: ${WARN_TOTAL_QUEUE})
 ------------------------------------------------------------
 [2] SYSTEM TOTAL TRAFFIC
 ------------------------------------------------------------
-System (${LOOKBACK_MINUTES}m)  : ${sys_wt} emails
-                Sent: ${sys_ws} | Deferred: ${sys_wd} | Bounced: ${sys_wb}
-
-System (60m)  : ${sys_ht} emails
-                Sent: ${sys_hs} | Deferred: ${sys_hd} | Bounced: ${sys_hb}
+Total Traffic : ${sys_tot} emails
+                Sent: ${sys_snt} | Deferred: ${sys_def} | Bounced: ${sys_bnc}
 ============================================================
 EOF
 )
@@ -1157,9 +1137,9 @@ show_status() {
     analyze_zimbra_log "$tmp_log_stats" "$tmp_sys_sum"
     analyze_postfix_queue "$tmp_q_stats" "$tmp_q_sum"
 
-    local sys_summary sys_wt sys_ws sys_wd sys_wb sys_ht sys_hs sys_hd sys_hb
-    sys_summary=$(cat "$tmp_sys_sum" 2>/dev/null || echo "0|0|0|0|0|0|0|0")
-    IFS='|' read -r sys_wt sys_ws sys_wd sys_wb sys_ht sys_hs sys_hd sys_hb <<< "$sys_summary"
+    local sys_summary sys_tot sys_snt sys_def sys_bnc
+    sys_summary=$(cat "$tmp_sys_sum" 2>/dev/null || echo "0|0|0|0")
+    IFS='|' read -r sys_tot sys_snt sys_def sys_bnc <<< "$sys_summary"
 
     local q_summary total_queue active_queue def_queue hold_queue
     q_summary=$(cat "$tmp_q_sum" 2>/dev/null || echo "0|0|0|0")
@@ -1174,22 +1154,22 @@ show_status() {
     echo " ${LOOKBACK_MINUTES}-Min Threshold   : Warning >= ${WARN_SENT_PER_WINDOW} | Critical >= ${CRIT_SENT_PER_WINDOW} emails"
     echo " 60-Min Threshold   : Warning >= ${WARN_SENT_PER_HOUR} | Critical >= ${CRIT_SENT_PER_HOUR} emails"
     echo " Queue/User Limit   : Warning >= ${WARN_QUEUE_PER_USER} | Critical >= ${CRIT_QUEUE_PER_USER} emails"
+    echo " Alert Cooldown     : Every ${ALERT_COOLDOWN_MINUTES} mins while spam/queue persists"
     echo " Alert Email To     : ${RESOLVED_EMAIL_TO} (Mode: ${EMAIL_DELIVERY_MODE})"
     echo "------------------------------------------------------------------------------"
-    echo " SYSTEM TOTAL TRAFFIC:"
-    echo "   + Last ${LOOKBACK_MINUTES} mins : ${sys_wt} emails (Sent: ${sys_ws} | Deferred: ${sys_wd} | Bounced: ${sys_wb})"
-    echo "   + Last 60 mins : ${sys_ht} emails (Sent: ${sys_hs} | Deferred: ${sys_hd} | Bounced: ${sys_hb})"
-    echo " POSTFIX MAIL QUEUE REMAINING: ${total_queue} emails"
+    echo " SYSTEM TOTAL TRAFFIC (CURRENT): ${sys_tot} emails"
+    echo "   + Sent: ${sys_snt} | Deferred: ${sys_def} | Bounced: ${sys_bnc}"
+    echo " POSTFIX MAIL QUEUE REMAINING  : ${total_queue} emails"
     echo "   + Active: ${active_queue} | Deferred: ${def_queue} | Hold: ${hold_queue}"
     echo "------------------------------------------------------------------------------"
-    printf " %-34s | %-10s | %-10s | %-15s\n" "TOP SENDERS (LAST 60M)" "${LOOKBACK_MINUTES} MINS" "60 MINS" "SOURCE IP"
+    printf " %-34s | %-10s | %-10s | %-15s\n" "TOP SENDERS" "TOTAL" "${LOOKBACK_MINUTES} MINS" "SOURCE IP"
     echo "------------------------------------------------------------------------------"
     if [[ -s "$tmp_log_stats" ]]; then
-        head -n 15 "$tmp_log_stats" | while IFS='|' read -r s wt ws wd wb ht hs hd hb ips tspan; do
-            printf " %-34s | %-10s | %-10s | %-15s\n" "$s" "$wt" "$ht" "$ips"
+        head -n 15 "$tmp_log_stats" | while IFS='|' read -r s ct cs cd cb wt ht ips tspan; do
+            printf " %-34s | %-10s | %-10s | %-15s\n" "$s" "$ct" "$wt" "$ips"
         done
     else
-        echo " (No outbound email traffic found in the configured window)"
+        echo " (No outbound email traffic found)"
     fi
     echo "------------------------------------------------------------------------------"
     printf " %-34s | %-10s | %-28s\n" "SENDERS IN POSTFIX QUEUE" "QUEUED" "STATUS / REASON"
@@ -1223,9 +1203,9 @@ run_test_alert() {
     analyze_zimbra_log "$tmp_log_stats" "$tmp_sys_sum"
     analyze_postfix_queue "$tmp_q_stats" "$tmp_q_sum"
 
-    local sys_summary sys_wt sys_ws sys_wd sys_wb sys_ht sys_hs sys_hd sys_hb
-    sys_summary=$(cat "$tmp_sys_sum" 2>/dev/null || echo "0|0|0|0|0|0|0|0")
-    IFS='|' read -r sys_wt sys_ws sys_wd sys_wb sys_ht sys_hs sys_hd sys_hb <<< "$sys_summary"
+    local sys_summary sys_tot sys_snt sys_def sys_bnc
+    sys_summary=$(cat "$tmp_sys_sum" 2>/dev/null || echo "0|0|0|0")
+    IFS='|' read -r sys_tot sys_snt sys_def sys_bnc <<< "$sys_summary"
 
     local q_summary total_queue active_queue def_queue hold_queue
     q_summary=$(cat "$tmp_q_sum" 2>/dev/null || echo "0|0|0|0")
@@ -1243,13 +1223,11 @@ run_test_alert() {
 <b>[ZIMBRA SPAM MONITOR - TEST]</b>
 <code>==============================</code>
 <b>Server       :</b> <code>$(html_escape "$srv_host")</code> (${srv_ip})
-<b>Time         :</b> ${now_str}
+<b>Alert Time   :</b> ${now_str}
 
 <b>[1] SYSTEM TOTAL TRAFFIC</b>
-<b>System (${LOOKBACK_MINUTES}m) :</b> <b>${sys_wt}</b> emails
-  <code>Sent: ${sys_ws} | Deferred: ${sys_wd} | Bounced: ${sys_wb}</code>
-<b>System (60m) :</b> <b>${sys_ht}</b> emails
-  <code>Sent: ${sys_hs} | Deferred: ${sys_hd} | Bounced: ${sys_hb}</code>
+<b>Total Traffic:</b> <b>${sys_tot}</b> emails
+  <code>Sent: ${sys_snt} | Deferred: ${sys_def} | Bounced: ${sys_bnc}</code>
 
 <b>[2] REMAINING MAIL QUEUE</b>
 <b>System Queue :</b> <b>${total_queue}</b> emails
@@ -1276,16 +1254,13 @@ EOF
          ZIMBRA SPAM MONITOR - TEST NOTIFICATION
 ============================================================
 Server        : ${srv_host} (${srv_ip})
-Time          : ${now_str}
+Alert Time    : ${now_str}
 
 ------------------------------------------------------------
 [1] SYSTEM TOTAL TRAFFIC
 ------------------------------------------------------------
-System (${LOOKBACK_MINUTES}m)  : ${sys_wt} emails
-                Sent: ${sys_ws} | Deferred: ${sys_wd} | Bounced: ${sys_wb}
-
-System (60m)  : ${sys_ht} emails
-                Sent: ${sys_hs} | Deferred: ${sys_hd} | Bounced: ${sys_hb}
+Total Traffic : ${sys_tot} emails
+                Sent: ${sys_snt} | Deferred: ${sys_def} | Bounced: ${sys_bnc}
 
 ------------------------------------------------------------
 [2] REMAINING MAIL QUEUE
