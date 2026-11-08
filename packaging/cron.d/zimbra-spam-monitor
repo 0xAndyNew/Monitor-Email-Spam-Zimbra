@@ -1,7 +1,7 @@
 # ==============================================================================
-# LỊCH CHẠY ĐỊNH KỲ CỦA ZIMBRA SPAM MONITOR (/etc/cron.d/zimbra-spam-monitor)
-# Mặc định: Quét mỗi 5 phút 1 lần.
-# Anh có thể sửa */5 thành */2 (2 phút/lần) hoặc */10 (10 phút/lần) tùy ý.
+# ZIMBRA SPAM MONITOR CRON SCHEDULE (/etc/cron.d/zimbra-spam-monitor)
+# Default: Runs every 5 minutes.
+# You can change the schedule anytime via: zimbra-spam-monitor
 # ==============================================================================
 SHELL=/bin/bash
 PATH=/usr/local/sbin:/usr/local/bin:/sbin:/bin:/usr/sbin:/usr/bin:/opt/zimbra/common/sbin:/opt/zimbra/bin

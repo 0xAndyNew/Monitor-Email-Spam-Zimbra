@@ -2,14 +2,14 @@
 # ==============================================================================
 # ZIMBRA OUTBOUND SPAM MONITOR & ALERT SYSTEM (zimbra-spam-monitor)
 # Version: 1.1.0
-# Hỗ trợ: RHEL / CentOS / Rocky / AlmaLinux (.rpm) & Ubuntu / Debian (.deb)
+# Supported OS: RHEL / CentOS / Rocky / AlmaLinux (.rpm) & Ubuntu / Debian (.deb)
 #
-# Chức năng:
-# 1. Giao diện Bảng điều khiển (TUI Hộp thoại chọn phím mũi tên & Menu chọn số)
-# 2. Quét /var/log/zimbra.log đếm số lượng mail gửi ra ngoài theo Phút & theo Giờ
-# 3. Kiểm tra hàng đợi Postfix (postqueue / mailq) theo từng tài khoản & toàn cục
-# 4. Cảnh báo tức thời qua Telegram Bot API và Email (Postfix nội bộ / SMTP ngoài)
-# 5. Tự động khóa tài khoản (zimbraAccountStatus locked) khi vượt ngưỡng Critical
+# Features:
+# 1. Interactive Control Panel (TUI Arrow-Key Dialog & Number Selection Menu)
+# 2. Scans /var/log/zimbra.log for outbound volume (Short-Window & Hourly rates)
+# 3. Inspects Postfix Mail Queue (postqueue / mailq) per sender & total queue
+# 4. Sends instant alerts via Telegram Bot API and Email (Local Postfix / External SMTP)
+# 5. Automatically locks compromised accounts (zimbraAccountStatus locked) on Critical
 # ==============================================================================
 
 set -u
@@ -20,7 +20,7 @@ CONFIG_FILE="${ZSM_CONFIG_FILE:-$DEFAULT_CONFIG_FILE}"
 CRON_FILE="${ZSM_CRON_FILE:-/etc/cron.d/zimbra-spam-monitor}"
 
 # ==============================================================================
-# CẤU HÌNH MẶC ĐỊNH (Sẽ được ghi đè bởi /etc/zimbra-spam-monitor/config.conf)
+# DEFAULT CONFIGURATION (Overridden by /etc/zimbra-spam-monitor/config.conf)
 # ==============================================================================
 MONITOR_ENABLED="true"
 ZIMBRA_LOG_FILE="/var/log/zimbra.log"
@@ -63,24 +63,23 @@ WHITELIST_FILE="/etc/zimbra-spam-monitor/whitelist.conf"
 STATE_DIR="/var/lib/zimbra-spam-monitor"
 MONITOR_LOG_FILE="/var/log/zimbra-spam-monitor.log"
 
-# Biến phục vụ kiểm thử (Mock/Test overrides)
+# Test / Mock environment overrides
 ZSM_NOW_EPOCH="${ZSM_NOW_EPOCH:-}"
 ZSM_POSTQUEUE_CMD="${ZSM_POSTQUEUE_CMD:-}"
 ZSM_ZMPROV_CMD="${ZSM_ZMPROV_CMD:-}"
 ZSM_SENDMAIL_CMD="${ZSM_SENDMAIL_CMD:-}"
 ZSM_CURL_CMD="${ZSM_CURL_CMD:-curl}"
 ZSM_HOSTNAME="${ZSM_HOSTNAME:-}"
-ZSM_UI_MODE="${ZSM_UI_MODE:-auto}" # "auto", "tui" (whiptail/dialog), hoặc "text" (menu chọn số)
+ZSM_UI_MODE="${ZSM_UI_MODE:-auto}" # "auto", "tui" (whiptail/dialog), or "text"
 
-# Màu sắc hiển thị cho giao diện Menu
-if [[ -t 1 ]]; then
+# ANSI Colors for Text Menu
+if [[ -t 1 || -t 2 ]]; then
     C_RESET="\033[0m"
     C_BOLD="\033[1m"
     C_GREEN="\033[1;32m"
     C_RED="\033[1;31m"
     C_YELLOW="\033[1;33m"
     C_CYAN="\033[1;36m"
-    C_BLUE="\033[1;34m"
 else
     C_RESET=""
     C_BOLD=""
@@ -88,11 +87,10 @@ else
     C_RED=""
     C_YELLOW=""
     C_CYAN=""
-    C_BLUE=""
 fi
 
 # ==============================================================================
-# HÀM TIỆN ÍCH & ĐỌC/GHI CẤU HÌNH
+# HELPER FUNCTIONS & CONFIGURATION MANAGEMENT
 # ==============================================================================
 load_config() {
     if [[ -f "$CONFIG_FILE" ]]; then
@@ -208,7 +206,8 @@ get_server_ip() {
     echo "$ip"
 }
 
-resolve_zimbra_Settings() {
+# Fast auto-detection of Zimbra localconfig XML without spawning JVM
+resolve_zimbra_settings() {
     local default_domain=""
     local srv_host
     srv_host=$(get_server_hostname)
@@ -317,7 +316,7 @@ is_whitelisted() {
 }
 
 # ==============================================================================
-# CƠ CHẾ COOLDOWN & LỊCH SỬ KHÓA TÀI KHOẢN
+# ALERT COOLDOWN & LOCKED ACCOUNT HISTORY
 # ==============================================================================
 should_send_alert() {
     local sender="$1"
@@ -392,24 +391,24 @@ record_locked_account() {
 }
 
 # ==============================================================================
-# TỰ ĐỘNG KHÓA TÀI KHOẢN ZIMBRA & TẠM GIỮ HÀNG ĐỢI KHI CRITICAL
+# AUTO-REMEDIATION ON CRITICAL (LOCK ACCOUNT & HOLD QUEUE)
 # ==============================================================================
 lock_zimbra_account() {
     local account="$1"
     if [[ "$AUTO_LOCK_ON_CRITICAL" != "true" ]]; then
-        echo "Không tự khóa (AUTO_LOCK_ON_CRITICAL=false)"
+        echo "Auto-lock disabled (AUTO_LOCK_ON_CRITICAL=false)"
         return 0
     fi
 
-    log_msg "CRITICAL" "Thực hiện khóa tự động tài khoản spam: $account"
+    log_msg "CRITICAL" "Auto-locking compromised spam account: $account"
 
     if [[ -n "$ZSM_ZMPROV_CMD" ]]; then
         if $ZSM_ZMPROV_CMD ma "$account" zimbraAccountStatus locked >/dev/null 2>&1; then
             record_locked_account "$account"
-            echo "Đã tự động khóa tài khoản (zimbraAccountStatus = locked)"
+            echo "Account automatically LOCKED (zimbraAccountStatus = locked)"
             return 0
         else
-            echo "Lỗi khi gọi lệnh khóa tài khoản ($ZSM_ZMPROV_CMD)"
+            echo "Failed to lock account via $ZSM_ZMPROV_CMD"
             return 1
         fi
     fi
@@ -417,14 +416,14 @@ lock_zimbra_account() {
     if [[ -x /opt/zimbra/bin/zmprov ]]; then
         if su - zimbra -c "/opt/zimbra/bin/zmprov ma '$account' zimbraAccountStatus locked" >/dev/null 2>&1; then
             record_locked_account "$account"
-            echo "Đã tự động khóa tài khoản (zimbraAccountStatus = locked)"
+            echo "Account automatically LOCKED (zimbraAccountStatus = locked)"
             return 0
         else
-            echo "Thực thi lệnh khóa thất bại (Kiểm tra quyền su - zimbra)"
+            echo "Failed to execute zmprov lock command (check root/zimbra permissions)"
             return 1
         fi
     else
-        echo "Không tìm thấy /opt/zimbra/bin/zmprov để khóa tự động"
+        echo "/opt/zimbra/bin/zmprov not found; could not auto-lock account"
         return 1
     fi
 }
@@ -449,11 +448,11 @@ hold_sender_queue() {
             if (s == tolower(target)) print qid
         }
     ' | $postsuper_bin -h - >/dev/null 2>&1 || true
-    log_msg "CRITICAL" "Đã chuyển sang chế độ HOLD các email trong queue của $sender"
+    log_msg "CRITICAL" "Placed queued messages from $sender on HOLD"
 }
 
 # ==============================================================================
-# GỬI THÔNG BÁO QUA TELEGRAM & EMAIL
+# TELEGRAM & EMAIL NOTIFICATIONS (100% ASCII-SAFE)
 # ==============================================================================
 html_escape() {
     local s="$1"
@@ -469,7 +468,7 @@ send_telegram_alert() {
         return 0
     fi
     if [[ -z "$TELEGRAM_BOT_TOKEN" || -z "$TELEGRAM_CHAT_ID" ]]; then
-        log_msg "WARN" "Telegram đang bật nhưng chưa cấu hình TELEGRAM_BOT_TOKEN hoặc TELEGRAM_CHAT_ID"
+        log_msg "WARN" "Telegram is enabled, but TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID is empty"
         return 1
     fi
 
@@ -482,10 +481,10 @@ send_telegram_alert() {
         --data-urlencode "text=${message_html}" 2>&1)
 
     if echo "$resp" | grep -q '"ok":true'; then
-        log_msg "INFO" "Đã gửi cảnh báo Telegram thành công tới Chat ID ${TELEGRAM_CHAT_ID}"
+        log_msg "INFO" "Telegram alert sent successfully to Chat ID ${TELEGRAM_CHAT_ID}"
         return 0
     else
-        log_msg "ERROR" "Gửi cảnh báo Telegram thất bại: $resp"
+        log_msg "ERROR" "Failed to send Telegram alert: $resp"
         return 1
     fi
 }
@@ -496,7 +495,7 @@ send_email_via_local_sendmail() {
     local sm_bin
     sm_bin=$(find_sendmail_bin)
     if [[ -z "$sm_bin" ]]; then
-        log_msg "ERROR" "Không tìm thấy lệnh sendmail trên hệ thống"
+        log_msg "ERROR" "sendmail binary not found on system"
         return 1
     fi
 
@@ -513,10 +512,10 @@ ${body_text}
 EOF
 )
     if printf "%s\n" "$email_payload" | $sm_bin -t >/dev/null 2>&1; then
-        log_msg "INFO" "Đã gửi Email cảnh báo (Local Postfix) tới ${RESOLVED_EMAIL_TO}"
+        log_msg "INFO" "Email alert sent (Local Postfix) to ${RESOLVED_EMAIL_TO}"
         return 0
     else
-        log_msg "ERROR" "Gửi Email qua Local Postfix thất bại"
+        log_msg "ERROR" "Failed to send Email via Local Postfix"
         return 1
     fi
 }
@@ -526,7 +525,7 @@ send_email_via_external_smtp() {
     local body_text="$2"
 
     if [[ -z "$SMTP_HOST" || -z "$SMTP_USER" || -z "$SMTP_PASS" ]]; then
-        log_msg "WARN" "Chưa cấu hình đầy đủ SMTP_HOST / SMTP_USER / SMTP_PASS cho SMTP ngoài"
+        log_msg "WARN" "Incomplete external SMTP settings (SMTP_HOST / SMTP_USER / SMTP_PASS)"
         return 1
     fi
 
@@ -567,11 +566,11 @@ EOF
         --user "${SMTP_USER}:${SMTP_PASS}" \
         -T "$tmp_mail" >/dev/null 2>&1; then
         rm -f "$tmp_mail"
-        log_msg "INFO" "Đã gửi Email cảnh báo (External SMTP ${SMTP_HOST}) tới ${RESOLVED_EMAIL_TO}"
+        log_msg "INFO" "Email alert sent (External SMTP ${SMTP_HOST}) to ${RESOLVED_EMAIL_TO}"
         return 0
     else
         rm -f "$tmp_mail"
-        log_msg "ERROR" "Gửi Email qua External SMTP (${SMTP_HOST}:${SMTP_PORT}) thất bại"
+        log_msg "ERROR" "Failed to send Email via External SMTP (${SMTP_HOST}:${SMTP_PORT})"
         return 1
     fi
 }
@@ -585,7 +584,7 @@ send_email_alert() {
         return 0
     fi
 
-    resolve_zimbra_Settings
+    resolve_zimbra_settings
 
     if [[ "$EMAIL_DELIVERY_MODE" == "smtp" ]]; then
         send_email_via_external_smtp "$subject" "$body_text"
@@ -611,18 +610,18 @@ send_email_alert() {
 }
 
 # ==============================================================================
-# PHÂN TÍCH LOG ZIMBRA (/var/log/zimbra.log) & HÀNG ĐỢI POSTFIX (postqueue)
+# ZIMBRA LOG (/var/log/zimbra.log) & POSTFIX QUEUE (postqueue) ANALYSIS
 # ==============================================================================
 analyze_zimbra_log() {
     local out_file="$1"
     : > "$out_file"
 
     if [[ ! -f "$ZIMBRA_LOG_FILE" ]]; then
-        log_msg "WARN" "Không tìm thấy file log Zimbra: $ZIMBRA_LOG_FILE"
+        log_msg "WARN" "Zimbra log file not found: $ZIMBRA_LOG_FILE"
         return 0
     fi
 
-    resolve_zimbra_Settings
+    resolve_zimbra_settings
     local now_epoch="${ZSM_NOW_EPOCH:-$(date +%s)}"
     local cur_year
     cur_year=$(date -d "@$now_epoch" '+%Y' 2>/dev/null || date '+%Y')
@@ -852,7 +851,7 @@ analyze_postfix_queue() {
     END {
         printf "%d|%d|%d|%d\n", total_q, active_q, def_q, hold_q > "'"$summary_file"'"
         for (u in q_user) {
-            reason = (u in q_reason ? q_reason[u] : "Đang chờ gửi trong hàng đợi")
+            reason = (u in q_reason ? q_reason[u] : "Queued for delivery")
             printf "%s|%d|%s\n", u, q_user[u], reason
         }
     }
@@ -860,7 +859,7 @@ analyze_postfix_queue() {
 }
 
 # ==============================================================================
-# CHU TRÌNH KIỂM TRA CHÍNH (--run)
+# MAIN CHECK CYCLE (--run)
 # ==============================================================================
 run_monitor_cycle() {
     load_config
@@ -873,7 +872,7 @@ run_monitor_cycle() {
         local old_pid
         old_pid=$(cat "$lock_file" 2>/dev/null || echo "")
         if [[ -n "$old_pid" ]] && kill -0 "$old_pid" 2>/dev/null; then
-            log_msg "WARN" "Tiến trình quét trước đó (PID $old_pid) vẫn đang chạy, bỏ qua chu kỳ này."
+            log_msg "WARN" "Previous scan (PID $old_pid) is still running; skipping cycle."
             return 0
         fi
     fi
@@ -944,40 +943,40 @@ run_monitor_cycle() {
 
         if (( win_tot >= CRIT_SENT_PER_WINDOW )); then
             severity="CRITICAL"
-            reasons+=("Gửi ${win_tot} mail trong ${LOOKBACK_MINUTES} phút (Ngưỡng Critical: ${CRIT_SENT_PER_WINDOW})")
+            reasons+=("${win_tot} emails in ${LOOKBACK_MINUTES}m (Critical >= ${CRIT_SENT_PER_WINDOW})")
         fi
         if [[ "$ENABLE_HOURLY_CHECK" == "true" ]] && (( hr_tot >= CRIT_SENT_PER_HOUR )); then
             severity="CRITICAL"
-            reasons+=("Gửi ${hr_tot} mail trong 60 phút (Ngưỡng Critical: ${CRIT_SENT_PER_HOUR})")
+            reasons+=("${hr_tot} emails in 60m (Critical >= ${CRIT_SENT_PER_HOUR})")
         fi
         if (( q_cnt >= CRIT_QUEUE_PER_USER )); then
             severity="CRITICAL"
-            reasons+=("Đang kẹt ${q_cnt} mail trong Queue (Ngưỡng Critical: ${CRIT_QUEUE_PER_USER})")
+            reasons+=("${q_cnt} queued emails (Critical >= ${CRIT_QUEUE_PER_USER})")
         fi
 
         if [[ "$severity" == "NORMAL" ]]; then
             if (( win_tot >= WARN_SENT_PER_WINDOW )); then
                 severity="WARNING"
-                reasons+=("Gửi ${win_tot} mail trong ${LOOKBACK_MINUTES} phút (Ngưỡng Warning: ${WARN_SENT_PER_WINDOW})")
+                reasons+=("${win_tot} emails in ${LOOKBACK_MINUTES}m (Warning >= ${WARN_SENT_PER_WINDOW})")
             fi
             if [[ "$ENABLE_HOURLY_CHECK" == "true" ]] && (( hr_tot >= WARN_SENT_PER_HOUR )); then
                 severity="WARNING"
-                reasons+=("Gửi ${hr_tot} mail trong 60 phút (Ngưỡng Warning: ${WARN_SENT_PER_HOUR})")
+                reasons+=("${hr_tot} emails in 60m (Warning >= ${WARN_SENT_PER_HOUR})")
             fi
             if (( q_cnt >= WARN_QUEUE_PER_USER )); then
                 severity="WARNING"
-                reasons+=("Đang kẹt ${q_cnt} mail trong Queue (Ngưỡng Warning: ${WARN_QUEUE_PER_USER})")
+                reasons+=("${q_cnt} queued emails (Warning >= ${WARN_QUEUE_PER_USER})")
             fi
         fi
 
         [[ "$severity" == "NORMAL" ]] && continue
 
         if ! should_send_alert "$sender" "$severity"; then
-            log_msg "INFO" "Bỏ qua cảnh báo lặp lại (Cooldown) cho $sender [$severity]"
+            log_msg "INFO" "Cooldown active; skipping duplicate alert for $sender [$severity]"
             continue
         fi
 
-        local action_taken="Chỉ gửi cảnh báo (Mức WARNING)"
+        local action_taken="Alert Only (WARNING level)"
         if [[ "$severity" == "CRITICAL" ]]; then
             action_taken=$(lock_zimbra_account "$sender")
             hold_sender_queue "$sender"
@@ -988,78 +987,75 @@ run_monitor_cycle() {
 
         local reason_str
         reason_str=$(IFS='; '; echo "${reasons[*]}")
-        log_msg "$severity" "Phát hiện Spam: user=$sender | ${LOOKBACK_MINUTES}m=${win_tot} | 1h=${hr_tot} | queue=${q_cnt} | action=${action_taken}"
-
-        local icon="⚠️"
-        [[ "$severity" == "CRITICAL" ]] && icon="🚨"
+        log_msg "$severity" "Outbound spam detected: user=$sender | ${LOOKBACK_MINUTES}m=${win_tot} | 60m=${hr_tot} | queue=${q_cnt} | action=${action_taken}"
 
         local tg_msg
         tg_msg=$(cat <<EOF
-${icon} <b>[ZIMBRA SPAM ${severity}] PHÁT HIỆN TÀI KHOẢN SPAM</b>
-━━━━━━━━━━━━━━━━━━━━━━
-🖥 <b>Server:</b> <code>$(html_escape "$srv_host")</code> (${srv_ip})
-🕒 <b>Thời gian:</b> ${now_str}
-👤 <b>Tài khoản Spam:</b> <code>$(html_escape "$sender")</code>
-📌 <b>Lý do:</b> $(html_escape "$reason_str")
+<b>[ZIMBRA SPAM ${severity}] OUTBOUND SPAM DETECTED</b>
+--------------------------------------
+<b>Server:</b> <code>$(html_escape "$srv_host")</code> (${srv_ip})
+<b>Time:</b> ${now_str}
+<b>Account:</b> <code>$(html_escape "$sender")</code>
+<b>Trigger:</b> $(html_escape "$reason_str")
 
-📊 <b>Thống kê lưu lượng gửi ra:</b>
-• <b>Trong ${LOOKBACK_MINUTES} phút qua:</b> <b>${win_tot}</b> email (Sent: ${win_snt} | Deferred: ${win_def} | Bounced: ${win_bnc})
-• <b>Trong 60 phút qua:</b> <b>${hr_tot}</b> email (Sent: ${hr_snt} | Deferred: ${hr_def} | Bounced: ${hr_bnc})
-• <b>Đang kẹt trong Queue:</b> <b>${q_cnt}</b> email (Tổng Queue toàn server: ${total_queue})
-• <b>IP nguồn gửi:</b> <code>$(html_escape "$s_ips")</code>
-• <b>Domain đích:</b> <code>$(html_escape "$s_doms")</code>
-• <b>Chi tiết Queue:</b> <i>$(html_escape "$q_reason")</i>
+<b>Outbound Traffic Summary:</b>
+- <b>Last ${LOOKBACK_MINUTES} mins:</b> <b>${win_tot}</b> emails (Sent: ${win_snt} | Deferred: ${win_def} | Bounced: ${win_bnc})
+- <b>Last 60 mins:</b> <b>${hr_tot}</b> emails (Sent: ${hr_snt} | Deferred: ${hr_def} | Bounced: ${hr_bnc})
+- <b>User Queue:</b> <b>${q_cnt}</b> emails (Total Server Queue: ${total_queue})
+- <b>Source IPs:</b> <code>$(html_escape "$s_ips")</code>
+- <b>Target Domains:</b> <code>$(html_escape "$s_doms")</code>
+- <b>Queue Note:</b> <i>$(html_escape "$q_reason")</i>
 
-🛡 <b>Hành động tự động:</b>
+<b>Automated Action:</b>
 <b>$(html_escape "$action_taken")</b>
-━━━━━━━━━━━━━━━━━━━━━━
-💡 <i>Lệnh mở khóa sau khi đổi mật khẩu:</i>
+--------------------------------------
+<i>Unlock command after password reset:</i>
 <code>zimbra-spam-monitor --unlock $(html_escape "$sender")</code>
 EOF
 )
 
-        local mail_subj="[Zimbra Spam ${severity}] Phát hiện tài khoản ${sender} đang gửi spam trên ${srv_host}"
+        local mail_subj="[Zimbra Spam ${severity}] Outbound spam detected from ${sender} on ${srv_host}"
         local mail_body
         mail_body=$(cat <<EOF
 ======================================================================
-CẢNH BÁO HỆ THỐNG GIÁM SÁT EMAIL SPAM ZIMBRA (${severity})
+ZIMBRA OUTBOUND SPAM MONITOR ALERT (${severity})
 ======================================================================
-Máy chủ Zimbra  : ${srv_host} (${srv_ip})
-Thời gian       : ${now_str}
-Tài khoản Spam  : ${sender}
-Mức độ cảnh báo : ${severity}
-Nguyên nhân     : ${reason_str}
+Zimbra Server   : ${srv_host} (${srv_ip})
+Timestamp       : ${now_str}
+Spam Account    : ${sender}
+Severity        : ${severity}
+Trigger Reason  : ${reason_str}
 
 ----------------------------------------------------------------------
-THỐNG KÊ CHI TIẾT SỐ LƯỢNG EMAIL SPAM RA NGOÀI:
+OUTBOUND TRAFFIC & QUEUE STATISTICS:
 ----------------------------------------------------------------------
-1. Trong ${LOOKBACK_MINUTES} phút gần nhất : ${win_tot} email
-   - Đã gửi thành công (Sent)   : ${win_snt}
-   - Đang trì hoãn (Deferred)   : ${win_def}
-   - Bị trả lại (Bounced)       : ${win_bnc}
+1. Last ${LOOKBACK_MINUTES} Minutes       : ${win_tot} emails
+   - Sent                       : ${win_snt}
+   - Deferred                   : ${win_def}
+   - Bounced                    : ${win_bnc}
 
-2. Trong 60 phút (1 giờ) qua   : ${hr_tot} email
-   - Đã gửi thành công (Sent)   : ${hr_snt}
-   - Đang trì hoãn (Deferred)   : ${hr_def}
-   - Bị trả lại (Bounced)       : ${hr_bnc}
+2. Last 60 Minutes (1 Hour)     : ${hr_tot} emails
+   - Sent                       : ${hr_snt}
+   - Deferred                   : ${hr_def}
+   - Bounced                    : ${hr_bnc}
 
-3. Hàng đợi Postfix (Queue)    : ${q_cnt} email của tài khoản này
-   - Tổng Queue toàn hệ thống   : ${total_queue} (Active: ${active_queue}, Deferred: ${def_queue}, Hold: ${hold_queue})
-   - Lý do kẹt trong Queue      : ${q_reason}
+3. Postfix Queue (Current)      : ${q_cnt} emails from this sender
+   - Total Server Queue         : ${total_queue} (Active: ${active_queue}, Deferred: ${def_queue}, Hold: ${hold_queue})
+   - Queue Status / Deferral    : ${q_reason}
 
-4. Nguồn phát tán:
-   - Địa chỉ IP đăng nhập       : ${s_ips}
-   - Các tên miền nhận chính    : ${s_doms}
+4. Connection Details:
+   - Authenticated / Client IPs : ${s_ips}
+   - Top Recipient Domains      : ${s_doms}
 
 ----------------------------------------------------------------------
-HÀNH ĐỘNG XỬ LÝ TỰ ĐỘNG CỦA HỆ THỐNG:
+AUTOMATED ACTION TAKEN:
 ----------------------------------------------------------------------
 -> ${action_taken}
 
-Hướng dẫn xử lý cho Quản trị viên:
-1. Đổi mật khẩu tài khoản bị lộ:
-   su - zimbra -c "zmprov sp ${sender} <MatKhauMoi>"
-2. Mở khóa lại tài khoản:
+Recommended Admin Remediation:
+1. Reset the compromised user's password:
+   su - zimbra -c "zmprov sp ${sender} <NewStrongPassword>"
+2. Unlock the account:
    zimbra-spam-monitor --unlock ${sender}
 ======================================================================
 EOF
@@ -1075,17 +1071,17 @@ EOF
             record_alert_state "__SYSTEM_TOTAL_QUEUE__" "WARNING"
             local q_tg_msg
             q_tg_msg=$(cat <<EOF
-⚠️ <b>[ZIMBRA QUEUE WARNING] HÀNG ĐỢI EMAIL TĂNG CAO</b>
-━━━━━━━━━━━━━━━━━━━━━━
-🖥 <b>Server:</b> <code>$(html_escape "$srv_host")</code> (${srv_ip})
-🕒 <b>Thời gian:</b> ${now_str}
-📦 <b>Tổng số mail trong Queue:</b> <b>${total_queue}</b> (Ngưỡng cảnh báo: ${WARN_TOTAL_QUEUE})
-• Active: ${active_queue} | Deferred: ${def_queue} | Hold: ${hold_queue}
+<b>[ZIMBRA QUEUE WARNING] HIGH MAIL QUEUE VOLUME</b>
+--------------------------------------
+<b>Server:</b> <code>$(html_escape "$srv_host")</code> (${srv_ip})
+<b>Time:</b> ${now_str}
+<b>Total Queued Emails:</b> <b>${total_queue}</b> (Threshold: ${WARN_TOTAL_QUEUE})
+- Active: ${active_queue} | Deferred: ${def_queue} | Hold: ${hold_queue}
 EOF
 )
             send_telegram_alert "$q_tg_msg"
-            send_email_alert "[Zimbra Queue Warning] Hàng đợi trên ${srv_host} đạt ${total_queue} email" \
-                "Tổng số email trong hàng đợi Postfix trên ${srv_host} (${srv_ip}) hiện tại là ${total_queue} (Active: ${active_queue}, Deferred: ${def_queue}, Hold: ${hold_queue})." \
+            send_email_alert "[Zimbra Queue Warning] Mail queue reached ${total_queue} emails on ${srv_host}" \
+                "Total Postfix queue count on ${srv_host} (${srv_ip}) is currently ${total_queue} (Active: ${active_queue}, Deferred: ${def_queue}, Hold: ${hold_queue})." \
                 "$total_queue"
         fi
     fi
@@ -1094,11 +1090,11 @@ EOF
 }
 
 # ==============================================================================
-# CÁC LỆNH HIỂN THỊ TRẠNG THÁI, TEST, UNLOCK
+# STATUS DASHBOARD, TEST ALERT & UNLOCK COMMANDS
 # ==============================================================================
 show_status() {
     load_config
-    resolve_zimbra_Settings
+    resolve_zimbra_settings
 
     local tmp_log_stats tmp_q_stats tmp_q_sum
     tmp_log_stats=$(mktemp 2>/dev/null || echo "/tmp/zsm_st_log_$$")
@@ -1116,37 +1112,37 @@ show_status() {
     hold_queue=$(echo "$q_summary" | cut -d'|' -f4)
 
     echo "=============================================================================="
-    echo " ZIMBRA SPAM MONITOR v${VERSION} - BẢNG TRẠNG THÁI HỆ THỐNG"
+    echo " ZIMBRA SPAM MONITOR v${VERSION} - SYSTEM STATUS"
     echo "=============================================================================="
-    echo " Máy chủ Zimbra     : $(get_server_hostname) ($(get_server_ip))"
-    echo " File cấu hình      : ${CONFIG_FILE}"
-    echo " Trạng thái Monitor : ${MONITOR_ENABLED} (Auto-Lock Critical: ${AUTO_LOCK_ON_CRITICAL})"
-    echo " Ngưỡng ${LOOKBACK_MINUTES} phút     : Warning >= ${WARN_SENT_PER_WINDOW} | Critical >= ${CRIT_SENT_PER_WINDOW} mail"
-    echo " Ngưỡng 60 phút     : Warning >= ${WARN_SENT_PER_HOUR} | Critical >= ${CRIT_SENT_PER_HOUR} mail"
-    echo " Ngưỡng Queue/User  : Warning >= ${WARN_QUEUE_PER_USER} | Critical >= ${CRIT_QUEUE_PER_USER} mail"
-    echo " Email nhận cảnh báo: ${RESOLVED_EMAIL_TO} (Chế độ: ${EMAIL_DELIVERY_MODE})"
+    echo " Zimbra Server      : $(get_server_hostname) ($(get_server_ip))"
+    echo " Config File        : ${CONFIG_FILE}"
+    echo " Monitor Enabled    : ${MONITOR_ENABLED} (Auto-Lock on Critical: ${AUTO_LOCK_ON_CRITICAL})"
+    echo " ${LOOKBACK_MINUTES}-Min Threshold   : Warning >= ${WARN_SENT_PER_WINDOW} | Critical >= ${CRIT_SENT_PER_WINDOW} emails"
+    echo " 60-Min Threshold   : Warning >= ${WARN_SENT_PER_HOUR} | Critical >= ${CRIT_SENT_PER_HOUR} emails"
+    echo " Queue/User Limit   : Warning >= ${WARN_QUEUE_PER_USER} | Critical >= ${CRIT_QUEUE_PER_USER} emails"
+    echo " Alert Email To     : ${RESOLVED_EMAIL_TO} (Mode: ${EMAIL_DELIVERY_MODE})"
     echo "------------------------------------------------------------------------------"
-    echo " TỔNG HÀNG ĐỢI POSTFIX HIỆN TẠI: ${total_queue} email"
-    echo "   + Active: ${active_queue} | Deferred (Kẹt): ${def_queue} | Hold: ${hold_queue}"
+    echo " POSTFIX MAIL QUEUE TOTAL: ${total_queue} emails"
+    echo "   + Active: ${active_queue} | Deferred: ${def_queue} | Hold: ${hold_queue}"
     echo "------------------------------------------------------------------------------"
-    printf " %-34s | %-10s | %-10s | %-15s\n" "TÀI KHOẢN GỬI (TOP 15)" "${LOOKBACK_MINUTES} PHÚT" "60 PHÚT" "IP NGUỒN"
+    printf " %-34s | %-10s | %-10s | %-15s\n" "TOP SENDERS (LAST 60M)" "${LOOKBACK_MINUTES} MINS" "60 MINS" "SOURCE IP"
     echo "------------------------------------------------------------------------------"
     if [[ -s "$tmp_log_stats" ]]; then
         head -n 15 "$tmp_log_stats" | while IFS='|' read -r s wt ws wd wb ht hs hd hb ips doms; do
             printf " %-34s | %-10s | %-10s | %-15s\n" "$s" "$wt" "$ht" "$ips"
         done
     else
-        echo " (Không có dữ liệu gửi mail trong khoảng thời gian quét)"
+        echo " (No outbound email traffic found in the configured window)"
     fi
     echo "------------------------------------------------------------------------------"
-    printf " %-34s | %-10s | %-28s\n" "TÀI KHOẢN ĐANG KẸT TRONG QUEUE" "SỐ MAIL" "LÝ DO KẸT"
+    printf " %-34s | %-10s | %-28s\n" "SENDERS IN POSTFIX QUEUE" "QUEUED" "STATUS / REASON"
     echo "------------------------------------------------------------------------------"
     if [[ -s "$tmp_q_stats" ]]; then
         head -n 10 "$tmp_q_stats" | while IFS='|' read -r u qc qr; do
             printf " %-34s | %-10s | %-28s\n" "$u" "$qc" "$qr"
         done
     else
-        echo " (Hàng đợi sạch - Không có tài khoản nào bị kẹt mail)"
+        echo " (Mail queue is clean)"
     fi
     echo "=============================================================================="
 
@@ -1155,49 +1151,49 @@ show_status() {
 
 run_test_alert() {
     load_config
-    resolve_zimbra_Settings
+    resolve_zimbra_settings
     local srv_host srv_ip now_str
     srv_host=$(get_server_hostname)
     srv_ip=$(get_server_ip)
     now_str=$(date '+%Y-%m-%d %H:%M:%S')
 
-    echo "Đang kiểm tra gửi cảnh báo thử nghiệm từ ${srv_host} (${srv_ip})..."
-    echo " - File cấu hình đang dùng : ${CONFIG_FILE}"
-    echo " - Telegram Enabled        : ${TELEGRAM_ENABLED} (Chat ID: ${TELEGRAM_CHAT_ID:-Chưa điền})"
-    echo " - Email Enabled           : ${EMAIL_ENABLED} (Gửi tới: ${RESOLVED_EMAIL_TO})"
+    echo "Sending test alert from ${srv_host} (${srv_ip})..."
+    echo " - Config File      : ${CONFIG_FILE}"
+    echo " - Telegram Enabled : ${TELEGRAM_ENABLED} (Chat ID: ${TELEGRAM_CHAT_ID:-Not set})"
+    echo " - Email Enabled    : ${EMAIL_ENABLED} (Recipient: ${RESOLVED_EMAIL_TO})"
 
     local test_tg_msg
     test_tg_msg=$(cat <<EOF
-✅ <b>[ZIMBRA SPAM MONITOR - TEST KẾT NỐI]</b>
-━━━━━━━━━━━━━━━━━━━━━━
-🖥 <b>Server:</b> <code>$(html_escape "$srv_host")</code> (${srv_ip})
-🕒 <b>Thời gian:</b> ${now_str}
-⚙️ <b>Ngưỡng ${LOOKBACK_MINUTES} phút:</b> Warn ${WARN_SENT_PER_WINDOW} / Crit ${CRIT_SENT_PER_WINDOW}
-⚙️ <b>Ngưỡng 60 phút:</b> Warn ${WARN_SENT_PER_HOUR} / Crit ${CRIT_SENT_PER_HOUR}
-⚙️ <b>Ngưỡng Queue:</b> Warn ${WARN_QUEUE_PER_USER} / Crit ${CRIT_QUEUE_PER_USER}
-🔒 <b>Tự động khóa khi Critical:</b> ${AUTO_LOCK_ON_CRITICAL}
-━━━━━━━━━━━━━━━━━━━━━━
-<i>Hệ thống giám sát Email Spam Zimbra đang hoạt động tốt!</i>
+<b>[ZIMBRA SPAM MONITOR - TEST NOTIFICATION]</b>
+--------------------------------------
+<b>Server:</b> <code>$(html_escape "$srv_host")</code> (${srv_ip})
+<b>Time:</b> ${now_str}
+<b>${LOOKBACK_MINUTES}-Min Limit:</b> Warn ${WARN_SENT_PER_WINDOW} / Crit ${CRIT_SENT_PER_WINDOW}
+<b>60-Min Limit:</b> Warn ${WARN_SENT_PER_HOUR} / Crit ${CRIT_SENT_PER_HOUR}
+<b>Queue Limit:</b> Warn ${WARN_QUEUE_PER_USER} / Crit ${CRIT_QUEUE_PER_USER}
+<b>Auto-Lock on Critical:</b> ${AUTO_LOCK_ON_CRITICAL}
+--------------------------------------
+<i>Zimbra Outbound Spam Monitor is working properly!</i>
 EOF
 )
 
     local tg_rc=0
     if [[ "$TELEGRAM_ENABLED" == "true" ]]; then
         if send_telegram_alert "$test_tg_msg"; then
-            echo " [OK] Đã gửi tin nhắn thử nghiệm qua Telegram thành công!"
+            echo " [OK] Test Telegram message sent successfully!"
         else
-            echo " [LỖI] Gửi Telegram thất bại. Vui lòng kiểm tra TELEGRAM_BOT_TOKEN và TELEGRAM_CHAT_ID."
+            echo " [ERROR] Failed to send Telegram alert. Check TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID."
             tg_rc=1
         fi
     fi
 
     local mail_rc=0
     if [[ "$EMAIL_ENABLED" == "true" ]]; then
-        local test_mail_body="Đây là email kiểm tra kết nối từ hệ thống Zimbra Spam Monitor trên máy chủ ${srv_host} (${srv_ip}) lúc ${now_str}. Hệ thống hoạt động bình thường."
-        if send_email_alert "[Zimbra Spam Monitor] Kiểm tra kết nối cảnh báo từ ${srv_host}" "$test_mail_body" 0; then
-            echo " [OK] Đã gửi Email thử nghiệm tới ${RESOLVED_EMAIL_TO} thành công!"
+        local test_mail_body="This is a test notification from Zimbra Outbound Spam Monitor on server ${srv_host} (${srv_ip}) at ${now_str}. Alert delivery is working properly."
+        if send_email_alert "[Zimbra Spam Monitor] Test Notification from ${srv_host}" "$test_mail_body" 0; then
+            echo " [OK] Test Email sent successfully to ${RESOLVED_EMAIL_TO}!"
         else
-            echo " [LỖI] Gửi Email thất bại. Kiểm tra lại dịch vụ Postfix hoặc cấu hình SMTP."
+            echo " [ERROR] Failed to send Email alert. Check Postfix or external SMTP settings."
             mail_rc=1
         fi
     fi
@@ -1208,46 +1204,46 @@ EOF
 unlock_account() {
     local target="$1"
     if [[ -z "$target" ]]; then
-        echo "Sử dụng: zimbra-spam-monitor --unlock <email@domain.com>"
+        echo "Usage: zimbra-spam-monitor --unlock <email@domain.com>"
         return 1
     fi
     load_config
-    echo "Đang mở khóa tài khoản ${target}..."
+    echo "Unlocking Zimbra account ${target}..."
     if [[ -n "$ZSM_ZMPROV_CMD" ]]; then
         $ZSM_ZMPROV_CMD ma "$target" zimbraAccountStatus active
     elif [[ -x /opt/zimbra/bin/zmprov ]]; then
         su - zimbra -c "/opt/zimbra/bin/zmprov ma '$target' zimbraAccountStatus active"
     else
-        echo "Không tìm thấy /opt/zimbra/bin/zmprov trên máy chủ."
+        echo "Error: /opt/zimbra/bin/zmprov not found on this server."
         return 1
     fi
     clear_alert_state "$target"
-    log_msg "INFO" "Quản trị viên đã mở khóa tài khoản $target và xóa trạng thái Cooldown"
-    echo "[OK] Tài khoản ${target} đã được chuyển về trạng thái 'active' và xóa Cooldown."
+    log_msg "INFO" "Admin unlocked account $target and cleared cooldown state"
+    echo "[OK] Account ${target} is now 'active' and alert cooldown has been cleared."
 }
 
 # ==============================================================================
-# QUẢN LÝ CHU KỲ CRON (/etc/cron.d/zimbra-spam-monitor)
+# CRON SCHEDULE MANAGEMENT (/etc/cron.d/zimbra-spam-monitor)
 # ==============================================================================
 get_current_cron_interval() {
     if [[ ! -f "$CRON_FILE" ]]; then
-        echo "Chưa tạo"
+        echo "Not configured"
         return
     fi
     if grep -q "^#.*zimbra-spam-monitor" "$CRON_FILE" 2>/dev/null; then
-        echo "Đang tạm dừng"
+        echo "Paused"
         return
     fi
     local spec
     spec=$(awk '/zimbra-spam-monitor/ && !/^#/ {print $1}' "$CRON_FILE" 2>/dev/null | head -n 1)
     case "$spec" in
-        "*"|"*/1") echo "1 phút/lần" ;;
-        "*/2")     echo "2 phút/lần" ;;
-        "*/5")     echo "5 phút/lần" ;;
-        "*/10")    echo "10 phút/lần" ;;
-        "*/15")    echo "15 phút/lần" ;;
-        "*/30")    echo "30 phút/lần" ;;
-        *)         echo "${spec:-5 phút/lần}" ;;
+        "*"|"*/1") echo "Every 1 min" ;;
+        "*/2")     echo "Every 2 mins" ;;
+        "*/5")     echo "Every 5 mins" ;;
+        "*/10")    echo "Every 10 mins" ;;
+        "*/15")    echo "Every 15 mins" ;;
+        "*/30")    echo "Every 30 mins" ;;
+        *)         echo "${spec:-Every 5 mins}" ;;
     esac
 }
 
@@ -1263,7 +1259,7 @@ SHELL=/bin/bash
 PATH=/usr/local/sbin:/usr/local/bin:/sbin:/bin:/usr/sbin:/usr/bin:/opt/zimbra/common/sbin:/opt/zimbra/bin
 # */5 * * * * root /usr/bin/zimbra-spam-monitor --run >/dev/null 2>&1
 EOF
-        log_msg "INFO" "Đã tạm dừng lịch quét tự động trong $CRON_FILE"
+        log_msg "INFO" "Paused automatic cron schedule in $CRON_FILE"
         return 0
     fi
 
@@ -1273,11 +1269,11 @@ PATH=/usr/local/sbin:/usr/local/bin:/sbin:/bin:/usr/sbin:/usr/bin:/opt/zimbra/co
 */${mins} * * * * root /usr/bin/zimbra-spam-monitor --run >/dev/null 2>&1
 EOF
     chmod 0644 "$CRON_FILE" 2>/dev/null || true
-    log_msg "INFO" "Đã cập nhật chu kỳ quét Cron thành ${mins} phút/lần"
+    log_msg "INFO" "Updated cron schedule to every ${mins} minute(s)"
 }
 
 # ==============================================================================
-# GIAO DIỆN ĐIỀU KHIỂN TƯƠNG TÁC (HỘP THOẠI TUI & MENU CHỌN BẰNG SỐ)
+# INTERACTIVE CONTROL PANEL (TUI DIALOG & NUMBER MENU - 100% ASCII ENGLISH)
 # ==============================================================================
 detect_tui_bin() {
     if [[ "$ZSM_UI_MODE" == "text" ]]; then
@@ -1296,12 +1292,11 @@ detect_tui_bin() {
     echo ""
 }
 
-# Hàm hiển thị Menu chọn tổng quát (Hỗ trợ cả hộp thoại whiptail/dialog dùng phím mũi tên Lên/Xuống VÀ Menu chọn số)
 ui_select_menu() {
     local title="$1"
     local prompt="$2"
     shift 2
-    local items=("$@") # Các cặp: tag1 desc1 tag2 desc2 ...
+    local items=("$@")
 
     local tui_bin
     tui_bin=$(detect_tui_bin)
@@ -1309,7 +1304,7 @@ ui_select_menu() {
     if [[ -n "$tui_bin" ]]; then
         local choice
         choice=$("$tui_bin" --title "$title" --backtitle "Zimbra Outbound Spam Monitor v${VERSION} - $(get_server_hostname)" \
-            --menu "$prompt\n(Dùng phím Mũi tên Lên/Xuống để di chuyển, Enter để chọn)" 22 78 12 \
+            --menu "$prompt\n(Use UP/DOWN arrow keys to select, ENTER to confirm)" 22 78 12 \
             "${items[@]}" 3>&1 1>&2 2>&3) || {
             echo "0"
             return
@@ -1318,7 +1313,6 @@ ui_select_menu() {
         return
     fi
 
-    # Fallback: Giao diện Menu chọn bằng số có màu sắc rõ ràng (In ra >&2 để hiển thị trực tiếp lên màn hình)
     echo "" >&2
     echo -e "${C_CYAN}==============================================================================${C_RESET}" >&2
     echo -e " ${C_BOLD}${title}${C_RESET}" >&2
@@ -1336,7 +1330,7 @@ ui_select_menu() {
     done
     echo -e "${C_CYAN}==============================================================================${C_RESET}" >&2
     local sel=""
-    if ! read -r -p " -> Nhập số mục muốn chọn rồi nhấn Enter [0 để quay lại/thoát]: " sel; then
+    if ! read -r -p " -> Select option number and press Enter [0 to Back/Exit]: " sel; then
         echo "0"
         return
     fi
@@ -1365,7 +1359,7 @@ ui_input_box() {
     echo "" >&2
     echo -e "${C_BOLD}[${title}]${C_RESET} ${prompt}" >&2
     local val=""
-    if ! read -r -p " -> Nhập giá trị mới (Nhấn Enter để giữ nguyên [${default_val}]): " val; then
+    if ! read -r -p " -> Enter new value (Press Enter to keep [${default_val}]): " val; then
         echo "$default_val"
         return
     fi
@@ -1395,28 +1389,28 @@ ui_msg_box() {
     echo -e "${C_GREEN}------------------------------------------------------------------------------${C_RESET}" >&2
     echo -e "$text" >&2
     echo -e "${C_GREEN}------------------------------------------------------------------------------${C_RESET}" >&2
-    read -r -p " Nhấn phím Enter để tiếp tục..." _ || true
+    read -r -p " Press Enter to continue..." _ || true
 }
 
 # ------------------------------------------------------------------------------
-# MENU CON 1: CẤU HÌNH TELEGRAM
+# SUBMENU: TELEGRAM SETTINGS
 # ------------------------------------------------------------------------------
 submenu_telegram() {
     while true; do
         load_config
-        local st_label="ĐANG BẬT (true)"
-        [[ "$TELEGRAM_ENABLED" != "true" ]] && st_label="ĐANG TẮT (false)"
-        local tok_mask="${TELEGRAM_BOT_TOKEN:-<Chưa cài đặt>}"
-        local cid_mask="${TELEGRAM_CHAT_ID:-<Chưa cài đặt>}"
+        local st_label="ENABLED (true)"
+        [[ "$TELEGRAM_ENABLED" != "true" ]] && st_label="DISABLED (false)"
+        local tok_mask="${TELEGRAM_BOT_TOKEN:-<Not configured>}"
+        local cid_mask="${TELEGRAM_CHAT_ID:-<Not configured>}"
 
         local choice
-        choice=$(ui_select_menu "CẤU HÌNH CẢNH BÁO TELEGRAM" \
-            "Chọn mục cần thay đổi cho kênh thông báo Telegram:" \
-            "1" "Trạng thái Telegram       : ${st_label} (Chọn để Bật/Tắt)" \
-            "2" "Nhập Telegram Bot Token   : ${tok_mask}" \
-            "3" "Nhập Telegram Chat ID     : ${cid_mask}" \
-            "4" "Gửi thử tin nhắn Test Telegram ngay" \
-            "0" "Quay lại Menu chính")
+        choice=$(ui_select_menu "TELEGRAM ALERT SETTINGS" \
+            "Select a Telegram configuration option:" \
+            "1" "Telegram Alerts        : ${st_label} (Select to Toggle)" \
+            "2" "Set Telegram Bot Token : ${tok_mask}" \
+            "3" "Set Telegram Chat ID   : ${cid_mask}" \
+            "4" "Send Test Alert Now" \
+            "0" "Back")
 
         case "$choice" in
             1)
@@ -1428,18 +1422,18 @@ submenu_telegram() {
                 ;;
             2)
                 local new_tok
-                new_tok=$(ui_input_box "TELEGRAM BOT TOKEN" "Nhập Token của Bot Telegram (Lấy từ @BotFather):" "$TELEGRAM_BOT_TOKEN")
+                new_tok=$(ui_input_box "TELEGRAM BOT TOKEN" "Enter Telegram Bot Token (from @BotFather):" "$TELEGRAM_BOT_TOKEN")
                 update_cfg_var "TELEGRAM_BOT_TOKEN" "$new_tok"
                 ;;
             3)
                 local new_cid
-                new_cid=$(ui_input_box "TELEGRAM CHAT ID" "Nhập Chat ID cá nhân hoặc Nhóm (Ví dụ: -100123456789):" "$TELEGRAM_CHAT_ID")
+                new_cid=$(ui_input_box "TELEGRAM CHAT ID" "Enter User or Group Chat ID (e.g. -100123456789):" "$TELEGRAM_CHAT_ID")
                 update_cfg_var "TELEGRAM_CHAT_ID" "$new_cid"
                 ;;
             4)
                 local out
                 out=$(run_test_alert 2>&1 || true)
-                ui_msg_box "KẾT QUẢ TEST CẢNH BÁO" "$out"
+                ui_msg_box "TEST ALERT RESULT" "$out"
                 ;;
             0|"")
                 break
@@ -1449,25 +1443,25 @@ submenu_telegram() {
 }
 
 # ------------------------------------------------------------------------------
-# MENU CON 2: CẤU HÌNH EMAIL & SMTP
+# SUBMENU: EMAIL & SMTP SETTINGS
 # ------------------------------------------------------------------------------
 submenu_email() {
     while true; do
         load_config
-        resolve_zimbra_Settings
-        local st_label="ĐANG BẬT (true)"
-        [[ "$EMAIL_ENABLED" != "true" ]] && st_label="ĐANG TẮT (false)"
+        resolve_zimbra_settings
+        local st_label="ENABLED (true)"
+        [[ "$EMAIL_ENABLED" != "true" ]] && st_label="DISABLED (false)"
 
         local choice
-        choice=$(ui_select_menu "CẤU HÌNH CẢNH BÁO EMAIL & SMTP" \
-            "Email hệ thống phát hiện tự động: ${RESOLVED_EMAIL_TO}" \
-            "1" "Trạng thái cảnh báo Email : ${st_label} (Chọn để Bật/Tắt)" \
-            "2" "Chọn Phương thức gửi      : ${EMAIL_DELIVERY_MODE} (auto / local / smtp)" \
-            "3" "Chọn Email NHẬN cảnh báo  : ${ALERT_EMAIL_TO} (-> ${RESOLVED_EMAIL_TO})" \
-            "4" "Chọn Email GỬI (From)     : ${ALERT_EMAIL_FROM} (-> ${RESOLVED_EMAIL_FROM})" \
-            "5" "Cấu hình SMTP bên ngoài dự phòng (Host: ${SMTP_HOST:-Trống})" \
-            "6" "Gửi thử Email kiểm tra ngay" \
-            "0" "Quay lại Menu chính")
+        choice=$(ui_select_menu "EMAIL & SMTP ALERT SETTINGS" \
+            "Auto-detected Zimbra Admin Email: ${RESOLVED_EMAIL_TO}" \
+            "1" "Email Alerts           : ${st_label} (Select to Toggle)" \
+            "2" "Delivery Mode          : ${EMAIL_DELIVERY_MODE} (auto / local / smtp)" \
+            "3" "Alert Recipient (To)   : ${ALERT_EMAIL_TO} (-> ${RESOLVED_EMAIL_TO})" \
+            "4" "Alert Sender (From)    : ${ALERT_EMAIL_FROM} (-> ${RESOLVED_EMAIL_FROM})" \
+            "5" "External Fallback SMTP : ${SMTP_HOST:-Not set}" \
+            "6" "Send Test Alert Now" \
+            "0" "Back")
 
         case "$choice" in
             1)
@@ -1479,12 +1473,12 @@ submenu_email() {
                 ;;
             2)
                 local mode_sel
-                mode_sel=$(ui_select_menu "CHỌN PHƯƠNG THỨC GỬI EMAIL" \
-                    "Anh muốn hệ thống gửi Email cảnh báo theo cơ chế nào?" \
-                    "1" "auto  - Tự động (Dùng Postfix nội bộ Zimbra, lỗi tự chuyển SMTP ngoài)" \
-                    "2" "local - Chỉ dùng Postfix nội bộ của Zimbra (Không cần nhập SMTP)" \
-                    "3" "smtp  - Chỉ dùng máy chủ SMTP bên ngoài" \
-                    "0" "Hủy")
+                mode_sel=$(ui_select_menu "SELECT EMAIL DELIVERY MODE" \
+                    "Choose how alert emails should be delivered:" \
+                    "1" "auto  - Local Zimbra Postfix first, fallback to External SMTP" \
+                    "2" "local - Only use Local Zimbra Postfix (No SMTP password needed)" \
+                    "3" "smtp  - Only use External SMTP Server" \
+                    "0" "Cancel")
                 case "$mode_sel" in
                     1) update_cfg_var "EMAIL_DELIVERY_MODE" "auto" ;;
                     2) update_cfg_var "EMAIL_DELIVERY_MODE" "local" ;;
@@ -1493,40 +1487,40 @@ submenu_email() {
                 ;;
             3)
                 local to_sel
-                to_sel=$(ui_select_menu "CHỌN ĐỊA CHỈ EMAIL NHẬN CẢNH BÁO" \
-                    "Chọn cách thiết lập địa chỉ nhận Email cảnh báo:" \
-                    "1" "Tự động lấy Email Admin của hệ thống Zimbra (auto -> ${RESOLVED_EMAIL_TO})" \
-                    "2" "Nhập địa chỉ Email nhận tùy chỉnh (Ví dụ: admin@domain.com,it@gmail.com)" \
-                    "0" "Quay lại")
+                to_sel=$(ui_select_menu "SELECT ALERT RECIPIENT EMAIL" \
+                    "Choose recipient configuration:" \
+                    "1" "Auto-detect Zimbra System Admin Email (auto -> ${RESOLVED_EMAIL_TO})" \
+                    "2" "Enter custom recipient email(s) (comma-separated)" \
+                    "0" "Back")
                 if [[ "$to_sel" == "1" ]]; then
                     update_cfg_var "ALERT_EMAIL_TO" "auto"
                 elif [[ "$to_sel" == "2" ]]; then
                     local custom_to
-                    custom_to=$(ui_input_box "NHẬP EMAIL NHẬN CẢNH BÁO" "Nhập 1 hoặc nhiều email (cách nhau bằng dấu phẩy):" "$ALERT_EMAIL_TO")
+                    custom_to=$(ui_input_box "ALERT RECIPIENT EMAIL" "Enter one or more emails (comma-separated):" "$ALERT_EMAIL_TO")
                     update_cfg_var "ALERT_EMAIL_TO" "$custom_to"
                 fi
                 ;;
             4)
                 local from_sel
-                from_sel=$(ui_select_menu "CHỌN ĐỊA CHỈ EMAIL GỬI (FROM)" \
-                    "Chọn cách thiết lập địa chỉ gửi (From):" \
-                    "1" "Tự động lấy từ hệ thống Zimbra (auto)" \
-                    "2" "Nhập địa chỉ From tùy chỉnh" \
-                    "0" "Quay lại")
+                from_sel=$(ui_select_menu "SELECT ALERT SENDER (FROM)" \
+                    "Choose sender address configuration:" \
+                    "1" "Auto-detect from Zimbra system (auto)" \
+                    "2" "Enter custom From email address" \
+                    "0" "Back")
                 if [[ "$from_sel" == "1" ]]; then
                     update_cfg_var "ALERT_EMAIL_FROM" "auto"
                 elif [[ "$from_sel" == "2" ]]; then
                     local custom_from
-                    custom_from=$(ui_input_box "NHẬP EMAIL GỬI (FROM)" "Nhập địa chỉ email gửi đi:" "$ALERT_EMAIL_FROM")
+                    custom_from=$(ui_input_box "ALERT SENDER EMAIL" "Enter sender From email address:" "$ALERT_EMAIL_FROM")
                     update_cfg_var "ALERT_EMAIL_FROM" "$custom_from"
                 fi
                 ;;
             5)
                 local shost sport suser spass
-                shost=$(ui_input_box "SMTP HOST" "Nhập địa chỉ máy chủ SMTP (Ví dụ: smtp.gmail.com):" "$SMTP_HOST")
-                sport=$(ui_input_box "SMTP PORT" "Nhập cổng SMTP (587 hoặc 465):" "$SMTP_PORT")
-                suser=$(ui_input_box "SMTP USER" "Nhập tài khoản đăng nhập SMTP:" "$SMTP_USER")
-                spass=$(ui_input_box "SMTP PASSWORD" "Nhập mật khẩu / App Password SMTP:" "$SMTP_PASS")
+                shost=$(ui_input_box "SMTP HOST" "Enter external SMTP server (e.g. smtp.gmail.com):" "$SMTP_HOST")
+                sport=$(ui_input_box "SMTP PORT" "Enter SMTP port (587 or 465):" "$SMTP_PORT")
+                suser=$(ui_input_box "SMTP USER" "Enter SMTP username:" "$SMTP_USER")
+                spass=$(ui_input_box "SMTP PASSWORD" "Enter SMTP password / App Password:" "$SMTP_PASS")
                 update_cfg_var "SMTP_HOST" "$shost"
                 update_cfg_var "SMTP_PORT" "$sport"
                 update_cfg_var "SMTP_USER" "$suser"
@@ -1535,7 +1529,7 @@ submenu_email() {
             6)
                 local out
                 out=$(run_test_alert 2>&1 || true)
-                ui_msg_box "KẾT QUẢ TEST CẢNH BÁO" "$out"
+                ui_msg_box "TEST ALERT RESULT" "$out"
                 ;;
             0|"")
                 break
@@ -1545,44 +1539,86 @@ submenu_email() {
 }
 
 # ------------------------------------------------------------------------------
-# MENU CON 3: CHỈNH SỬA NGƯỠNG PHÁT HIỆN SPAM (CHỌN TỪNG NGƯỠNG)
+# COMBINED SUBMENU [2]: NOTIFICATIONS & TEST ALERT (TELEGRAM + EMAIL + TEST)
+# ------------------------------------------------------------------------------
+submenu_notifications() {
+    while true; do
+        load_config
+        resolve_zimbra_settings
+
+        local tg_badge="ON"
+        [[ "$TELEGRAM_ENABLED" != "true" ]] && tg_badge="OFF"
+        [[ -z "$TELEGRAM_BOT_TOKEN" ]] && tg_badge="${tg_badge} (No Token)"
+
+        local mail_badge="ON (${EMAIL_DELIVERY_MODE} -> ${RESOLVED_EMAIL_TO})"
+        [[ "$EMAIL_ENABLED" != "true" ]] && mail_badge="OFF"
+
+        local choice
+        choice=$(ui_select_menu "NOTIFICATION CHANNELS & TEST ALERT" \
+            "Configure Telegram, Email/SMTP, or send a test notification:" \
+            "1" "Configure Telegram Alerts      [${tg_badge}]" \
+            "2" "Configure Email & SMTP Alerts  [${mail_badge}]" \
+            "3" "Send Test Alert Now            (Telegram & Email)" \
+            "0" "Back to Main Menu")
+
+        case "$choice" in
+            1)
+                submenu_telegram
+                ;;
+            2)
+                submenu_email
+                ;;
+            3)
+                local test_out
+                test_out=$(run_test_alert 2>&1 || true)
+                ui_msg_box "TEST ALERT RESULT" "$test_out"
+                ;;
+            0|"")
+                break
+                ;;
+        esac
+    done
+}
+
+# ------------------------------------------------------------------------------
+# SUBMENU [3]: SPAM DETECTION THRESHOLDS
 # ------------------------------------------------------------------------------
 submenu_thresholds() {
     while true; do
         load_config
-        local hr_label="ĐANG BẬT"
-        [[ "$ENABLE_HOURLY_CHECK" != "true" ]] && hr_label="ĐANG TẮT"
-        local int_label="Chỉ đếm mail gửi ra ngoài Internet"
-        [[ "$COUNT_INTERNAL_TO_INTERNAL" == "true" ]] && int_label="Đếm cả mail gửi nội bộ"
+        local hr_label="ENABLED"
+        [[ "$ENABLE_HOURLY_CHECK" != "true" ]] && hr_label="DISABLED"
+        local int_label="External outbound & SASL only"
+        [[ "$COUNT_INTERNAL_TO_INTERNAL" == "true" ]] && int_label="Count all (including internal)"
 
         local choice
-        choice=$(ui_select_menu "CHỈNH SỬA NGƯỠNG CẢNH BÁO SPAM" \
-            "Chọn đúng thông số ngưỡng mà anh muốn điều chỉnh:" \
-            "1" "Khoảng thời gian quét ngắn (Phút)      : ${LOOKBACK_MINUTES} phút" \
-            "2" "Ngưỡng WARNING trong ${LOOKBACK_MINUTES} phút          : >= ${WARN_SENT_PER_WINDOW} email" \
-            "3" "Ngưỡng CRITICAL trong ${LOOKBACK_MINUTES} phút         : >= ${CRIT_SENT_PER_WINDOW} email" \
-            "4" "Kiểm tra ngưỡng theo Giờ (60 phút)     : ${hr_label} (Chọn để Bật/Tắt)" \
-            "5" "Ngưỡng WARNING trong 1 Giờ (60 phút)   : >= ${WARN_SENT_PER_HOUR} email" \
-            "6" "Ngưỡng CRITICAL trong 1 Giờ (60 phút)  : >= ${CRIT_SENT_PER_HOUR} email" \
-            "7" "Ngưỡng WARNING kẹt trong Queue/1 User  : >= ${WARN_QUEUE_PER_USER} email" \
-            "8" "Ngưỡng CRITICAL kẹt trong Queue/1 User : >= ${CRIT_QUEUE_PER_USER} email" \
-            "9" "Ngưỡng WARNING Tổng Queue toàn Server  : >= ${WARN_TOTAL_QUEUE} email" \
-            "10" "Thời gian chống lặp thông báo Cooldown : ${ALERT_COOLDOWN_MINUTES} phút" \
-            "11" "Phạm vi đếm mail                       : ${int_label}" \
-            "0" "Quay lại Menu chính")
+        choice=$(ui_select_menu "EDIT SPAM DETECTION THRESHOLDS" \
+            "Select any threshold parameter below to modify:" \
+            "1" "Short Scan Window (Minutes)           : ${LOOKBACK_MINUTES} mins" \
+            "2" "WARNING Limit in ${LOOKBACK_MINUTES} mins               : >= ${WARN_SENT_PER_WINDOW} emails" \
+            "3" "CRITICAL Limit in ${LOOKBACK_MINUTES} mins              : >= ${CRIT_SENT_PER_WINDOW} emails" \
+            "4" "Hourly Check (60 mins)                : ${hr_label} (Select to Toggle)" \
+            "5" "WARNING Limit in 60 mins (1 Hour)     : >= ${WARN_SENT_PER_HOUR} emails" \
+            "6" "CRITICAL Limit in 60 mins (1 Hour)    : >= ${CRIT_SENT_PER_HOUR} emails" \
+            "7" "WARNING Queue Limit per User          : >= ${WARN_QUEUE_PER_USER} emails" \
+            "8" "CRITICAL Queue Limit per User         : >= ${CRIT_QUEUE_PER_USER} emails" \
+            "9" "WARNING Total Server Queue Limit      : >= ${WARN_TOTAL_QUEUE} emails" \
+            "10" "Alert Cooldown Interval               : ${ALERT_COOLDOWN_MINUTES} mins" \
+            "11" "Traffic Counting Scope                : ${int_label}" \
+            "0" "Back to Main Menu")
 
         local val=""
         case "$choice" in
             1)
-                val=$(ui_input_box "KHOẢNG THỜI GIAN QUÉT NGẮN (PHÚT)" "Nhập số phút quét log gần nhất (Ví dụ: 5, 10, 15):" "$LOOKBACK_MINUTES")
+                val=$(ui_input_box "SHORT SCAN WINDOW (MINUTES)" "Enter short lookback window in minutes (e.g. 5, 10, 15):" "$LOOKBACK_MINUTES")
                 [[ "$val" =~ ^[0-9]+$ ]] && update_cfg_num "LOOKBACK_MINUTES" "$val"
                 ;;
             2)
-                val=$(ui_input_box "NGƯỠNG WARNING (${LOOKBACK_MINUTES} PHÚT)" "Số lượng email gửi trong ${LOOKBACK_MINUTES} phút để báo WARNING:" "$WARN_SENT_PER_WINDOW")
+                val=$(ui_input_box "WARNING LIMIT (${LOOKBACK_MINUTES} MINS)" "Emails sent in ${LOOKBACK_MINUTES} mins to trigger WARNING:" "$WARN_SENT_PER_WINDOW")
                 [[ "$val" =~ ^[0-9]+$ ]] && update_cfg_num "WARN_SENT_PER_WINDOW" "$val"
                 ;;
             3)
-                val=$(ui_input_box "NGƯỠNG CRITICAL (${LOOKBACK_MINUTES} PHÚT)" "Số lượng email gửi trong ${LOOKBACK_MINUTES} phút để báo CRITICAL & Khóa:" "$CRIT_SENT_PER_WINDOW")
+                val=$(ui_input_box "CRITICAL LIMIT (${LOOKBACK_MINUTES} MINS)" "Emails sent in ${LOOKBACK_MINUTES} mins to trigger CRITICAL:" "$CRIT_SENT_PER_WINDOW")
                 [[ "$val" =~ ^[0-9]+$ ]] && update_cfg_num "CRIT_SENT_PER_WINDOW" "$val"
                 ;;
             4)
@@ -1593,27 +1629,27 @@ submenu_thresholds() {
                 fi
                 ;;
             5)
-                val=$(ui_input_box "NGƯỠNG WARNING THEO GIỜ (60 PHÚT)" "Số lượng email gửi trong 60 phút để báo WARNING:" "$WARN_SENT_PER_HOUR")
+                val=$(ui_input_box "HOURLY WARNING LIMIT (60 MINS)" "Emails sent in 60 mins to trigger WARNING:" "$WARN_SENT_PER_HOUR")
                 [[ "$val" =~ ^[0-9]+$ ]] && update_cfg_num "WARN_SENT_PER_HOUR" "$val"
                 ;;
             6)
-                val=$(ui_input_box "NGƯỠNG CRITICAL THEO GIỜ (60 PHÚT)" "Số lượng email gửi trong 60 phút để báo CRITICAL & Khóa:" "$CRIT_SENT_PER_HOUR")
+                val=$(ui_input_box "HOURLY CRITICAL LIMIT (60 MINS)" "Emails sent in 60 mins to trigger CRITICAL:" "$CRIT_SENT_PER_HOUR")
                 [[ "$val" =~ ^[0-9]+$ ]] && update_cfg_num "CRIT_SENT_PER_HOUR" "$val"
                 ;;
             7)
-                val=$(ui_input_box "NGƯỠNG WARNING QUEUE / USER" "Số lượng email đang kẹt trong Queue của 1 tài khoản để báo WARNING:" "$WARN_QUEUE_PER_USER")
+                val=$(ui_input_box "USER QUEUE WARNING LIMIT" "Queued messages for 1 user to trigger WARNING:" "$WARN_QUEUE_PER_USER")
                 [[ "$val" =~ ^[0-9]+$ ]] && update_cfg_num "WARN_QUEUE_PER_USER" "$val"
                 ;;
             8)
-                val=$(ui_input_box "NGƯỠNG CRITICAL QUEUE / USER" "Số lượng email đang kẹt trong Queue của 1 tài khoản để báo CRITICAL:" "$CRIT_QUEUE_PER_USER")
+                val=$(ui_input_box "USER QUEUE CRITICAL LIMIT" "Queued messages for 1 user to trigger CRITICAL:" "$CRIT_QUEUE_PER_USER")
                 [[ "$val" =~ ^[0-9]+$ ]] && update_cfg_num "CRIT_QUEUE_PER_USER" "$val"
                 ;;
             9)
-                val=$(ui_input_box "NGƯỠNG TỔNG QUEUE TOÀN SERVER" "Tổng số lượng mail trong Queue toàn hệ thống để cảnh báo nghẽn:" "$WARN_TOTAL_QUEUE")
+                val=$(ui_input_box "TOTAL SERVER QUEUE LIMIT" "Total Postfix queue size to trigger congestion warning:" "$WARN_TOTAL_QUEUE")
                 [[ "$val" =~ ^[0-9]+$ ]] && update_cfg_num "WARN_TOTAL_QUEUE" "$val"
                 ;;
             10)
-                val=$(ui_input_box "THỜI GIAN COOLDOWN (PHÚT)" "Số phút chờ giữa 2 lần gửi cảnh báo cùng mức cho cùng 1 tài khoản:" "$ALERT_COOLDOWN_MINUTES")
+                val=$(ui_input_box "ALERT COOLDOWN (MINUTES)" "Minutes to wait before repeating the same alert for a user:" "$ALERT_COOLDOWN_MINUTES")
                 [[ "$val" =~ ^[0-9]+$ ]] && update_cfg_num "ALERT_COOLDOWN_MINUTES" "$val"
                 ;;
             11)
@@ -1631,25 +1667,25 @@ submenu_thresholds() {
 }
 
 # ------------------------------------------------------------------------------
-# MENU CON 4: TỰ ĐỘNG KHÓA & MỞ KHÓA TÀI KHOẢN (CHỌN TỪ DANH SÁCH)
+# SUBMENU [4]: AUTO-LOCK & UNLOCK ACCOUNTS
 # ------------------------------------------------------------------------------
 submenu_lock_control() {
     while true; do
         load_config
-        local lock_label="ĐANG BẬT (Tự động khóa khi chạm mức CRITICAL)"
-        [[ "$AUTO_LOCK_ON_CRITICAL" != "true" ]] && lock_label="ĐANG TẮT (Chỉ gửi cảnh báo, không khóa)"
+        local lock_label="ENABLED (Auto-lock account on CRITICAL)"
+        [[ "$AUTO_LOCK_ON_CRITICAL" != "true" ]] && lock_label="DISABLED (Alert only, do not lock)"
 
-        local hold_label="ĐANG TẮT"
-        [[ "$AUTO_HOLD_QUEUE_ON_CRITICAL" == "true" ]] && hold_label="ĐANG BẬT (Tự động Hold mail trong Queue)"
+        local hold_label="DISABLED"
+        [[ "$AUTO_HOLD_QUEUE_ON_CRITICAL" == "true" ]] && hold_label="ENABLED (Hold user queue on CRITICAL)"
 
         local choice
-        choice=$(ui_select_menu "TỰ ĐỘNG KHÓA & MỞ KHÓA TÀI KHOẢN" \
-            "Quản lý cơ chế tự động khóa và mở khóa tài khoản Zimbra:" \
-            "1" "Tự động khóa khi CRITICAL : ${lock_label}" \
-            "2" "Tạm giữ Queue khi CRITICAL: ${hold_label}" \
-            "3" "Chọn mở khóa tài khoản vừa bị khóa tự động (Từ danh sách)" \
-            "4" "Nhập địa chỉ Email bất kỳ để mở khóa (active)" \
-            "0" "Quay lại Menu chính")
+        choice=$(ui_select_menu "AUTO-LOCK & UNLOCK ZIMBRA ACCOUNTS" \
+            "Manage automatic account remediation and unlock accounts:" \
+            "1" "Auto-Lock on CRITICAL  : ${lock_label}" \
+            "2" "Hold Queue on CRITICAL : ${hold_label}" \
+            "3" "Select & Unlock Recently Auto-Locked Account" \
+            "4" "Unlock Account Manually by Email Address" \
+            "0" "Back to Main Menu")
 
         case "$choice" in
             1)
@@ -1669,38 +1705,38 @@ submenu_lock_control() {
             3)
                 local locked_file="$STATE_DIR/locked_accounts.db"
                 if [[ ! -s "$locked_file" ]]; then
-                    ui_msg_box "DANH SÁCH TRỐNG" "Hiện tại chưa có tài khoản nào trong danh sách bị khóa tự động bởi hệ thống."
+                    ui_msg_box "NO LOCKED ACCOUNTS" "No accounts are currently recorded in the auto-locked list."
                 else
                     local menu_args=()
                     local idx=1
                     local acc_map=()
                     while IFS='|' read -r acc ltime; do
                         [[ -z "$acc" ]] && continue
-                        menu_args+=("$idx" "${acc} (Khóa lúc: ${ltime})")
+                        menu_args+=("$idx" "${acc} (Locked at: ${ltime})")
                         acc_map[$idx]="$acc"
                         idx=$(( idx + 1 ))
                     done < "$locked_file"
-                    menu_args+=("0" "Quay lại")
+                    menu_args+=("0" "Back")
 
                     local sel_idx
-                    sel_idx=$(ui_select_menu "CHỌN TÀI KHOẢN CẦN MỞ KHÓA" \
-                        "Chọn tài khoản anh muốn mở khóa (chuyển về active):" \
+                    sel_idx=$(ui_select_menu "SELECT ACCOUNT TO UNLOCK" \
+                        "Choose an account to set back to 'active':" \
                         "${menu_args[@]}")
                     if [[ -n "$sel_idx" && "$sel_idx" != "0" && -n "${acc_map[$sel_idx]:-}" ]]; then
                         local target_acc="${acc_map[$sel_idx]}"
                         local u_out
                         u_out=$(unlock_account "$target_acc" 2>&1 || true)
-                        ui_msg_box "KẾT QUẢ MỞ KHÓA" "$u_out"
+                        ui_msg_box "UNLOCK RESULT" "$u_out"
                     fi
                 fi
                 ;;
             4)
                 local manual_acc
-                manual_acc=$(ui_input_box "MỞ KHÓA TÀI KHOẢN" "Nhập địa chỉ email cần mở khóa (Ví dụ: user@domain.com):" "")
+                manual_acc=$(ui_input_box "UNLOCK ACCOUNT" "Enter email address to unlock (e.g. user@domain.com):" "")
                 if [[ -n "$manual_acc" ]]; then
                     local u_out
                     u_out=$(unlock_account "$manual_acc" 2>&1 || true)
-                    ui_msg_box "KẾT QUẢ MỞ KHÓA" "$u_out"
+                    ui_msg_box "UNLOCK RESULT" "$u_out"
                 fi
                 ;;
             0|"")
@@ -1711,7 +1747,7 @@ submenu_lock_control() {
 }
 
 # ------------------------------------------------------------------------------
-# MENU CON 5: QUẢN LÝ DANH SÁCH MIỄN TRỪ (WHITELIST) BẰNG CÁCH CHỌN
+# SUBMENU [5]: WHITELIST MANAGEMENT
 # ------------------------------------------------------------------------------
 submenu_whitelist() {
     while true; do
@@ -1723,28 +1759,28 @@ submenu_whitelist() {
         count_wl=$(grep -v '^[[:space:]]*#' "$WHITELIST_FILE" 2>/dev/null | grep -c '[^[:space:]]' || true)
 
         local choice
-        choice=$(ui_select_menu "QUẢN LÝ DANH SÁCH MIỄN TRỪ (WHITELIST)" \
-            "Hiện đang có ${count_wl} mục trong Whitelist (${WHITELIST_FILE}):" \
-            "1" "Xem danh sách các Email / Domain đang được miễn trừ" \
-            "2" "Thêm Email hoặc @domain.com mới vào Whitelist" \
-            "3" "Chọn xóa Email / Domain khỏi Whitelist (Chọn từ danh sách)" \
-            "0" "Quay lại Menu chính")
+        choice=$(ui_select_menu "MANAGE SENDER WHITELIST" \
+            "Currently ${count_wl} whitelisted entries (${WHITELIST_FILE}):" \
+            "1" "View Current Whitelist" \
+            "2" "Add Email or @domain.com to Whitelist" \
+            "3" "Select & Remove Entry from Whitelist" \
+            "0" "Back to Main Menu")
 
         case "$choice" in
             1)
                 local list_txt
                 list_txt=$(grep -v '^[[:space:]]*#' "$WHITELIST_FILE" 2>/dev/null | sed '/^[[:space:]]*$/d' || true)
                 if [[ -z "$list_txt" ]]; then
-                    list_txt="(Danh sách Whitelist hiện đang trống)"
+                    list_txt="(Whitelist is currently empty)"
                 fi
-                ui_msg_box "DANH SÁCH WHITELIST HIỆN TẠI" "$list_txt"
+                ui_msg_box "WHITELIST ENTRIES" "$list_txt"
                 ;;
             2)
                 local new_wl
-                new_wl=$(ui_input_box "THÊM VÀO WHITELIST" "Nhập địa chỉ email (vd: marketing@domain.com) hoặc cả tên miền (@domain.com):" "")
+                new_wl=$(ui_input_box "ADD TO WHITELIST" "Enter email (e.g. marketing@domain.com) or domain (@domain.com):" "")
                 if [[ -n "$new_wl" ]]; then
                     echo "$new_wl" >> "$WHITELIST_FILE"
-                    ui_msg_box "ĐÃ THÊM WHITELIST" "Đã thêm '${new_wl}' vào danh sách miễn trừ thành công!"
+                    ui_msg_box "WHITELIST UPDATED" "Added '${new_wl}' to whitelist."
                 fi
                 ;;
             3)
@@ -1761,18 +1797,18 @@ submenu_whitelist() {
                 done < "$WHITELIST_FILE"
 
                 if (( idx == 1 )); then
-                    ui_msg_box "WHITELIST TRỐNG" "Không có mục nào trong Whitelist để xóa."
+                    ui_msg_box "WHITELIST EMPTY" "There are no entries to remove."
                 else
-                    wl_items+=("0" "Quay lại")
+                    wl_items+=("0" "Back")
                     local del_idx
-                    del_idx=$(ui_select_menu "CHỌN MỤC CẦN XÓA KHỎI WHITELIST" \
-                        "Chọn địa chỉ anh muốn gỡ khỏi danh sách miễn trừ:" \
+                    del_idx=$(ui_select_menu "REMOVE WHITELIST ENTRY" \
+                        "Select entry to remove from whitelist:" \
                         "${wl_items[@]}")
                     if [[ -n "$del_idx" && "$del_idx" != "0" && -n "${wl_map[$del_idx]:-}" ]]; then
                         local target_del="${wl_map[$del_idx]}"
                         grep -v -F "$target_del" "$WHITELIST_FILE" > "${WHITELIST_FILE}.tmp" 2>/dev/null || true
                         mv -f "${WHITELIST_FILE}.tmp" "$WHITELIST_FILE"
-                        ui_msg_box "ĐÃ XÓA" "Đã xóa '${target_del}' khỏi Whitelist."
+                        ui_msg_box "REMOVED" "Removed '${target_del}' from whitelist."
                     fi
                 fi
                 ;;
@@ -1784,121 +1820,79 @@ submenu_whitelist() {
 }
 
 # ------------------------------------------------------------------------------
-# MENU CON 6: CHỌN CHU KỲ QUÉT TỰ ĐỘNG (CRONJOB)
+# SUBMENU [6]: CRON CHECK SCHEDULE
 # ------------------------------------------------------------------------------
 submenu_cron_schedule() {
     local cur_cron
     cur_cron=$(get_current_cron_interval)
 
     local choice
-    choice=$(ui_select_menu "CHỌN CHU KỲ QUÉT TỰ ĐỘNG (CRON)" \
-        "Chu kỳ hiện tại: ${cur_cron} (File: ${CRON_FILE})" \
-        "1" "Quét mỗi 1 phút / lần   (*/1 * * * *)" \
-        "2" "Quét mỗi 2 phút / lần   (*/2 * * * *)" \
-        "3" "Quét mỗi 5 phút / lần   (*/5 * * * * - Khuyên dùng)" \
-        "4" "Quét mỗi 10 phút / lần  (*/10 * * * *)" \
-        "5" "Quét mỗi 15 phút / lần  (*/15 * * * *)" \
-        "6" "Quét mỗi 30 phút / lần  (*/30 * * * *)" \
-        "7" "Tạm dừng lịch quét Cron" \
-        "0" "Quay lại Menu chính")
+    choice=$(ui_select_menu "CHANGE CRON CHECK SCHEDULE" \
+        "Current Schedule: ${cur_cron} (${CRON_FILE})" \
+        "1" "Every 1 minute    (*/1 * * * *)" \
+        "2" "Every 2 minutes   (*/2 * * * *)" \
+        "3" "Every 5 minutes   (*/5 * * * * - Recommended)" \
+        "4" "Every 10 minutes  (*/10 * * * *)" \
+        "5" "Every 15 minutes  (*/15 * * * *)" \
+        "6" "Every 30 minutes  (*/30 * * * *)" \
+        "7" "Pause Automatic Cron Schedule" \
+        "0" "Back to Main Menu")
 
     case "$choice" in
-        1) set_cron_interval_minutes "1";  ui_msg_box "ĐÃ CẬP NHẬT" "Đã đặt chu kỳ quét: 1 phút / lần." ;;
-        2) set_cron_interval_minutes "2";  ui_msg_box "ĐÃ CẬP NHẬT" "Đã đặt chu kỳ quét: 2 phút / lần." ;;
-        3) set_cron_interval_minutes "5";  ui_msg_box "ĐÃ CẬP NHẬT" "Đã đặt chu kỳ quét: 5 phút / lần." ;;
-        4) set_cron_interval_minutes "10"; ui_msg_box "ĐÃ CẬP NHẬT" "Đã đặt chu kỳ quét: 10 phút / lần." ;;
-        5) set_cron_interval_minutes "15"; ui_msg_box "ĐÃ CẬP NHẬT" "Đã đặt chu kỳ quét: 15 phút / lần." ;;
-        6) set_cron_interval_minutes "30"; ui_msg_box "ĐÃ CẬP NHẬT" "Đã đặt chu kỳ quét: 30 phút / lần." ;;
-        7) set_cron_interval_minutes "disable"; ui_msg_box "ĐÃ TẠM DỪNG" "Đã tạm dừng Cronjob quét tự động." ;;
+        1) set_cron_interval_minutes "1";  ui_msg_box "SCHEDULE UPDATED" "Scan interval set to: Every 1 minute." ;;
+        2) set_cron_interval_minutes "2";  ui_msg_box "SCHEDULE UPDATED" "Scan interval set to: Every 2 minutes." ;;
+        3) set_cron_interval_minutes "5";  ui_msg_box "SCHEDULE UPDATED" "Scan interval set to: Every 5 minutes." ;;
+        4) set_cron_interval_minutes "10"; ui_msg_box "SCHEDULE UPDATED" "Scan interval set to: Every 10 minutes." ;;
+        5) set_cron_interval_minutes "15"; ui_msg_box "SCHEDULE UPDATED" "Scan interval set to: Every 15 minutes." ;;
+        6) set_cron_interval_minutes "30"; ui_msg_box "SCHEDULE UPDATED" "Scan interval set to: Every 30 minutes." ;;
+        7) set_cron_interval_minutes "disable"; ui_msg_box "SCHEDULE PAUSED" "Automatic cron scan has been paused." ;;
     esac
 }
 
 # ------------------------------------------------------------------------------
-# MENU CON GỘP: CẤU HÌNH KÊNH CẢNH BÁO (TELEGRAM, EMAIL & TEST)
-# ------------------------------------------------------------------------------
-submenu_notifications() {
-    while true; do
-        load_config
-        resolve_zimbra_Settings
-
-        local tg_badge="ĐANG BẬT"
-        [[ "$TELEGRAM_ENABLED" != "true" ]] && tg_badge="ĐANG TẮT"
-        [[ -z "$TELEGRAM_BOT_TOKEN" ]] && tg_badge="${tg_badge} (Chưa nhập Token)"
-
-        local mail_badge="ĐANG BẬT (${EMAIL_DELIVERY_MODE} -> ${RESOLVED_EMAIL_TO})"
-        [[ "$EMAIL_ENABLED" != "true" ]] && mail_badge="ĐANG TẮT"
-
-        local choice
-        choice=$(ui_select_menu "CẤU HÌNH KÊNH CẢNH BÁO (TELEGRAM & EMAIL)" \
-            "Chọn kênh thông báo cần cấu hình hoặc gửi tin nhắn kiểm tra:" \
-            "1" "Cấu hình Cảnh báo Telegram       [${tg_badge}]" \
-            "2" "Cấu hình Cảnh báo Email & SMTP   [${mail_badge}]" \
-            "3" "Gửi thử tin nhắn Test Cảnh Báo   (Telegram & Email)" \
-            "0" "Quay lại Menu chính")
-
-        case "$choice" in
-            1)
-                submenu_telegram
-                ;;
-            2)
-                submenu_email
-                ;;
-            3)
-                local test_out
-                test_out=$(run_test_alert 2>&1 || true)
-                ui_msg_box "KẾT QUẢ GỬI THỬ CẢNH BÁO" "$test_out"
-                ;;
-            0|"")
-                break
-                ;;
-        esac
-    done
-}
-
-# ------------------------------------------------------------------------------
-# BẢNG ĐIỀU KHIỂN CHÍNH (MAIN CONTROL PANEL)
+# MAIN CONTROL PANEL
 # ------------------------------------------------------------------------------
 run_interactive_menu() {
     while true; do
         load_config
-        resolve_zimbra_Settings
+        resolve_zimbra_settings
 
-        local mon_badge="ĐANG BẬT"
-        [[ "$MONITOR_ENABLED" != "true" ]] && mon_badge="ĐANG TẮT"
+        local mon_badge="ENABLED"
+        [[ "$MONITOR_ENABLED" != "true" ]] && mon_badge="DISABLED"
 
-        local lock_badge="BẬT"
-        [[ "$AUTO_LOCK_ON_CRITICAL" != "true" ]] && lock_badge="TẮT"
+        local lock_badge="ON"
+        [[ "$AUTO_LOCK_ON_CRITICAL" != "true" ]] && lock_badge="OFF"
 
         local cron_badge
         cron_badge=$(get_current_cron_interval)
 
-        local tg_badge="TG:BẬT"
-        [[ "$TELEGRAM_ENABLED" != "true" || -z "$TELEGRAM_BOT_TOKEN" ]] && tg_badge="TG:Chưa cài/Tắt"
+        local tg_badge="TG:ON"
+        [[ "$TELEGRAM_ENABLED" != "true" || -z "$TELEGRAM_BOT_TOKEN" ]] && tg_badge="TG:OFF/Unset"
         local em_badge="Mail:${RESOLVED_EMAIL_TO}"
-        [[ "$EMAIL_ENABLED" != "true" ]] && em_badge="Mail:TẮT"
+        [[ "$EMAIL_ENABLED" != "true" ]] && em_badge="Mail:OFF"
 
         local choice
-        choice=$(ui_select_menu "BẢNG ĐIỀU KHIỂN ZIMBRA SPAM MONITOR v${VERSION}" \
-            "Trạng thái: [${mon_badge}] | Chu kỳ: [${cron_badge}] | Khóa tự động: [${lock_badge}]" \
-            "1" "Xem Bảng Trạng Thái & Top Tài Khoản Gửi Mail hiện tại" \
-            "2" "Cấu hình Cảnh báo & Test (${tg_badge} | ${em_badge})" \
-            "3" "Chỉnh sửa Ngưỡng Cảnh Báo Spam (${LOOKBACK_MINUTES}p: ${WARN_SENT_PER_WINDOW}/${CRIT_SENT_PER_WINDOW} | 1h: ${WARN_SENT_PER_HOUR}/${CRIT_SENT_PER_HOUR})" \
-            "4" "Cài đặt Tự Động Khóa & Mở Khóa Tài Khoản (Auto-Lock: ${lock_badge})" \
-            "5" "Quản lý Danh Sách Miễn Trừ - Whitelist (Thêm / Chọn xóa)" \
-            "6" "Thay đổi Chu Kỳ Quét Tự Động Cron (${cron_badge})" \
-            "7" "Bật / Tắt toàn bộ hệ thống Giám Sát (Hiện tại: ${mon_badge})" \
-            "8" "Xem Nhật Ký Hoạt Động gần nhất (/var/log/zimbra-spam-monitor.log)" \
-            "0" "Thoát")
+        choice=$(ui_select_menu "ZIMBRA SPAM MONITOR CONTROL PANEL v${VERSION}" \
+            "Status: [${mon_badge}] | Cron: [${cron_badge}] | Auto-Lock: [${lock_badge}]" \
+            "1" "View System Status & Top Senders" \
+            "2" "Configure Alerts & Test (${tg_badge} | ${em_badge})" \
+            "3" "Edit Spam Thresholds (${LOOKBACK_MINUTES}m: ${WARN_SENT_PER_WINDOW}/${CRIT_SENT_PER_WINDOW} | 60m: ${WARN_SENT_PER_HOUR}/${CRIT_SENT_PER_HOUR})" \
+            "4" "Auto-Lock Settings & Unlock Accounts (Auto-Lock: ${lock_badge})" \
+            "5" "Manage Sender Whitelist (View / Add / Remove)" \
+            "6" "Change Cron Check Schedule (${cron_badge})" \
+            "7" "Enable / Disable Monitoring Service (Current: ${mon_badge})" \
+            "8" "View Recent Monitor Logs (/var/log/zimbra-spam-monitor.log)" \
+            "0" "Exit")
 
         case "$choice" in
             1)
                 local st_out
                 st_out=$(show_status 2>&1 || true)
                 if [[ -n "$(detect_tui_bin)" ]]; then
-                    ui_msg_box "TRẠNG THÁI HỆ THỐNG HIỆN TẠI" "$st_out"
+                    ui_msg_box "CURRENT SYSTEM STATUS" "$st_out"
                 else
                     echo "$st_out"
-                    read -r -p " Nhấn phím Enter để quay lại Menu..." _
+                    read -r -p " Press Enter to return to menu..." _ || true
                 fi
                 ;;
             2)
@@ -1919,21 +1913,21 @@ run_interactive_menu() {
             7)
                 if [[ "$MONITOR_ENABLED" == "true" ]]; then
                     update_cfg_var "MONITOR_ENABLED" "false"
-                    ui_msg_box "ĐÃ TẮT GIÁM SÁT" "Hệ thống giám sát đã chuyển sang trạng thái TẠM DỪNG (MONITOR_ENABLED=false)."
+                    ui_msg_box "MONITORING DISABLED" "Monitoring is now PAUSED (MONITOR_ENABLED=false)."
                 else
                     update_cfg_var "MONITOR_ENABLED" "true"
-                    ui_msg_box "ĐÃ BẬT GIÁM SÁT" "Hệ thống giám sát đã được BẬT trở lại (MONITOR_ENABLED=true)."
+                    ui_msg_box "MONITORING ENABLED" "Monitoring is now ACTIVE (MONITOR_ENABLED=true)."
                 fi
                 ;;
             8)
-                local log_txt="(Chưa có dữ liệu log)"
+                local log_txt="(No log entries yet)"
                 if [[ -f "$MONITOR_LOG_FILE" ]]; then
-                    log_txt=$(tail -n 25 "$MONITOR_LOG_FILE" 2>/dev/null || echo "(Trống)")
+                    log_txt=$(tail -n 25 "$MONITOR_LOG_FILE" 2>/dev/null || echo "(Empty)")
                 fi
-                ui_msg_box "25 DÒNG LOG GẦN NHẤT (${MONITOR_LOG_FILE})" "$log_txt"
+                ui_msg_box "LAST 25 LOG LINES (${MONITOR_LOG_FILE})" "$log_txt"
                 ;;
             0|"")
-                echo "Đã thoát bảng điều khiển Zimbra Spam Monitor."
+                echo "Exited Zimbra Spam Monitor Control Panel."
                 break
                 ;;
         esac
@@ -1943,28 +1937,24 @@ run_interactive_menu() {
 show_help() {
     cat <<EOF
 Zimbra Outbound Spam Monitor v${VERSION}
-Công cụ giám sát, cảnh báo (Telegram + Email) và tự động khóa tài khoản spam cho Zimbra.
+Outbound spam detection, Telegram & Email alerting, and automatic account locking for Zimbra.
 
-Cách sử dụng:
-  zimbra-spam-monitor                        Mở Giao diện Bảng điều khiển (Chọn bằng phím mũi tên / số)
-  zimbra-spam-monitor --menu                 Mở Giao diện Bảng điều khiển (TUI Hộp thoại / Menu)
-  zimbra-spam-monitor --text-menu            Mở Giao diện Menu chọn bằng số (Text mode)
-  zimbra-spam-monitor --configure            Mở Giao diện Bảng điều khiển cấu hình
-  zimbra-spam-monitor --run                  Chạy chu kỳ quét ngầm (Được gọi tự động bởi Cron)
-  zimbra-spam-monitor --status               Xem thống kê Top tài khoản gửi mail & hàng đợi hiện tại
-  zimbra-spam-monitor --edit-config          Mở trực tiếp file /etc/zimbra-spam-monitor/config.conf bằng nano/vi
-  zimbra-spam-monitor --test                 Gửi tin nhắn thử nghiệm qua Telegram và Email
-  zimbra-spam-monitor --unlock <email>       Mở khóa nhanh tài khoản Zimbra bị khóa tự động
-  zimbra-spam-monitor --whitelist-add <mail> Thêm tài khoản vào danh sách miễn trừ (Whitelist)
-  zimbra-spam-monitor --help                 Hiển thị hướng dẫn này
+Usage:
+  zimbra-spam-monitor                        Open Interactive Control Panel (TUI / Menu)
+  zimbra-spam-monitor --menu                 Open Interactive Control Panel (TUI Dialog)
+  zimbra-spam-monitor --text-menu            Open Number Selection Menu (Text mode)
+  zimbra-spam-monitor --run                  Run background scan cycle (used by Cron)
+  zimbra-spam-monitor --status               Show current Top Senders & Postfix Queue table
+  zimbra-spam-monitor --test                 Send a test notification to Telegram & Email
+  zimbra-spam-monitor --unlock <email>       Unlock a locked Zimbra account & clear cooldown
+  zimbra-spam-monitor --whitelist-add <mail> Add an email or @domain.com to Whitelist
+  zimbra-spam-monitor --help                 Show this help message
 EOF
 }
 
 # ==============================================================================
-# ĐIỂM VÀO CHƯƠNG TRÌNH (ENTRYPOINT)
+# ENTRYPOINT
 # ==============================================================================
-# Nếu quản trị viên gõ trực tiếp 'zimbra-spam-monitor' trên terminal -> Mở ngay Giao diện Chọn!
-# Nếu được gọi không có tham số từ tiến trình nền (không có tty) -> Chạy --run.
 if [[ $# -eq 0 ]]; then
     if [[ -t 0 && -t 1 ]]; then
         ACTION="--menu"
@@ -1989,14 +1979,6 @@ case "$ACTION" in
     --status|status)
         show_status
         ;;
-    --edit-config|edit)
-        ensure_config_file_exists
-        EDITOR_CMD="${EDITOR:-nano}"
-        if ! command -v "$EDITOR_CMD" >/dev/null 2>&1; then
-            EDITOR_CMD="vi"
-        fi
-        "$EDITOR_CMD" "$CONFIG_FILE"
-        ;;
     --test|test)
         run_test_alert
         ;;
@@ -2005,12 +1987,12 @@ case "$ACTION" in
         ;;
     --whitelist-add)
         if [[ -z "${2:-}" ]]; then
-            echo "Sử dụng: zimbra-spam-monitor --whitelist-add <email@domain.com>"
+            echo "Usage: zimbra-spam-monitor --whitelist-add <email@domain.com>"
             exit 1
         fi
         load_config
         echo "${2}" >> "$WHITELIST_FILE"
-        echo "[OK] Đã thêm ${2} vào danh sách miễn trừ (${WHITELIST_FILE})."
+        echo "[OK] Added ${2} to whitelist (${WHITELIST_FILE})."
         ;;
     --version|-v)
         echo "zimbra-spam-monitor version ${VERSION}"

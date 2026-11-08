@@ -1,128 +1,108 @@
-# Zimbra Outbound Spam Monitor (`zimbra-spam-monitor`)
+# Zimbra Outbound Spam Monitor (`zimbra-spam-monitor` v1.1.0)
 
-Hệ thống giám sát tự động phát hiện tài khoản email **Zimbra Collaboration Suite (ZCS)** bị chiếm quyền (hacked) đang phát tán spam ra ngoài, gửi cảnh báo tức thời qua **Telegram** và **Email**, đồng thời hỗ trợ **tự động khóa tài khoản (`locked`)** khi vượt ngưỡng nguy hiểm.
+Automated outbound email spam detection, alerting (**Telegram** + **Email**), and account auto-locking tool for **Zimbra Collaboration Suite (ZCS)**.
 
-Tích hợp **Giao diện Bảng Điều Khiển Chọn Mục (TUI Hộp thoại dùng phím mũi tên $\uparrow/\downarrow$ & Menu chọn số)** giúp cài đặt và tinh chỉnh mọi thông số ngay trên màn hình SSH.
-
----
-
-## 1. Cài đặt nhanh từ GitHub Releases (`.rpm` & `.deb`)
-
-Trang tải bản phát hành (Releases): https://github.com/0xAndyNew/Monitor-Email-Spam-Zimbra/releases/tag/v1.0.0
-
-### A. Trên CentOS / RHEL / Rocky Linux / AlmaLinux (Gói `.rpm`)
-Chạy lệnh sau với quyền `root` trên server Zimbra:
-```bash
-wget -O zimbra-spam-monitor-1.0.0-1.noarch.rpm https://github.com/0xAndyNew/Monitor-Email-Spam-Zimbra/releases/download/v1.0.0/zimbra-spam-monitor-1.0.0-1.noarch.rpm
-rpm -ivh zimbra-spam-monitor-1.0.0-1.noarch.rpm
-```
-*(Hoặc dùng `yum localinstall -y zimbra-spam-monitor-1.0.0-1.noarch.rpm`)*
-
-### B. Trên Ubuntu / Debian (Gói `.deb`)
-Chạy lệnh sau với quyền `root` trên server Zimbra:
-```bash
-wget -O zimbra-spam-monitor_1.0.0-1_all.deb https://github.com/0xAndyNew/Monitor-Email-Spam-Zimbra/releases/download/v1.0.0/zimbra-spam-monitor_1.0.0-1_all.deb
-dpkg -i zimbra-spam-monitor_1.0.0-1_all.deb
-```
+Includes a **100% ASCII-safe English Interactive Control Panel** (supports `whiptail`/`dialog` arrow-key TUI boxes as well as numbered text menus) to prevent any font or locale encoding issues across SSH terminals.
 
 ---
 
-## 2. Hướng dẫn Sử dụng Giao diện Bảng Điều Khiển
+## 1. Quick Installation from GitHub Releases (`.rpm` & `.deb`)
 
-Sau khi cài đặt xong gói `.rpm` hoặc `.deb`, anh chỉ cần gõ lệnh:
+Releases page: https://github.com/0xAndyNew/Monitor-Email-Spam-Zimbra/releases/tag/v1.1.0
+
+### A. RHEL / CentOS / Rocky Linux / AlmaLinux (`.rpm`)
+Run as `root` on your Zimbra server:
+```bash
+wget -O zimbra-spam-monitor-1.1.0-1.noarch.rpm https://github.com/0xAndyNew/Monitor-Email-Spam-Zimbra/releases/download/v1.1.0/zimbra-spam-monitor-1.1.0-1.noarch.rpm
+rpm -Uvh zimbra-spam-monitor-1.1.0-1.noarch.rpm
+```
+*(Or: `yum localinstall -y zimbra-spam-monitor-1.1.0-1.noarch.rpm`)*
+
+### B. Ubuntu / Debian (`.deb`)
+Run as `root` on your Zimbra server:
+```bash
+wget -O zimbra-spam-monitor_1.1.0-1_all.deb https://github.com/0xAndyNew/Monitor-Email-Spam-Zimbra/releases/download/v1.1.0/zimbra-spam-monitor_1.1.0-1_all.deb
+dpkg -i zimbra-spam-monitor_1.1.0-1_all.deb
+```
+
+---
+
+## 2. Interactive Control Panel Usage
+
+After installing the package, run:
 ```bash
 zimbra-spam-monitor
 ```
-*(Nếu server có sẵn `whiptail`/`dialog`, hệ thống hiển thị **hộp thoại đồ họa màu xanh** dùng phím **Mũi tên Lên/Xuống + Enter** để chọn; hoặc chạy `zimbra-spam-monitor --text-menu` để chọn bằng phím số `1..8`).*
+- Uses `whiptail` / `dialog` arrow-key menus (`UP`/`DOWN` + `ENTER`) automatically when available.
+- Use `zimbra-spam-monitor --text-menu` if you prefer a numbered text menu (`1..8`).
 
-### Giao diện Menu chính:
+### Main Control Panel Layout:
 ```text
 ==============================================================================
- BẢNG ĐIỀU KHIỂN ZIMBRA SPAM MONITOR v1.1.0
+ ZIMBRA SPAM MONITOR CONTROL PANEL v1.1.0
 ------------------------------------------------------------------------------
- Trạng thái: [ĐANG BẬT] | Chu kỳ: [5 phút/lần] | Khóa tự động: [BẬT]
+ Status: [ENABLED] | Cron: [Every 5 mins] | Auto-Lock: [ON]
 ------------------------------------------------------------------------------
-  [1 ] Xem Bảng Trạng Thái & Top Tài Khoản Gửi Mail hiện tại
-  [2 ] Cấu hình Cảnh báo & Test (TG:BẬT | Mail:admin@domain.com)
-  [3 ] Chỉnh sửa Ngưỡng Cảnh Báo Spam (10p: 80/200 | 1h: 300/600)
-  [4 ] Cài đặt Tự Động Khóa & Mở Khóa Tài Khoản (Auto-Lock: BẬT)
-  [5 ] Quản lý Danh Sách Miễn Trừ - Whitelist (Thêm / Chọn xóa)
-  [6 ] Thay đổi Chu Kỳ Quét Tự Động Cron (5 phút/lần)
-  [7 ] Bật / Tắt toàn bộ hệ thống Giám Sát (Hiện tại: ĐANG BẬT)
-  [8 ] Xem Nhật Ký Hoạt Động gần nhất (/var/log/zimbra-spam-monitor.log)
-  [0 ] Thoát
+  [1 ] View System Status & Top Senders
+  [2 ] Configure Alerts & Test (TG:ON | Mail:admin@domain.com)
+  [3 ] Edit Spam Thresholds (10m: 80/200 | 60m: 300/600)
+  [4 ] Auto-Lock Settings & Unlock Accounts (Auto-Lock: ON)
+  [5 ] Manage Sender Whitelist (View / Add / Remove)
+  [6 ] Change Cron Check Schedule (Every 5 mins)
+  [7 ] Enable / Disable Monitoring Service (Current: ENABLED)
+  [8 ] View Recent Monitor Logs (/var/log/zimbra-spam-monitor.log)
+  [0 ] Exit
 ==============================================================================
 ```
 
-### Chi tiết các Menu chức năng:
-
-#### 1. Menu `[2]` — Cấu hình Kênh Cảnh Báo & Gửi Test (Gộp chung Telegram + Email + Test)
-Khi chọn mục `[2]`, hệ thống mở ra Menu con gồm:
-- **`[1] Cấu hình Cảnh báo Telegram`**:
-  - Bật / Tắt cảnh báo Telegram.
-  - Nhập `TELEGRAM_BOT_TOKEN` (lấy từ `@BotFather`).
-  - Nhập `TELEGRAM_CHAT_ID` (ID cá nhân hoặc nhóm nhận cảnh báo).
-- **`[2] Cấu hình Cảnh báo Email & SMTP`**:
-  - Bật / Tắt cảnh báo Email.
-  - Chọn phương thức gửi:
-    - `auto`: Tự động dùng Postfix nội bộ của Zimbra, nếu hàng đợi nghẽn và có SMTP ngoài thì tự chuyển sang SMTP ngoài.
-    - `local`: Chỉ dùng Postfix nội bộ của Zimbra (không cần nhập tài khoản SMTP).
-    - `smtp`: Chỉ dùng máy chủ SMTP bên ngoài.
-  - Chọn địa chỉ nhận cảnh báo: Để `auto` (tự động lấy Email Admin mặc định của hệ thống Zimbra) hoặc nhập email tùy chỉnh.
-- **`[3] Gửi thử tin nhắn Test Cảnh Báo (Telegram & Email)`**:
-  - Kiểm tra kết nối gửi ngay lập tức 1 bản tin thử nghiệm về cả Telegram và Email.
-
-#### 2. Menu `[3]` — Chỉnh sửa Ngưỡng Cảnh Báo Spam
-Chọn đúng ngưỡng cần điều chỉnh mà không phải nhập lại các thông số khác:
-- Khoảng thời gian quét ngắn (Mặc định: `10 phút`).
-- Ngưỡng **WARNING** & **CRITICAL** trong 10 phút (Mặc định: `80` / `200` email).
-- Ngưỡng **WARNING** & **CRITICAL** trong 1 Giờ - 60 phút (Mặc định: `300` / `600` email).
-- Ngưỡng **WARNING** & **CRITICAL** số mail đang kẹt trong Queue của 1 tài khoản (Mặc định: `40` / `100` email).
-- Ngưỡng **WARNING** tổng hàng đợi toàn Server (Mặc định: `300` email).
-- Thời gian nghỉ chống lặp thông báo Cooldown (Mặc định: `30 phút`).
-
-#### 3. Menu `[4]` — Cài đặt Tự Động Khóa & Mở Khóa Tài Khoản
-- Bật / Tắt tự động khóa tài khoản (`zimbraAccountStatus locked`) khi chạm mức **CRITICAL**.
-- Bật / Tắt tự động tạm giữ (`hold`) các mail spam đang chờ trong Queue của tài khoản đó.
-- **Chọn mở khóa nhanh tài khoản bị khóa tự động**: Hiển thị danh sách các tài khoản vừa bị khóa để bấm chọn mở khóa ngay sau khi đã đổi mật khẩu.
-
-#### 4. Menu `[5]` — Quản lý Danh Sách Miễn Trừ (Whitelist)
-- Xem danh sách các tài khoản / tên miền được miễn trừ.
-- Thêm địa chỉ email (ví dụ `marketing@congty.com`) hoặc tên miền (`@congty.com`).
-- Chọn xóa trực tiếp từ danh sách hiển thị trên màn hình.
-
-#### 5. Menu `[6]` — Thay đổi Chu Kỳ Quét Tự Động (Cronjob)
-- Chọn 1 chạm chu kỳ quét: `1 phút/lần`, `2 phút/lần`, `5 phút/lần` (Khuyên dùng), `10 phút/lần`, `15 phút/lần`, `30 phút/lần`, hoặc `Tạm dừng`.
+### Key Menu Features:
+1. **`[1]` View System Status & Top Senders**: Displays current Postfix queue counts (`Active`, `Deferred`, `Hold`) and top outbound senders over the short window and last 60 minutes.
+2. **`[2]` Configure Alerts & Test (Combined Menu)**:
+   - **`[1]` Configure Telegram Alerts**: Toggle On/Off, set `TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID`.
+   - **`[2]` Configure Email & SMTP Alerts**: Toggle On/Off, select delivery mode (`auto` / `local` / `smtp`), auto-detect Zimbra Admin email (`auto`) or set custom recipients, and configure optional fallback external SMTP.
+   - **`[3]` Send Test Alert Now**: Immediately sends a test alert to both Telegram and Email.
+3. **`[3]` Edit Spam Thresholds**: Select individual thresholds to edit:
+   - Short Scan Window (`LOOKBACK_MINUTES`, default `10` mins): Warning `80` / Critical `200`.
+   - Hourly Check (`60` mins): Warning `300` / Critical `600`.
+   - Postfix Queue per User: Warning `40` / Critical `100`.
+   - Total Server Queue Warning: `300`.
+   - Alert Cooldown Interval: `30` mins.
+4. **`[4]` Auto-Lock Settings & Unlock Accounts**:
+   - Toggle automatic account locking (`zmprov ma <user> zimbraAccountStatus locked`) when reaching `CRITICAL`.
+   - Toggle automatic Postfix queue hold (`postsuper -h`) on `CRITICAL`.
+   - Select & unlock recently auto-locked accounts directly from a list.
+5. **`[5]` Manage Sender Whitelist**: View, add, or select & remove whitelisted emails (`marketing@domain.com`) or domains (`@domain.com`).
+6. **`[6]` Change Cron Check Schedule**: One-select cron interval (`Every 1, 2, 5, 10, 15, 30 minutes`, or `Pause`).
 
 ---
 
-## 3. Các lệnh CLI chạy nhanh (Tùy chọn)
+## 3. Direct CLI Commands
 
-Ngoài giao diện chọn `zimbra-spam-monitor`, anh có thể gọi nhanh từ dòng lệnh:
 ```bash
-zimbra-spam-monitor --status                 # Xem bảng thống kê trực tiếp
-zimbra-spam-monitor --test                   # Gửi thử cảnh báo Telegram & Email
-zimbra-spam-monitor --unlock user@domain.com # Mở khóa nhanh tài khoản
-zimbra-spam-monitor --whitelist-add a@b.com  # Thêm nhanh vào Whitelist
+zimbra-spam-monitor                        # Open Interactive Control Panel
+zimbra-spam-monitor --status               # Print status table & top senders
+zimbra-spam-monitor --test                 # Send test alert to Telegram & Email
+zimbra-spam-monitor --unlock user@dom.com  # Unlock a Zimbra account & clear cooldown
+zimbra-spam-monitor --whitelist-add a@b.c  # Add sender/domain to whitelist
 ```
 
 ---
 
-## 4. Gỡ cài đặt hoàn toàn khỏi Server
+## 4. Uninstall
 
-- **Trên CentOS / RHEL / Rocky Linux:**
+- **RHEL / CentOS / Rocky / AlmaLinux:**
   ```bash
   rpm -e zimbra-spam-monitor
   ```
-- **Trên Ubuntu / Debian:**
+- **Ubuntu / Debian:**
   ```bash
   apt purge -y zimbra-spam-monitor
   ```
 
 ---
 
-## 5. Đóng gói lại từ Mã nguồn (Dành cho Developer)
-Nếu chỉnh sửa mã nguồn trong thư mục `src/` hoặc `config/`, chạy lệnh sau để đóng gói lại cả 2 file `.rpm` và `.deb`:
+## 5. Building Packages from Source
 ```bash
 python3 packaging/build_rpm_deb.py
+bash tests/run_test.sh
 ```

@@ -1,8 +1,7 @@
 #!/usr/bin/env python3
 """
-Trình đóng gói tự động tạo file .deb (Ubuntu/Debian) và .rpm (RHEL/CentOS/Rocky/AlmaLinux)
-cho hệ thống Zimbra Outbound Spam Monitor (zimbra-spam-monitor).
-Không phụ thuộc vào công cụ ngoài, hoạt động trên cả Windows và Linux.
+Cross-platform package builder generating .deb (Ubuntu/Debian) and .rpm (RHEL/CentOS/Rocky/AlmaLinux)
+packages for Zimbra Outbound Spam Monitor (zimbra-spam-monitor).
 """
 
 import gzip
@@ -12,24 +11,23 @@ import os
 import struct
 import sys
 import tarfile
-import time
 from pathlib import Path
 
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
 PKG_NAME = "zimbra-spam-monitor"
-PKG_VERSION = "1.0.0"
+PKG_VERSION = "1.1.0"
 PKG_RELEASE = "1"
 PKG_SUMMARY = "Zimbra Outbound Email Spam Monitor & Alert System (Telegram + Email)"
 PKG_DESC = (
-    "He thong giam sat tu dong phat hien tai khoan Zimbra gui spam ra ngoai.\n"
-    "- Quet /var/log/zimbra.log dem so luong mail theo Phut va theo Gio.\n"
-    "- Kiem tra hang doi Postfix (postqueue / mailq) theo tung tai khoan.\n"
-    "- Gui canh bao qua Telegram Bot API va Email (Postfix noi bo / SMTP ngoai).\n"
-    "- Tu dong khoa tai khoan (zimbraAccountStatus locked) khi vuot nguong Critical."
+    "Automated outbound spam detection and alerting system for Zimbra Collaboration Suite.\n"
+    "- Scans /var/log/zimbra.log for short-window (minutes) and hourly outbound rates.\n"
+    "- Inspects Postfix mail queue (postqueue / mailq) per sender and server-wide.\n"
+    "- Sends instant alerts via Telegram Bot API and Email (Local Postfix / External SMTP).\n"
+    "- Automatically locks compromised accounts (zimbraAccountStatus locked) on Critical."
 )
-PKG_MAINTAINER = "Zimbra Admin <admin@localhost>"
+PKG_MAINTAINER = "Zimbra Admin <179321164+0xAndyNew@users.noreply.github.com>"
 PKG_LICENSE = "MIT"
 BUILD_TIME = 1730000000
 
@@ -37,7 +35,7 @@ ROOT_DIR = Path(__file__).resolve().parent.parent
 
 
 def read_lf_bytes(path: Path) -> bytes:
-    """Đọc file và chuẩn hóa dấu xuống dòng về chuẩn Unix LF (\\n)."""
+    """Read file and normalize line endings to Unix LF (\\n)."""
     raw = path.read_bytes()
     return raw.replace(b"\r\n", b"\n")
 
@@ -52,13 +50,10 @@ chmod 0644 /etc/cron.d/zimbra-spam-monitor 2>/dev/null || true
 chmod 0755 /usr/bin/zimbra-spam-monitor 2>/dev/null || true
 
 echo "======================================================================"
-echo " [OK] Da cai dat thanh cong: zimbra-spam-monitor"
+echo " [OK] Installed successfully: zimbra-spam-monitor v1.1.0"
 echo "----------------------------------------------------------------------"
-echo " -> Go lenh sau de mo GIAO DIEN BANG DIEU KHIEN (Chon bang phim mui ten/so):"
+echo " -> Run the command below to open the INTERACTIVE CONTROL PANEL:"
 echo "      zimbra-spam-monitor"
-echo ""
-echo " -> Hoac sua truc tiep file cau hinh tai:"
-echo "      nano /etc/zimbra-spam-monitor/config.conf"
 echo "======================================================================"
 exit 0
 """
@@ -77,7 +72,7 @@ exit 0
 
 
 def get_package_files():
-    """Trả về danh sách các file và thư mục sẽ cài vào hệ thống Linux."""
+    """Return sorted list of files and directories to package."""
     bin_bytes = read_lf_bytes(ROOT_DIR / "src" / "zimbra-spam-monitor")
     cfg_bytes = read_lf_bytes(ROOT_DIR / "config" / "config.conf")
     wl_bytes = read_lf_bytes(ROOT_DIR / "config" / "whitelist.conf")
@@ -86,7 +81,6 @@ def get_package_files():
         ROOT_DIR / "packaging" / "logrotate.d" / "zimbra-spam-monitor"
     )
 
-    # Danh sách sắp xếp theo thứ tự đường dẫn chuẩn cho cả RPM và DEB
     items = [
         {
             "path": "/etc/cron.d/zimbra-spam-monitor",
@@ -142,7 +136,7 @@ def get_package_files():
 
 
 # ==============================================================================
-# 1. TRÌNH ĐÓNG GÓI .DEB (UBUNTU / DEBIAN)
+# 1. DEBIAN (.DEB) PACKAGE BUILDER
 # ==============================================================================
 def make_tar_gz(entries) -> bytes:
     buf = io.BytesIO()
@@ -185,7 +179,6 @@ def make_ar_member(name: str, data: bytes) -> bytes:
 def build_deb(out_path: Path):
     items = get_package_files()
 
-    # Chuẩn bị cây thư mục đầy đủ cho data.tar.gz
     parent_dirs = [
         "./",
         "./etc/",
@@ -258,11 +251,11 @@ def build_deb(out_path: Path):
         + make_ar_member("data.tar.gz", data_tar_gz)
     )
     out_path.write_bytes(deb_bytes)
-    print(f"[OK] Đã tạo gói DEB: {out_path} ({len(deb_bytes):,} bytes)")
+    print(f"[OK] Built DEB package: {out_path} ({len(deb_bytes):,} bytes)")
 
 
 # ==============================================================================
-# 2. TRÌNH ĐÓNG GÓI .RPM CHUẨN RPM v4 (RHEL / CENTOS / ROCKY / ALMALINUX)
+# 2. RPM v4 (.RPM) PACKAGE BUILDER
 # ==============================================================================
 RPM_NULL = 0
 RPM_CHAR = 1
@@ -277,7 +270,7 @@ RPM_I18NSTRING = 9
 
 
 def build_cpio_newc(items) -> bytes:
-    """Tạo CPIO archive định dạng SVR4 '070701' (newc) cho RPM payload."""
+    """Create SVR4 '070701' (newc) CPIO archive for RPM payload."""
     out = io.BytesIO()
     ino = 1
     for item in items:
@@ -311,7 +304,6 @@ def build_cpio_newc(items) -> bytes:
         ).encode("ascii")
         out.write(hdr)
         out.write(cpio_name)
-        # Pad header + filename tới bội số của 4 bytes
         rem = (110 + namesize) % 4
         if rem:
             out.write(b"\x00" * (4 - rem))
@@ -323,7 +315,6 @@ def build_cpio_newc(items) -> bytes:
                 out.write(b"\x00" * (4 - rem_d))
         ino += 1
 
-    # Trailer
     trailer_name = b"TRAILER!!!\x00"
     t_ns = len(trailer_name)
     t_hdr = (
@@ -344,16 +335,12 @@ def build_cpio_newc(items) -> bytes:
 
 
 def pack_rpm_header(tags_list, region_tag: int) -> bytes:
-    """
-    Đóng gói RPM Header kèm Immutable Region Tag (63 cho Main Header, 62 cho Signature Header).
-    tags_list: list of tuples (tag_id, dtype, values)
-    """
+    """Pack RPM Header with Immutable Region Tag (63 for Main, 62 for Signature)."""
     sorted_tags = sorted(tags_list, key=lambda x: x[0])
     index_entries = []
     data_store = bytearray()
 
     for tag_id, dtype, val in sorted_tags:
-        # Căn chỉnh bộ nhớ (alignment) theo kiểu dữ liệu
         if dtype == RPM_INT16 and (len(data_store) % 2 != 0):
             data_store.extend(b"\x00" * (2 - (len(data_store) % 2)))
         elif dtype == RPM_INT32 and (len(data_store) % 4 != 0):
@@ -391,7 +378,6 @@ def pack_rpm_header(tags_list, region_tag: int) -> bytes:
 
         index_entries.append((tag_id, dtype, offset, count))
 
-    # Thêm Immutable Region Tag ở đầu danh sách index, trỏ tới trailer 16-byte ở cuối data_store
     total_entries = len(index_entries) + 1
     region_offset = len(data_store)
     neg_dl = -(total_entries * 16)
@@ -418,7 +404,6 @@ def build_rpm(out_path: Path):
         gz.write(cpio_raw)
     payload_gz = cpio_gz_buf.getvalue()
 
-    # Xây dựng bảng DIRNAMES, BASENAMES, DIRINDEXES và metadata của từng file
     dirnames = []
     dir_map = {}
     dirindexes = []
@@ -462,7 +447,6 @@ def build_rpm(out_path: Path):
             total_reg_size += sz
             filemodes.append(0o100000 | item["mode"])
             filedigests.append(hashlib.sha256(item["data"]).hexdigest())
-            # RPMFILE_CONFIG (1) | RPMFILE_NOREPLACE (16) = 17
             fileflags.append(17 if item["is_config"] else 0)
 
         filerdevs.append(0)
@@ -474,8 +458,6 @@ def build_rpm(out_path: Path):
         fileinodes.append(idx)
         filelangs.append("")
 
-    # Khai báo Dependencies chuẩn của gói RPM
-    # RPMSENSE_LESS (2) | RPMSENSE_EQUAL (8) | RPMSENSE_RPMLIB (0x1000000) = 0x100000A (16777226)
     RPMLIB_FLAG = 0x0100000A
     req_names = [
         "/bin/bash",
@@ -529,12 +511,11 @@ def build_rpm(out_path: Path):
         (1124, RPM_STRING, "cpio"),
         (1125, RPM_STRING, "gzip"),
         (1126, RPM_STRING, "9"),
-        (5011, RPM_INT32, 8),  # 8 = PGPHASHALGO_SHA256
+        (5011, RPM_INT32, 8),
     ]
 
     main_header_bytes = pack_rpm_header(main_tags, region_tag=63)
 
-    # Tính toán Signature Header (Tag 62)
     header_plus_payload = main_header_bytes + payload_gz
     sha1_hex = hashlib.sha1(main_header_bytes).hexdigest()
     sha256_hex = hashlib.sha256(main_header_bytes).hexdigest()
@@ -548,12 +529,10 @@ def build_rpm(out_path: Path):
         (1007, RPM_INT32, len(cpio_raw)),
     ]
     sig_header_bytes = pack_rpm_header(sig_tags, region_tag=62)
-    # Pad Signature Header tới bội số của 8 bytes
     sig_rem = len(sig_header_bytes) % 8
     if sig_rem:
         sig_header_bytes += b"\x00" * (8 - sig_rem)
 
-    # Tạo 96-byte RPM Lead
     lead_name = f"{PKG_NAME}-{PKG_VERSION}-{PKG_RELEASE}".encode("ascii")[:65]
     lead_name = lead_name.ljust(66, b"\x00")
     lead = struct.pack(
@@ -561,17 +540,17 @@ def build_rpm(out_path: Path):
         b"\xed\xab\xee\xdb",
         3,
         0,
-        0,    # Binary package
-        255,  # noarch
+        0,
+        255,
         lead_name,
-        1,    # Linux
-        5,    # RPMSIGTYPE_HEADERSIG
+        1,
+        5,
         b"\x00" * 16,
     )
 
     rpm_bytes = lead + sig_header_bytes + main_header_bytes + payload_gz
     out_path.write_bytes(rpm_bytes)
-    print(f"[OK] Đã tạo gói RPM: {out_path} ({len(rpm_bytes):,} bytes)")
+    print(f"[OK] Built RPM package: {out_path} ({len(rpm_bytes):,} bytes)")
 
 
 def main():

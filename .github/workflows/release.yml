@@ -30,6 +30,6 @@ jobs:
         if: startsWith(github.ref, 'refs/tags/')
         with:
           files: |
-            zimbra-spam-monitor_1.0.0-1_all.deb
-            zimbra-spam-monitor-1.0.0-1.noarch.rpm
+            zimbra-spam-monitor_*.deb
+            zimbra-spam-monitor-*.rpm
           generate_release_notes: true

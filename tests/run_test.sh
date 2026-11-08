@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# BỘ KIỂM THỬ TỰ ĐỘNG (AUTOMATED TEST SUITE) CHO ZIMBRA-SPAM-MONITOR
-# Kiểm tra:
-# 1. Cú pháp Bash và cấu trúc nhị phân của gói .deb & .rpm
-# 2. Mô phỏng phân tích /var/log/zimbra.log (theo phút & theo giờ) và postqueue
-# 3. Kiểm tra lọc Whitelist, phân loại ngưỡng WARNING / CRITICAL
-# 4. Kiểm tra tự động khóa tài khoản (zmprov) và gửi cảnh báo Telegram + Email
-# 5. Kiểm tra cơ chế Cooldown và lệnh --status, --test, --unlock
+# AUTOMATED TEST SUITE FOR ZIMBRA-SPAM-MONITOR
+# Verifies:
+# 1. Bash syntax & 100% ASCII encoding check (zero font/locale issues)
+# 2. Binary structure of .deb & .rpm packages
+# 3. Simulated /var/log/zimbra.log (short-window & hourly) and postqueue analysis
+# 4. Whitelist filtering, WARNING / CRITICAL thresholds, auto-lock, Telegram & Email
+# 5. Interactive Control Panel Menu (--text-menu) navigation & edits
 # ==============================================================================
 set -e
 
@@ -14,42 +14,53 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 MONITOR_BIN="$ROOT_DIR/src/zimbra-spam-monitor"
 
-echo "=== [1/5] Kiểm tra cú pháp Bash (bash -n) ==="
+echo "=== [1/6] Checking Bash syntax (bash -n) ==="
 bash -n "$MONITOR_BIN"
 bash -n "$ROOT_DIR/packaging/build-packages.sh"
-echo " -> [PASS] Cú pháp Bash hợp lệ."
+echo " -> [PASS] Bash syntax is valid."
 
-echo "=== [2/5] Kiểm tra cấu trúc gói .deb và .rpm ==="
-python - "$ROOT_DIR" << 'PYEOF'
+echo "=== [2/6] Verifying 100% ASCII-safe encoding & .deb / .rpm binary structure ==="
+PY_CMD="python"
+if python3 --version >/dev/null 2>&1; then
+    PY_CMD="python3"
+fi
+
+"$PY_CMD" - "$ROOT_DIR" << 'PYEOF'
 import gzip
-import hashlib
-import io
 import struct
 import sys
-import tarfile
 from pathlib import Path
 
-if hasattr(sys.stdout, "reconfigure"):
-    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
-
 root = Path(sys.argv[1])
-deb_path = root / "zimbra-spam-monitor_1.0.0-1_all.deb"
-rpm_path = root / "zimbra-spam-monitor-1.0.0-1.noarch.rpm"
+
+# Verify 100% pure ASCII across all packaged runtime/config files
+ascii_files = [
+    root / "src" / "zimbra-spam-monitor",
+    root / "config" / "config.conf",
+    root / "config" / "whitelist.conf",
+    root / "packaging" / "cron.d" / "zimbra-spam-monitor",
+    root / "packaging" / "logrotate.d" / "zimbra-spam-monitor",
+    root / "packaging" / "zimbra-spam-monitor.spec",
+]
+for f in ascii_files:
+    raw = f.read_bytes()
+    non_ascii = [b for b in raw if b > 127]
+    assert not non_ascii, f"Non-ASCII bytes found in {f}"
+
+deb_path = root / "zimbra-spam-monitor_1.1.0-1_all.deb"
+rpm_path = root / "zimbra-spam-monitor-1.1.0-1.noarch.rpm"
 
 assert deb_path.exists() and deb_path.stat().st_size > 5000, "Missing or empty .deb"
 assert rpm_path.exists() and rpm_path.stat().st_size > 5000, "Missing or empty .rpm"
 
-# Verify .deb ar header
 deb_data = deb_path.read_bytes()
 assert deb_data.startswith(b"!<arch>\n"), "Invalid .deb ar magic"
 assert b"debian-binary" in deb_data[:100], "Missing debian-binary member"
 assert b"control.tar.gz" in deb_data, "Missing control.tar.gz"
 assert b"data.tar.gz" in deb_data, "Missing data.tar.gz"
 
-# Verify .rpm Lead, Signature Header, Main Header, and CPIO Payload
 rpm_data = rpm_path.read_bytes()
 assert rpm_data[:4] == b"\xed\xab\xee\xdb", "Invalid RPM Lead magic"
-# Signature header starts at byte 96
 assert rpm_data[96:104] == b"\x8e\xad\xe8\x01\x00\x00\x00\x00", "Invalid RPM Signature Header magic"
 sig_entries, sig_dlen = struct.unpack("!II", rpm_data[104:112])
 sig_total = 16 + sig_entries * 16 + sig_dlen
@@ -66,10 +77,10 @@ assert cpio_raw.startswith(b"070701"), "Invalid CPIO newc header inside RPM"
 assert b"./usr/bin/zimbra-spam-monitor" in cpio_raw, "Missing binary in RPM CPIO"
 assert b"./etc/zimbra-spam-monitor/config.conf" in cpio_raw, "Missing config.conf in RPM CPIO"
 assert b"TRAILER!!!" in cpio_raw, "Missing CPIO TRAILER"
-print(" -> [PASS] Cấu trúc nhị phân .deb và .rpm đạt chuẩn 100%.")
+print(" -> [PASS] 100% ASCII encoding & valid .deb / .rpm binary structures verified.")
 PYEOF
 
-echo "=== [3/5] Thiết lập môi trường giả lập Zimbra ==="
+echo "=== [3/6] Setting up simulated Zimbra environment ==="
 TEST_TMP=$(mktemp -d 2>/dev/null || echo "/tmp/zsm_test_$$")
 mkdir -p "$TEST_TMP"
 trap 'rm -rf "$TEST_TMP"' EXIT
@@ -83,14 +94,8 @@ FAKE_TG_OUT="$TEST_TMP/telegram_sent.txt"
 FAKE_MAIL_OUT="$TEST_TMP/email_sent.txt"
 FAKE_ZMPROV_OUT="$TEST_TMP/zmprov_actions.txt"
 
-# Mốc thời gian cố định: 2026-11-08 15:00:00 (Epoch = 1794124800)
 FIXED_EPOCH=$(date -d "2026-11-08 15:00:00" +%s)
 
-# Tạo log giả lập:
-# - normal@company.com: 5 mail (Bình thường)
-# - marketing@company.com: 250 mail (Nằm trong Whitelist -> Bỏ qua)
-# - warn_user@company.com: 90 mail trong 10 phút (Vượt ngưỡng WARN = 80)
-# - hacked_user@company.com: 210 mail trong 10 phút từ IP 203.0.113.99 (Vượt ngưỡng CRIT = 200)
 : > "$FAKE_LOG"
 for i in $(seq 1 5); do
     printf "Nov  8 14:55:10 mail postfix/smtpd[1001]: QNORM%03d: client=localhost[127.0.0.1], sasl_method=LOGIN, sasl_username=normal@company.com\n" "$i" >> "$FAKE_LOG"
@@ -114,7 +119,6 @@ done
 
 echo "marketing@company.com" > "$FAKE_WL"
 
-# Tạo mock script cho postqueue, zmprov, sendmail, curl
 MOCK_PQ="$TEST_TMP/mock_postqueue.sh"
 cat << 'EOF' > "$MOCK_PQ"
 #!/usr/bin/env bash
@@ -186,7 +190,7 @@ STATE_DIR="$FAKE_STATE"
 MONITOR_LOG_FILE="$FAKE_MON_LOG"
 EOF
 
-echo "=== [4/5] Chạy kiểm tra chu kỳ quét (--run) ==="
+echo "=== [4/6] Running scan cycle (--run) ==="
 ZSM_CONFIG_FILE="$FAKE_CFG" \
 ZSM_NOW_EPOCH="$FIXED_EPOCH" \
 ZSM_POSTQUEUE_CMD="$MOCK_PQ" \
@@ -196,33 +200,28 @@ ZSM_CURL_CMD="$MOCK_CURL" \
 ZSM_HOSTNAME="mail.company.com" \
 bash "$MONITOR_BIN" --run
 
-# Kiểm tra kết quả:
-# 1. hacked_user@company.com phải bị khóa tự động
 grep -q "ma hacked_user@company.com zimbraAccountStatus locked" "$FAKE_ZMPROV_OUT"
-echo " -> [PASS] Tự động khóa tài khoản vượt ngưỡng CRITICAL (hacked_user@company.com)."
+echo " -> [PASS] Auto-locked CRITICAL spammer (hacked_user@company.com)."
 
-# 2. warn_user@company.com KHÔNG bị khóa, chỉ cảnh báo WARNING
 if grep -q "warn_user@company.com" "$FAKE_ZMPROV_OUT"; then
-    echo " -> [FAIL] warn_user@company.com không được phép bị khóa!"
+    echo " -> [FAIL] warn_user@company.com should not be locked!"
     exit 1
 fi
-echo " -> [PASS] Tài khoản mức WARNING (warn_user@company.com) chỉ cảnh báo, không bị khóa."
+echo " -> [PASS] WARNING account (warn_user@company.com) alerted only, not locked."
 
-# 3. marketing@company.com nằm trong Whitelist nên KHÔNG bị cảnh báo
 if grep -q "marketing@company.com" "$FAKE_MAIL_OUT"; then
-    echo " -> [FAIL] marketing@company.com nằm trong Whitelist nhưng vẫn bị cảnh báo!"
+    echo " -> [FAIL] Whitelisted marketing@company.com triggered an alert!"
     exit 1
 fi
-echo " -> [PASS] Whitelist hoạt động chính xác (bỏ qua marketing@company.com)."
+echo " -> [PASS] Whitelist bypassed marketing@company.com properly."
 
-# 4. Kiểm tra nội dung Email và Telegram
 grep -q "hacked_user@company.com" "$FAKE_MAIL_OUT"
 grep -q "warn_user@company.com" "$FAKE_MAIL_OUT"
 grep -q "203.0.113.99" "$FAKE_MAIL_OUT"
 grep -q "hacked_user@company.com" "$FAKE_TG_OUT"
-echo " -> [PASS] Cảnh báo Telegram & Email chứa đầy đủ tài khoản spam, số lượng mail và IP nguồn."
+echo " -> [PASS] Telegram & Email notifications contain spammer, counts, and source IPs."
 
-echo "=== [5/6] Kiểm tra lệnh --status, --test và --unlock ==="
+echo "=== [5/6] Verifying --status command ==="
 STATUS_OUT=$(ZSM_CONFIG_FILE="$FAKE_CFG" \
 ZSM_NOW_EPOCH="$FIXED_EPOCH" \
 ZSM_POSTQUEUE_CMD="$MOCK_PQ" \
@@ -230,15 +229,9 @@ ZSM_HOSTNAME="mail.company.com" \
 bash "$MONITOR_BIN" --status)
 
 echo "$STATUS_OUT" | grep -q "hacked_user@company.com"
-echo " -> [PASS] Lệnh --status hiển thị đúng bảng thống kê."
+echo " -> [PASS] --status output verified."
 
-echo "=== [6/6] Kiểm tra Giao diện Bảng điều khiển Chọn mục (--menu / --text-menu) ==="
-# Mô phỏng người dùng bấm chọn trên menu mới:
-# - Chọn 2 (Cấu hình Cảnh báo & Test) -> Chọn 3 (Gửi thử tin nhắn Test Cảnh Báo) -> Enter -> Chọn 0 (Quay lại)
-# - Chọn 3 (Chỉnh sửa Ngưỡng) -> Chọn 2 (Sửa WARN_SENT_PER_WINDOW) -> Nhập 125 -> Chọn 0 (Quay lại)
-# - Chọn 4 (Tự động khóa & Mở khóa) -> Chọn 3 (Chọn mở khóa tài khoản từ danh sách) -> Chọn 1 (hacked_user@company.com) -> Enter -> Chọn 0 (Quay lại)
-# - Chọn 5 (Quản lý Whitelist) -> Chọn 2 (Thêm Whitelist) -> Nhập vip@company.com -> Enter -> Chọn 0 (Quay lại)
-# - Chọn 0 (Thoát)
+echo "=== [6/6] Verifying Interactive Control Panel Menu (--text-menu) ==="
 printf "2\n3\n\n0\n3\n2\n125\n0\n4\n3\n1\n\n0\n5\n2\nvip@company.com\n\n0\n0\n" | \
 ZSM_CONFIG_FILE="$FAKE_CFG" \
 ZSM_ZMPROV_CMD="$MOCK_ZMPROV" \
@@ -248,15 +241,15 @@ ZSM_UI_MODE="text" \
 bash "$MONITOR_BIN" --text-menu >/dev/null 2>&1
 
 grep -q "^WARN_SENT_PER_WINDOW=125" "$FAKE_CFG"
-echo " -> [PASS] Chọn chỉnh sửa ngưỡng qua Giao diện Menu thành công (WARN_SENT_PER_WINDOW=125)."
+echo " -> [PASS] Threshold updated via Control Panel Menu (WARN_SENT_PER_WINDOW=125)."
 
 grep -q "ma hacked_user@company.com zimbraAccountStatus active" "$FAKE_ZMPROV_OUT"
-echo " -> [PASS] Chọn mở khóa tài khoản từ danh sách trong Giao diện Menu thành công."
+echo " -> [PASS] Account unlocked via Control Panel Menu."
 
 grep -q "vip@company.com" "$FAKE_WL"
-echo " -> [PASS] Chọn thêm Whitelist qua Giao diện Menu thành công."
+echo " -> [PASS] Whitelist entry added via Control Panel Menu."
 
 echo ""
 echo "======================================================================"
-echo " TẤT CẢ CÁC BÀI KIỂM THỬ (6/6) ĐỀU THÀNH CÔNG 100%!"
+echo " ALL AUTOMATED TESTS (6/6) PASSED 100%!"
 echo "======================================================================"

@@ -1,5 +1,5 @@
 Name:           zimbra-spam-monitor
-Version:        1.0.0
+Version:        1.1.0
 Release:        1
 Summary:        Zimbra Outbound Email Spam Monitor & Alert System (Telegram + Email)
 License:        MIT
@@ -8,11 +8,12 @@ BuildArch:      noarch
 Requires:       bash, gawk, curl, crontabs
 
 %description
-He thong giam sat va canh bao Email Spam Outbound cho Zimbra Collaboration Suite.
-- Quet /var/log/zimbra.log dem so luong email gui ra ngoai theo Phut va theo Gio.
-- Kiem tra hang doi Postfix (postqueue / mailq) theo tung tai khoan.
-- Gui canh bao tuc thoi qua Telegram Bot API va Email (Postfix noi bo / SMTP ngoai).
-- Tu dong khoa tai khoan (zimbraAccountStatus locked) khi vuot nguong Critical.
+Automated outbound spam detection and alerting system for Zimbra Collaboration Suite.
+- Scans /var/log/zimbra.log for short-window (minutes) and hourly outbound email rates.
+- Inspects Postfix mail queue (postqueue / mailq) per sender and server-wide.
+- Sends instant alerts via Telegram Bot API and Email (Local Postfix / External SMTP).
+- Automatically locks compromised accounts (zimbraAccountStatus locked) on Critical threshold.
+- Includes an interactive TUI / Menu control panel (run: zimbra-spam-monitor).
 
 %install
 mkdir -p %{buildroot}/usr/bin
@@ -32,15 +33,9 @@ mkdir -p /var/lib/zimbra-spam-monitor
 touch /var/log/zimbra-spam-monitor.log
 chmod 0640 /var/log/zimbra-spam-monitor.log
 echo "======================================================================"
-echo " [OK] Da cai dat thanh cong goi: zimbra-spam-monitor-1.0.0"
-echo " 1. Chinh sua cau hinh truc tiep tai:"
-echo "      nano /etc/zimbra-spam-monitor/config.conf"
-echo "    Hoac chay menu cau hinh nhanh:"
-echo "      zimbra-spam-monitor --configure"
-echo " 2. Kiem tra gui thong bao Telegram & Email:"
-echo "      zimbra-spam-monitor --test"
-echo " 3. Xem trang thai luu luong gui mail & hang doi hien tai:"
-echo "      zimbra-spam-monitor --status"
+echo " [OK] Installed successfully: zimbra-spam-monitor v1.1.0"
+echo " -> Run the command below to open the Interactive Control Panel:"
+echo "      zimbra-spam-monitor"
 echo "======================================================================"
 
 %postun
