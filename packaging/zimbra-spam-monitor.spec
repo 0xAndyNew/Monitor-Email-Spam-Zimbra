@@ -1,5 +1,5 @@
 Name:           zimbra-spam-monitor
-Version:        1.1.0
+Version:        1.1.1
 Release:        1
 Summary:        Zimbra Outbound Email Spam Monitor & Alert System (Telegram + Email)
 License:        MIT

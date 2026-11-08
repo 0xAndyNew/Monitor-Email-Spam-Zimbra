@@ -14,7 +14,7 @@
 
 set -u
 
-VERSION="1.1.0"
+VERSION="1.1.1"
 DEFAULT_CONFIG_FILE="/etc/zimbra-spam-monitor/config.conf"
 CONFIG_FILE="${ZSM_CONFIG_FILE:-$DEFAULT_CONFIG_FILE}"
 CRON_FILE="${ZSM_CRON_FILE:-/etc/cron.d/zimbra-spam-monitor}"
@@ -614,7 +614,11 @@ send_email_alert() {
 # ==============================================================================
 analyze_zimbra_log() {
     local out_file="$1"
+    local sys_sum_file="${2:-}"
     : > "$out_file"
+    if [[ -n "$sys_sum_file" ]]; then
+        echo "0|0|0|0|0|0|0|0" > "$sys_sum_file"
+    fi
 
     if [[ ! -f "$ZIMBRA_LOG_FILE" ]]; then
         log_msg "WARN" "Zimbra log file not found: $ZIMBRA_LOG_FILE"
@@ -631,10 +635,13 @@ analyze_zimbra_log() {
         -v cur_year="$cur_year" \
         -v win_mins="$LOOKBACK_MINUTES" \
         -v count_internal="$COUNT_INTERNAL_TO_INTERNAL" \
-        -v internal_domains="$RESOLVED_INTERNAL_DOMAINS" '
+        -v internal_domains="$RESOLVED_INTERNAL_DOMAINS" \
+        -v sys_file="$sys_sum_file" '
     BEGIN {
         win_cutoff = now_epoch - (win_mins * 60)
         hour_cutoff = now_epoch - 3600
+        sys_wt = 0; sys_ws = 0; sys_wd = 0; sys_wb = 0
+        sys_ht = 0; sys_hs = 0; sys_hd = 0; sys_hb = 0
 
         split("Jan Feb Mar Apr May Jun Jul Aug Sep Oct Nov Dec", mnames, " ")
         for (i = 1; i <= 12; i++) {
@@ -648,6 +655,7 @@ analyze_zimbra_log() {
     }
 
     function parse_epoch(line,   mo, dy, hms, y, hr, mi, sc, iso, ts) {
+        line_hms = ""
         if (match(line, /^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}/)) {
             iso = substr(line, 1, 19)
             y  = substr(iso, 1, 4)
@@ -656,12 +664,14 @@ analyze_zimbra_log() {
             hr = substr(iso, 12, 2)
             mi = substr(iso, 15, 2)
             sc = substr(iso, 18, 2)
+            line_hms = hr ":" mi ":" sc
             ts = mktime(y " " mo " " dy " " hr " " mi " " sc)
             return ts
         }
         if (($1 in m_map) && ($2 ~ /^[0-9]+$/) && ($3 ~ /^[0-9]{2}:[0-9]{2}:[0-9]{2}$/)) {
             mo = m_map[$1]
             dy = sprintf("%02d", $2 + 0)
+            line_hms = $3
             split($3, hms, ":")
             hr = hms[1]; mi = hms[2]; sc = hms[3]
             ts = mktime(cur_year " " mo " " dy " " hr " " mi " " sc)
@@ -704,6 +714,7 @@ analyze_zimbra_log() {
             if (qid != "" && sasl != "") {
                 q_sasl[qid] = sasl
                 q_time[qid] = ts
+                if (line_hms != "") q_hms[qid] = line_hms
                 if (cip != "") q_ip[qid] = cip
             }
             next
@@ -721,6 +732,7 @@ analyze_zimbra_log() {
             if (qid != "" && faddr != "") {
                 q_from[qid] = faddr
                 if (!(qid in q_time)) q_time[qid] = ts
+                if (!(qid in q_hms) && line_hms != "") q_hms[qid] = line_hms
             }
             next
         }
@@ -757,35 +769,43 @@ analyze_zimbra_log() {
 
             all_senders[sender] = 1
             hour_total[sender]++
-            if (st == "sent") hour_sent[sender]++
-            else if (st == "deferred") hour_def[sender]++
-            else if (st == "bounced") hour_bnc[sender]++
+            sys_ht++
+            if (st == "sent") { hour_sent[sender]++; sys_hs++ }
+            else if (st == "deferred") { hour_def[sender]++; sys_hd++ }
+            else if (st == "bounced") { hour_bnc[sender]++; sys_hb++ }
+
+            ev_hms = (line_hms != "" ? line_hms : q_hms[qid])
+            if (ev_hms != "") {
+                if (!(sender in hr_first_hms)) hr_first_hms[sender] = ev_hms
+                hr_last_hms[sender] = ev_hms
+            }
+
+            if ((qid in q_ip) && q_ip[qid] != "") {
+                ip_key = sender "|" q_ip[qid]
+                if (!(ip_key in seen_ip)) {
+                    seen_ip[ip_key] = 1
+                    sender_ips[sender] = (sender_ips[sender] == "" ? q_ip[qid] : sender_ips[sender] ", " q_ip[qid])
+                }
+            }
 
             if (ts >= win_cutoff) {
                 win_total[sender]++
-                if (st == "sent") win_sent[sender]++
-                else if (st == "deferred") win_def[sender]++
-                else if (st == "bounced") win_bnc[sender]++
+                sys_wt++
+                if (st == "sent") { win_sent[sender]++; sys_ws++ }
+                else if (st == "deferred") { win_def[sender]++; sys_wd++ }
+                else if (st == "bounced") { win_bnc[sender]++; sys_wb++ }
 
-                if ((qid in q_ip) && q_ip[qid] != "") {
-                    ip_key = sender "|" q_ip[qid]
-                    if (!(ip_key in seen_ip)) {
-                        seen_ip[ip_key] = 1
-                        sender_ips[sender] = (sender_ips[sender] == "" ? q_ip[qid] : sender_ips[sender] "," q_ip[qid])
-                    }
-                }
-                if (rdom != "") {
-                    dom_key = sender "|" rdom
-                    if (!(dom_key in seen_dom) && dom_count[sender] < 5) {
-                        seen_dom[dom_key] = 1
-                        dom_count[sender]++
-                        sender_doms[sender] = (sender_doms[sender] == "" ? rdom : sender_doms[sender] "," rdom)
-                    }
+                if (ev_hms != "") {
+                    if (!(sender in win_first_hms)) win_first_hms[sender] = ev_hms
+                    win_last_hms[sender] = ev_hms
                 }
             }
         }
     }
     END {
+        if (sys_file != "") {
+            printf "%d|%d|%d|%d|%d|%d|%d|%d\n", sys_wt, sys_ws, sys_wd, sys_wb, sys_ht, sys_hs, sys_hd, sys_hb > sys_file
+        }
         for (s in all_senders) {
             wt = win_total[s] + 0
             ws = win_sent[s] + 0
@@ -796,8 +816,13 @@ analyze_zimbra_log() {
             hd = hour_def[s] + 0
             hb = hour_bnc[s] + 0
             ips = (sender_ips[s] != "" ? sender_ips[s] : "local/webmail")
-            doms = (sender_doms[s] != "" ? sender_doms[s] : "-")
-            printf "%s|%d|%d|%d|%d|%d|%d|%d|%d|%s|%s\n", s, wt, ws, wd, wb, ht, hs, hd, hb, ips, doms
+            tspan = "-"
+            if (s in win_first_hms) {
+                tspan = win_first_hms[s] " -> " win_last_hms[s]
+            } else if (s in hr_first_hms) {
+                tspan = hr_first_hms[s] " -> " hr_last_hms[s]
+            }
+            printf "%s|%d|%d|%d|%d|%d|%d|%d|%d|%s|%s\n", s, wt, ws, wd, wb, ht, hs, hd, hb, ips, tspan
         }
     }
     ' | sort -t'|' -k2,2nr -k6,6nr > "$out_file"
@@ -878,21 +903,23 @@ run_monitor_cycle() {
     fi
     echo $$ > "$lock_file"
 
-    local tmp_log_stats tmp_q_stats tmp_q_sum tmp_merged
+    local tmp_log_stats tmp_sys_sum tmp_q_stats tmp_q_sum tmp_merged
     tmp_log_stats=$(mktemp 2>/dev/null || echo "/tmp/zsm_log_$$")
+    tmp_sys_sum=$(mktemp 2>/dev/null || echo "/tmp/zsm_syssum_$$")
     tmp_q_stats=$(mktemp 2>/dev/null || echo "/tmp/zsm_q_$$")
     tmp_q_sum=$(mktemp 2>/dev/null || echo "/tmp/zsm_qsum_$$")
     tmp_merged=$(mktemp 2>/dev/null || echo "/tmp/zsm_merged_$$")
 
-    analyze_zimbra_log "$tmp_log_stats"
+    analyze_zimbra_log "$tmp_log_stats" "$tmp_sys_sum"
     analyze_postfix_queue "$tmp_q_stats" "$tmp_q_sum"
+
+    local sys_summary sys_wt sys_ws sys_wd sys_wb sys_ht sys_hs sys_hd sys_hb
+    sys_summary=$(cat "$tmp_sys_sum" 2>/dev/null || echo "0|0|0|0|0|0|0|0")
+    IFS='|' read -r sys_wt sys_ws sys_wd sys_wb sys_ht sys_hs sys_hd sys_hb <<< "$sys_summary"
 
     local q_summary total_queue active_queue def_queue hold_queue
     q_summary=$(cat "$tmp_q_sum" 2>/dev/null || echo "0|0|0|0")
-    total_queue=$(echo "$q_summary" | cut -d'|' -f1)
-    active_queue=$(echo "$q_summary" | cut -d'|' -f2)
-    def_queue=$(echo "$q_summary" | cut -d'|' -f3)
-    hold_queue=$(echo "$q_summary" | cut -d'|' -f4)
+    IFS='|' read -r total_queue active_queue def_queue hold_queue <<< "$q_summary"
 
     awk -F'|' '
     FNR == NR {
@@ -901,7 +928,7 @@ run_monitor_cycle() {
         users[s] = 1
         wt[s] = $2; ws[s] = $3; wd[s] = $4; wb[s] = $5
         ht[s] = $6; hs[s] = $7; hd[s] = $8; hb[s] = $9
-        ips[s] = $10; doms[s] = $11
+        ips[s] = $10; tspan[s] = $11
         next
     }
     {
@@ -909,29 +936,29 @@ run_monitor_cycle() {
         if (s == "") next
         users[s] = 1
         qc[s] = $2
-        qr[s] = $3
     }
     END {
         for (u in users) {
-            printf "%s|%d|%d|%d|%d|%d|%d|%d|%d|%d|%s|%s|%s\n",
+            printf "%s|%d|%d|%d|%d|%d|%d|%d|%d|%d|%s|%s\n",
                 u,
                 wt[u]+0, ws[u]+0, wd[u]+0, wb[u]+0,
                 ht[u]+0, hs[u]+0, hd[u]+0, hb[u]+0,
                 qc[u]+0,
-                (ips[u] != "" ? ips[u] : "-"),
-                (doms[u] != "" ? doms[u] : "-"),
-                (qr[u] != "" ? qr[u] : "-")
+                (ips[u] != "" ? ips[u] : "queued/unknown"),
+                (tspan[u] != "" ? tspan[u] : "-")
         }
     }
     ' "$tmp_log_stats" "$tmp_q_stats" | sort -t'|' -k2,2nr -k10,10nr > "$tmp_merged"
 
-    local srv_host srv_ip now_str
+    local srv_host srv_ip now_epoch now_str now_date
     srv_host=$(get_server_hostname)
     srv_ip=$(get_server_ip)
-    now_str=$(date '+%Y-%m-%d %H:%M:%S')
+    now_epoch="${ZSM_NOW_EPOCH:-$(date +%s)}"
+    now_str=$(date -d "@$now_epoch" '+%Y-%m-%d %H:%M:%S' 2>/dev/null || date '+%Y-%m-%d %H:%M:%S')
+    now_date=$(date -d "@$now_epoch" '+%Y-%m-%d' 2>/dev/null || date '+%Y-%m-%d')
     local alerts_triggered=0
 
-    while IFS='|' read -r sender win_tot win_snt win_def win_bnc hr_tot hr_snt hr_def hr_bnc q_cnt s_ips s_doms q_reason; do
+    while IFS='|' read -r sender win_tot win_snt win_def win_bnc hr_tot hr_snt hr_def hr_bnc q_cnt s_ips s_tspan; do
         [[ -z "$sender" ]] && continue
 
         if is_whitelisted "$sender"; then
@@ -939,33 +966,24 @@ run_monitor_cycle() {
         fi
 
         local severity="NORMAL"
-        local reasons=()
 
         if (( win_tot >= CRIT_SENT_PER_WINDOW )); then
             severity="CRITICAL"
-            reasons+=("${win_tot} emails in ${LOOKBACK_MINUTES}m (Critical >= ${CRIT_SENT_PER_WINDOW})")
         fi
         if [[ "$ENABLE_HOURLY_CHECK" == "true" ]] && (( hr_tot >= CRIT_SENT_PER_HOUR )); then
             severity="CRITICAL"
-            reasons+=("${hr_tot} emails in 60m (Critical >= ${CRIT_SENT_PER_HOUR})")
         fi
         if (( q_cnt >= CRIT_QUEUE_PER_USER )); then
             severity="CRITICAL"
-            reasons+=("${q_cnt} queued emails (Critical >= ${CRIT_QUEUE_PER_USER})")
         fi
 
         if [[ "$severity" == "NORMAL" ]]; then
             if (( win_tot >= WARN_SENT_PER_WINDOW )); then
                 severity="WARNING"
-                reasons+=("${win_tot} emails in ${LOOKBACK_MINUTES}m (Warning >= ${WARN_SENT_PER_WINDOW})")
-            fi
-            if [[ "$ENABLE_HOURLY_CHECK" == "true" ]] && (( hr_tot >= WARN_SENT_PER_HOUR )); then
+            elif [[ "$ENABLE_HOURLY_CHECK" == "true" ]] && (( hr_tot >= WARN_SENT_PER_HOUR )); then
                 severity="WARNING"
-                reasons+=("${hr_tot} emails in 60m (Warning >= ${WARN_SENT_PER_HOUR})")
-            fi
-            if (( q_cnt >= WARN_QUEUE_PER_USER )); then
+            elif (( q_cnt >= WARN_QUEUE_PER_USER )); then
                 severity="WARNING"
-                reasons+=("${q_cnt} queued emails (Warning >= ${WARN_QUEUE_PER_USER})")
             fi
         fi
 
@@ -976,7 +994,7 @@ run_monitor_cycle() {
             continue
         fi
 
-        local action_taken="Alert Only (WARNING level)"
+        local action_taken="Alert Only (WARNING)"
         if [[ "$severity" == "CRITICAL" ]]; then
             action_taken=$(lock_zimbra_account "$sender")
             hold_sender_queue "$sender"
@@ -985,79 +1003,79 @@ run_monitor_cycle() {
         record_alert_state "$sender" "$severity"
         alerts_triggered=$(( alerts_triggered + 1 ))
 
-        local reason_str
-        reason_str=$(IFS='; '; echo "${reasons[*]}")
-        log_msg "$severity" "Outbound spam detected: user=$sender | ${LOOKBACK_MINUTES}m=${win_tot} | 60m=${hr_tot} | queue=${q_cnt} | action=${action_taken}"
+        local spam_time_str="$now_str"
+        if [[ -n "$s_tspan" && "$s_tspan" != "-" ]]; then
+            spam_time_str="${now_date} (${s_tspan})"
+        fi
+
+        log_msg "$severity" "Outbound spam detected: user=$sender | time=${spam_time_str} | ${LOOKBACK_MINUTES}m=${win_tot} | 60m=${hr_tot} | queue=${q_cnt} | action=${action_taken}"
 
         local tg_msg
         tg_msg=$(cat <<EOF
-<b>[ZIMBRA SPAM ${severity}] OUTBOUND SPAM DETECTED</b>
---------------------------------------
-<b>Server:</b> <code>$(html_escape "$srv_host")</code> (${srv_ip})
-<b>Time:</b> ${now_str}
-<b>Account:</b> <code>$(html_escape "$sender")</code>
-<b>Trigger:</b> $(html_escape "$reason_str")
+<b>[ZIMBRA SPAM ${severity}]</b>
+<code>==============================</code>
+<b>Server       :</b> <code>$(html_escape "$srv_host")</code> (${srv_ip})
+<b>Spam Time    :</b> $(html_escape "$spam_time_str")
+<b>Spam Account :</b> <code>$(html_escape "$sender")</code>
+<b>Source IPs   :</b> <code>$(html_escape "$s_ips")</code>
 
-<b>Outbound Traffic Summary:</b>
-- <b>Last ${LOOKBACK_MINUTES} mins:</b> <b>${win_tot}</b> emails (Sent: ${win_snt} | Deferred: ${win_def} | Bounced: ${win_bnc})
-- <b>Last 60 mins:</b> <b>${hr_tot}</b> emails (Sent: ${hr_snt} | Deferred: ${hr_def} | Bounced: ${hr_bnc})
-- <b>User Queue:</b> <b>${q_cnt}</b> emails (Total Server Queue: ${total_queue})
-- <b>Source IPs:</b> <code>$(html_escape "$s_ips")</code>
-- <b>Target Domains:</b> <code>$(html_escape "$s_doms")</code>
-- <b>Queue Note:</b> <i>$(html_escape "$q_reason")</i>
+<b>[1] ACCOUNT SPAM VOLUME</b>
+<b>Last ${LOOKBACK_MINUTES} mins :</b> <b>${win_tot}</b> emails
+  <code>Sent: ${win_snt} | Deferred: ${win_def} | Bounced: ${win_bnc}</code>
+<b>Last 60 mins :</b> <b>${hr_tot}</b> emails
+  <code>Sent: ${hr_snt} | Deferred: ${hr_def} | Bounced: ${hr_bnc}</code>
 
-<b>Automated Action:</b>
-<b>$(html_escape "$action_taken")</b>
---------------------------------------
-<i>Unlock command after password reset:</i>
-<code>zimbra-spam-monitor --unlock $(html_escape "$sender")</code>
+<b>[2] REMAINING MAIL QUEUE</b>
+<b>Account Queue:</b> <b>${q_cnt}</b> emails
+<b>System Queue :</b> <b>${total_queue}</b> emails
+  <code>Active: ${active_queue} | Deferred: ${def_queue} | Hold: ${hold_queue}</code>
+
+<b>[3] SYSTEM TOTAL TRAFFIC</b>
+<b>System (${LOOKBACK_MINUTES}m) :</b> <b>${sys_wt}</b> emails
+  <code>Sent: ${sys_ws} | Deferred: ${sys_wd} | Bounced: ${sys_wb}</code>
+<b>System (60m) :</b> <b>${sys_ht}</b> emails
+  <code>Sent: ${sys_hs} | Deferred: ${sys_hd} | Bounced: ${sys_hb}</code>
+<code>==============================</code>
 EOF
 )
 
-        local mail_subj="[Zimbra Spam ${severity}] Outbound spam detected from ${sender} on ${srv_host}"
+        local mail_subj="[Zimbra Spam ${severity}] ${sender} (${win_tot} emails / ${LOOKBACK_MINUTES}m) on ${srv_host}"
         local mail_body
         mail_body=$(cat <<EOF
-======================================================================
-ZIMBRA OUTBOUND SPAM MONITOR ALERT (${severity})
-======================================================================
-Zimbra Server   : ${srv_host} (${srv_ip})
-Timestamp       : ${now_str}
-Spam Account    : ${sender}
-Severity        : ${severity}
-Trigger Reason  : ${reason_str}
+============================================================
+         ZIMBRA SPAM ALERT - ${severity}
+============================================================
+Server        : ${srv_host} (${srv_ip})
+Alert Time    : ${now_str}
+Spam Time     : ${spam_time_str}
+Spam Account  : ${sender}
+Source IPs    : ${s_ips}
 
-----------------------------------------------------------------------
-OUTBOUND TRAFFIC & QUEUE STATISTICS:
-----------------------------------------------------------------------
-1. Last ${LOOKBACK_MINUTES} Minutes       : ${win_tot} emails
-   - Sent                       : ${win_snt}
-   - Deferred                   : ${win_def}
-   - Bounced                    : ${win_bnc}
+------------------------------------------------------------
+[1] ACCOUNT SPAM VOLUME
+------------------------------------------------------------
+Last ${LOOKBACK_MINUTES} mins  : ${win_tot} emails
+                Sent: ${win_snt} | Deferred: ${win_def} | Bounced: ${win_bnc}
 
-2. Last 60 Minutes (1 Hour)     : ${hr_tot} emails
-   - Sent                       : ${hr_snt}
-   - Deferred                   : ${hr_def}
-   - Bounced                    : ${hr_bnc}
+Last 60 mins  : ${hr_tot} emails
+                Sent: ${hr_snt} | Deferred: ${hr_def} | Bounced: ${hr_bnc}
 
-3. Postfix Queue (Current)      : ${q_cnt} emails from this sender
-   - Total Server Queue         : ${total_queue} (Active: ${active_queue}, Deferred: ${def_queue}, Hold: ${hold_queue})
-   - Queue Status / Deferral    : ${q_reason}
+------------------------------------------------------------
+[2] REMAINING MAIL QUEUE
+------------------------------------------------------------
+Account Queue : ${q_cnt} emails
+System Queue  : ${total_queue} emails
+                Active: ${active_queue} | Deferred: ${def_queue} | Hold: ${hold_queue}
 
-4. Connection Details:
-   - Authenticated / Client IPs : ${s_ips}
-   - Top Recipient Domains      : ${s_doms}
+------------------------------------------------------------
+[3] SYSTEM TOTAL TRAFFIC
+------------------------------------------------------------
+System (${LOOKBACK_MINUTES}m)  : ${sys_wt} emails
+                Sent: ${sys_ws} | Deferred: ${sys_wd} | Bounced: ${sys_wb}
 
-----------------------------------------------------------------------
-AUTOMATED ACTION TAKEN:
-----------------------------------------------------------------------
--> ${action_taken}
-
-Recommended Admin Remediation:
-1. Reset the compromised user's password:
-   su - zimbra -c "zmprov sp ${sender} <NewStrongPassword>"
-2. Unlock the account:
-   zimbra-spam-monitor --unlock ${sender}
-======================================================================
+System (60m)  : ${sys_ht} emails
+                Sent: ${sys_hs} | Deferred: ${sys_hd} | Bounced: ${sys_hb}
+============================================================
 EOF
 )
 
@@ -1071,22 +1089,56 @@ EOF
             record_alert_state "__SYSTEM_TOTAL_QUEUE__" "WARNING"
             local q_tg_msg
             q_tg_msg=$(cat <<EOF
-<b>[ZIMBRA QUEUE WARNING] HIGH MAIL QUEUE VOLUME</b>
---------------------------------------
-<b>Server:</b> <code>$(html_escape "$srv_host")</code> (${srv_ip})
-<b>Time:</b> ${now_str}
-<b>Total Queued Emails:</b> <b>${total_queue}</b> (Threshold: ${WARN_TOTAL_QUEUE})
-- Active: ${active_queue} | Deferred: ${def_queue} | Hold: ${hold_queue}
+<b>[ZIMBRA QUEUE WARNING]</b>
+<code>==============================</code>
+<b>Server       :</b> <code>$(html_escape "$srv_host")</code> (${srv_ip})
+<b>Alert Time   :</b> ${now_str}
+
+<b>[1] REMAINING MAIL QUEUE</b>
+<b>System Queue :</b> <b>${total_queue}</b> emails (Limit: ${WARN_TOTAL_QUEUE})
+  <code>Active: ${active_queue} | Deferred: ${def_queue} | Hold: ${hold_queue}</code>
+
+<b>[2] SYSTEM TOTAL TRAFFIC</b>
+<b>System (${LOOKBACK_MINUTES}m) :</b> <b>${sys_wt}</b> emails
+  <code>Sent: ${sys_ws} | Deferred: ${sys_wd} | Bounced: ${sys_wb}</code>
+<b>System (60m) :</b> <b>${sys_ht}</b> emails
+  <code>Sent: ${sys_hs} | Deferred: ${sys_hd} | Bounced: ${sys_hb}</code>
+<code>==============================</code>
+EOF
+)
+            local q_mail_body
+            q_mail_body=$(cat <<EOF
+============================================================
+         ZIMBRA QUEUE WARNING
+============================================================
+Server        : ${srv_host} (${srv_ip})
+Alert Time    : ${now_str}
+
+------------------------------------------------------------
+[1] REMAINING MAIL QUEUE
+------------------------------------------------------------
+System Queue  : ${total_queue} emails (Limit: ${WARN_TOTAL_QUEUE})
+                Active: ${active_queue} | Deferred: ${def_queue} | Hold: ${hold_queue}
+
+------------------------------------------------------------
+[2] SYSTEM TOTAL TRAFFIC
+------------------------------------------------------------
+System (${LOOKBACK_MINUTES}m)  : ${sys_wt} emails
+                Sent: ${sys_ws} | Deferred: ${sys_wd} | Bounced: ${sys_wb}
+
+System (60m)  : ${sys_ht} emails
+                Sent: ${sys_hs} | Deferred: ${sys_hd} | Bounced: ${sys_hb}
+============================================================
 EOF
 )
             send_telegram_alert "$q_tg_msg"
-            send_email_alert "[Zimbra Queue Warning] Mail queue reached ${total_queue} emails on ${srv_host}" \
-                "Total Postfix queue count on ${srv_host} (${srv_ip}) is currently ${total_queue} (Active: ${active_queue}, Deferred: ${def_queue}, Hold: ${hold_queue})." \
+            send_email_alert "[Zimbra Queue Warning] ${total_queue} queued emails on ${srv_host}" \
+                "$q_mail_body" \
                 "$total_queue"
         fi
     fi
 
-    rm -f "$tmp_log_stats" "$tmp_q_stats" "$tmp_q_sum" "$tmp_merged" "$lock_file"
+    rm -f "$tmp_log_stats" "$tmp_sys_sum" "$tmp_q_stats" "$tmp_q_sum" "$tmp_merged" "$lock_file"
 }
 
 # ==============================================================================
@@ -1096,20 +1148,22 @@ show_status() {
     load_config
     resolve_zimbra_settings
 
-    local tmp_log_stats tmp_q_stats tmp_q_sum
+    local tmp_log_stats tmp_sys_sum tmp_q_stats tmp_q_sum
     tmp_log_stats=$(mktemp 2>/dev/null || echo "/tmp/zsm_st_log_$$")
+    tmp_sys_sum=$(mktemp 2>/dev/null || echo "/tmp/zsm_st_sys_$$")
     tmp_q_stats=$(mktemp 2>/dev/null || echo "/tmp/zsm_st_q_$$")
     tmp_q_sum=$(mktemp 2>/dev/null || echo "/tmp/zsm_st_qsum_$$")
 
-    analyze_zimbra_log "$tmp_log_stats"
+    analyze_zimbra_log "$tmp_log_stats" "$tmp_sys_sum"
     analyze_postfix_queue "$tmp_q_stats" "$tmp_q_sum"
+
+    local sys_summary sys_wt sys_ws sys_wd sys_wb sys_ht sys_hs sys_hd sys_hb
+    sys_summary=$(cat "$tmp_sys_sum" 2>/dev/null || echo "0|0|0|0|0|0|0|0")
+    IFS='|' read -r sys_wt sys_ws sys_wd sys_wb sys_ht sys_hs sys_hd sys_hb <<< "$sys_summary"
 
     local q_summary total_queue active_queue def_queue hold_queue
     q_summary=$(cat "$tmp_q_sum" 2>/dev/null || echo "0|0|0|0")
-    total_queue=$(echo "$q_summary" | cut -d'|' -f1)
-    active_queue=$(echo "$q_summary" | cut -d'|' -f2)
-    def_queue=$(echo "$q_summary" | cut -d'|' -f3)
-    hold_queue=$(echo "$q_summary" | cut -d'|' -f4)
+    IFS='|' read -r total_queue active_queue def_queue hold_queue <<< "$q_summary"
 
     echo "=============================================================================="
     echo " ZIMBRA SPAM MONITOR v${VERSION} - SYSTEM STATUS"
@@ -1122,13 +1176,16 @@ show_status() {
     echo " Queue/User Limit   : Warning >= ${WARN_QUEUE_PER_USER} | Critical >= ${CRIT_QUEUE_PER_USER} emails"
     echo " Alert Email To     : ${RESOLVED_EMAIL_TO} (Mode: ${EMAIL_DELIVERY_MODE})"
     echo "------------------------------------------------------------------------------"
-    echo " POSTFIX MAIL QUEUE TOTAL: ${total_queue} emails"
+    echo " SYSTEM TOTAL TRAFFIC:"
+    echo "   + Last ${LOOKBACK_MINUTES} mins : ${sys_wt} emails (Sent: ${sys_ws} | Deferred: ${sys_wd} | Bounced: ${sys_wb})"
+    echo "   + Last 60 mins : ${sys_ht} emails (Sent: ${sys_hs} | Deferred: ${sys_hd} | Bounced: ${sys_hb})"
+    echo " POSTFIX MAIL QUEUE REMAINING: ${total_queue} emails"
     echo "   + Active: ${active_queue} | Deferred: ${def_queue} | Hold: ${hold_queue}"
     echo "------------------------------------------------------------------------------"
     printf " %-34s | %-10s | %-10s | %-15s\n" "TOP SENDERS (LAST 60M)" "${LOOKBACK_MINUTES} MINS" "60 MINS" "SOURCE IP"
     echo "------------------------------------------------------------------------------"
     if [[ -s "$tmp_log_stats" ]]; then
-        head -n 15 "$tmp_log_stats" | while IFS='|' read -r s wt ws wd wb ht hs hd hb ips doms; do
+        head -n 15 "$tmp_log_stats" | while IFS='|' read -r s wt ws wd wb ht hs hd hb ips tspan; do
             printf " %-34s | %-10s | %-10s | %-15s\n" "$s" "$wt" "$ht" "$ips"
         done
     else
@@ -1146,7 +1203,7 @@ show_status() {
     fi
     echo "=============================================================================="
 
-    rm -f "$tmp_log_stats" "$tmp_q_stats" "$tmp_q_sum"
+    rm -f "$tmp_log_stats" "$tmp_sys_sum" "$tmp_q_stats" "$tmp_q_sum"
 }
 
 run_test_alert() {
@@ -1157,6 +1214,25 @@ run_test_alert() {
     srv_ip=$(get_server_ip)
     now_str=$(date '+%Y-%m-%d %H:%M:%S')
 
+    local tmp_log_stats tmp_sys_sum tmp_q_stats tmp_q_sum
+    tmp_log_stats=$(mktemp 2>/dev/null || echo "/tmp/zsm_tst_log_$$")
+    tmp_sys_sum=$(mktemp 2>/dev/null || echo "/tmp/zsm_tst_sys_$$")
+    tmp_q_stats=$(mktemp 2>/dev/null || echo "/tmp/zsm_tst_q_$$")
+    tmp_q_sum=$(mktemp 2>/dev/null || echo "/tmp/zsm_tst_qsum_$$")
+
+    analyze_zimbra_log "$tmp_log_stats" "$tmp_sys_sum"
+    analyze_postfix_queue "$tmp_q_stats" "$tmp_q_sum"
+
+    local sys_summary sys_wt sys_ws sys_wd sys_wb sys_ht sys_hs sys_hd sys_hb
+    sys_summary=$(cat "$tmp_sys_sum" 2>/dev/null || echo "0|0|0|0|0|0|0|0")
+    IFS='|' read -r sys_wt sys_ws sys_wd sys_wb sys_ht sys_hs sys_hd sys_hb <<< "$sys_summary"
+
+    local q_summary total_queue active_queue def_queue hold_queue
+    q_summary=$(cat "$tmp_q_sum" 2>/dev/null || echo "0|0|0|0")
+    IFS='|' read -r total_queue active_queue def_queue hold_queue <<< "$q_summary"
+
+    rm -f "$tmp_log_stats" "$tmp_sys_sum" "$tmp_q_stats" "$tmp_q_sum"
+
     echo "Sending test alert from ${srv_host} (${srv_ip})..."
     echo " - Config File      : ${CONFIG_FILE}"
     echo " - Telegram Enabled : ${TELEGRAM_ENABLED} (Chat ID: ${TELEGRAM_CHAT_ID:-Not set})"
@@ -1164,16 +1240,21 @@ run_test_alert() {
 
     local test_tg_msg
     test_tg_msg=$(cat <<EOF
-<b>[ZIMBRA SPAM MONITOR - TEST NOTIFICATION]</b>
---------------------------------------
-<b>Server:</b> <code>$(html_escape "$srv_host")</code> (${srv_ip})
-<b>Time:</b> ${now_str}
-<b>${LOOKBACK_MINUTES}-Min Limit:</b> Warn ${WARN_SENT_PER_WINDOW} / Crit ${CRIT_SENT_PER_WINDOW}
-<b>60-Min Limit:</b> Warn ${WARN_SENT_PER_HOUR} / Crit ${CRIT_SENT_PER_HOUR}
-<b>Queue Limit:</b> Warn ${WARN_QUEUE_PER_USER} / Crit ${CRIT_QUEUE_PER_USER}
-<b>Auto-Lock on Critical:</b> ${AUTO_LOCK_ON_CRITICAL}
---------------------------------------
-<i>Zimbra Outbound Spam Monitor is working properly!</i>
+<b>[ZIMBRA SPAM MONITOR - TEST]</b>
+<code>==============================</code>
+<b>Server       :</b> <code>$(html_escape "$srv_host")</code> (${srv_ip})
+<b>Time         :</b> ${now_str}
+
+<b>[1] SYSTEM TOTAL TRAFFIC</b>
+<b>System (${LOOKBACK_MINUTES}m) :</b> <b>${sys_wt}</b> emails
+  <code>Sent: ${sys_ws} | Deferred: ${sys_wd} | Bounced: ${sys_wb}</code>
+<b>System (60m) :</b> <b>${sys_ht}</b> emails
+  <code>Sent: ${sys_hs} | Deferred: ${sys_hd} | Bounced: ${sys_hb}</code>
+
+<b>[2] REMAINING MAIL QUEUE</b>
+<b>System Queue :</b> <b>${total_queue}</b> emails
+  <code>Active: ${active_queue} | Deferred: ${def_queue} | Hold: ${hold_queue}</code>
+<code>==============================</code>
 EOF
 )
 
@@ -1189,7 +1270,31 @@ EOF
 
     local mail_rc=0
     if [[ "$EMAIL_ENABLED" == "true" ]]; then
-        local test_mail_body="This is a test notification from Zimbra Outbound Spam Monitor on server ${srv_host} (${srv_ip}) at ${now_str}. Alert delivery is working properly."
+        local test_mail_body
+        test_mail_body=$(cat <<EOF
+============================================================
+         ZIMBRA SPAM MONITOR - TEST NOTIFICATION
+============================================================
+Server        : ${srv_host} (${srv_ip})
+Time          : ${now_str}
+
+------------------------------------------------------------
+[1] SYSTEM TOTAL TRAFFIC
+------------------------------------------------------------
+System (${LOOKBACK_MINUTES}m)  : ${sys_wt} emails
+                Sent: ${sys_ws} | Deferred: ${sys_wd} | Bounced: ${sys_wb}
+
+System (60m)  : ${sys_ht} emails
+                Sent: ${sys_hs} | Deferred: ${sys_hd} | Bounced: ${sys_hb}
+
+------------------------------------------------------------
+[2] REMAINING MAIL QUEUE
+------------------------------------------------------------
+System Queue  : ${total_queue} emails
+                Active: ${active_queue} | Deferred: ${def_queue} | Hold: ${hold_queue}
+============================================================
+EOF
+)
         if send_email_alert "[Zimbra Spam Monitor] Test Notification from ${srv_host}" "$test_mail_body" 0; then
             echo " [OK] Test Email sent successfully to ${RESOLVED_EMAIL_TO}!"
         else

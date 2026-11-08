@@ -1,4 +1,4 @@
-# Zimbra Outbound Spam Monitor (`zimbra-spam-monitor` v1.1.0)
+# Zimbra Outbound Spam Monitor (`zimbra-spam-monitor` v1.1.1)
 
 Automated outbound email spam detection, alerting (**Telegram** + **Email**), and account auto-locking tool for **Zimbra Collaboration Suite (ZCS)**.
 
@@ -8,21 +8,21 @@ Includes a **100% ASCII-safe English Interactive Control Panel** (supports `whip
 
 ## 1. Quick Installation from GitHub Releases (`.rpm` & `.deb`)
 
-Releases page: https://github.com/0xAndyNew/Monitor-Email-Spam-Zimbra/releases/tag/v1.1.0
+Releases page: https://github.com/0xAndyNew/Monitor-Email-Spam-Zimbra/releases/tag/v1.1.1
 
 ### A. RHEL / CentOS / Rocky Linux / AlmaLinux (`.rpm`)
 Run as `root` on your Zimbra server:
 ```bash
-wget -O zimbra-spam-monitor-1.1.0-1.noarch.rpm https://github.com/0xAndyNew/Monitor-Email-Spam-Zimbra/releases/download/v1.1.0/zimbra-spam-monitor-1.1.0-1.noarch.rpm
-rpm -Uvh zimbra-spam-monitor-1.1.0-1.noarch.rpm
+wget -O zimbra-spam-monitor-1.1.1-1.noarch.rpm https://github.com/0xAndyNew/Monitor-Email-Spam-Zimbra/releases/download/v1.1.1/zimbra-spam-monitor-1.1.1-1.noarch.rpm
+rpm -Uvh zimbra-spam-monitor-1.1.1-1.noarch.rpm
 ```
-*(Or: `yum localinstall -y zimbra-spam-monitor-1.1.0-1.noarch.rpm`)*
+*(Or: `yum localinstall -y zimbra-spam-monitor-1.1.1-1.noarch.rpm`)*
 
 ### B. Ubuntu / Debian (`.deb`)
 Run as `root` on your Zimbra server:
 ```bash
-wget -O zimbra-spam-monitor_1.1.0-1_all.deb https://github.com/0xAndyNew/Monitor-Email-Spam-Zimbra/releases/download/v1.1.0/zimbra-spam-monitor_1.1.0-1_all.deb
-dpkg -i zimbra-spam-monitor_1.1.0-1_all.deb
+wget -O zimbra-spam-monitor_1.1.1-1_all.deb https://github.com/0xAndyNew/Monitor-Email-Spam-Zimbra/releases/download/v1.1.1/zimbra-spam-monitor_1.1.1-1_all.deb
+dpkg -i zimbra-spam-monitor_1.1.1-1_all.deb
 ```
 
 ---
