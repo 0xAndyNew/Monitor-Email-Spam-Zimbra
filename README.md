@@ -6,12 +6,14 @@ Tích hợp **Giao diện Bảng Điều Khiển Chọn Mục (TUI Hộp thoại
 
 ---
 
-## 1. Cài đặt nhanh từ GitHub (`.rpm` & `.deb`)
+## 1. Cài đặt nhanh từ GitHub Releases (`.rpm` & `.deb`)
+
+Trang tải bản phát hành (Releases): https://github.com/0xAndyNew/Monitor-Email-Spam-Zimbra/releases/tag/v1.0.0
 
 ### A. Trên CentOS / RHEL / Rocky Linux / AlmaLinux (Gói `.rpm`)
 Chạy lệnh sau với quyền `root` trên server Zimbra:
 ```bash
-wget -O zimbra-spam-monitor-1.0.0-1.noarch.rpm https://github.com/0xAndyNew/Monitor-Email-Spam-Zimbra/raw/main/zimbra-spam-monitor-1.0.0-1.noarch.rpm
+wget -O zimbra-spam-monitor-1.0.0-1.noarch.rpm https://github.com/0xAndyNew/Monitor-Email-Spam-Zimbra/releases/download/v1.0.0/zimbra-spam-monitor-1.0.0-1.noarch.rpm
 rpm -ivh zimbra-spam-monitor-1.0.0-1.noarch.rpm
 ```
 *(Hoặc dùng `yum localinstall -y zimbra-spam-monitor-1.0.0-1.noarch.rpm`)*
@@ -19,7 +21,7 @@ rpm -ivh zimbra-spam-monitor-1.0.0-1.noarch.rpm
 ### B. Trên Ubuntu / Debian (Gói `.deb`)
 Chạy lệnh sau với quyền `root` trên server Zimbra:
 ```bash
-wget -O zimbra-spam-monitor_1.0.0-1_all.deb https://github.com/0xAndyNew/Monitor-Email-Spam-Zimbra/raw/main/zimbra-spam-monitor_1.0.0-1_all.deb
+wget -O zimbra-spam-monitor_1.0.0-1_all.deb https://github.com/0xAndyNew/Monitor-Email-Spam-Zimbra/releases/download/v1.0.0/zimbra-spam-monitor_1.0.0-1_all.deb
 dpkg -i zimbra-spam-monitor_1.0.0-1_all.deb
 ```
 
