@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
 # ==============================================================================
 # ZIMBRA OUTBOUND SPAM MONITOR & ALERT SYSTEM (zimbra-spam-monitor)
-# Version: 1.2.0
+# Version: 1.2.1
 # Supported OS: RHEL / CentOS / Rocky / AlmaLinux (.rpm) & Ubuntu / Debian (.deb)
 #
 # Features:
-# 1. Interactive Control Panel (TUI Arrow-Key Dialog & Number Selection Menu)
-# 2. Multi-Signal Outbound Spam Engine per short sliding window (default 5 mins):
+# 1. Streamlined Interactive Control Panel (TUI Arrow-Key & Number Menu)
+# 2. Multi-Signal Outbound Spam Engine per short check interval (default 5 mins):
 #    - Messages Sent, Total Recipients, Unique Recipients, External Domains
 #    - Failed Rate ((Deferred + Bounced) / Recipients %) with min floor
 #    - Distinct Source IPs (Botnet detection) & External Sender Spoofing
@@ -20,7 +20,7 @@
 
 set -u
 
-VERSION="1.2.0"
+VERSION="1.2.1"
 DEFAULT_CONFIG_FILE="/etc/zimbra-spam-monitor/config.conf"
 CONFIG_FILE="${ZSM_CONFIG_FILE:-$DEFAULT_CONFIG_FILE}"
 CRON_FILE="${ZSM_CRON_FILE:-/etc/cron.d/zimbra-spam-monitor}"
@@ -1561,7 +1561,7 @@ show_status() {
     echo " ZIMBRA SPAM MONITOR v${VERSION} - LIVE SYSTEM STATUS (LAST ${LOOKBACK_MINUTES} MINS)"
     echo "=============================================================================="
     echo " Zimbra Server   : $(get_server_hostname) ($(get_server_ip))"
-    echo " Monitor Status  : ${MONITOR_ENABLED} | Window: ${LOOKBACK_MINUTES}m | Cooldown: ${ALERT_COOLDOWN_MINUTES}m | Auto-Lock: ${AUTO_LOCK_ON_CRITICAL}"
+    echo " Monitor Status  : ${MONITOR_ENABLED} | Check Range: ${LOOKBACK_MINUTES}m | Cooldown: ${ALERT_COOLDOWN_MINUTES}m | Auto-Lock: ${AUTO_LOCK_ON_CRITICAL}"
     echo " Alert Email To  : ${RESOLVED_EMAIL_TO} (Mode: ${EMAIL_DELIVERY_MODE})"
     echo " System Traffic  : ${sys_tot} emails (Sent: ${sys_snt} | Deferred: ${sys_def} | Bounced: ${sys_bnc})"
     echo " Postfix Queue   : ${total_queue} emails (Active: ${active_queue} | Deferred: ${def_queue} | Hold: ${hold_queue})"
@@ -1627,7 +1627,7 @@ run_test_alert() {
 
     echo "Sending test alert from ${srv_host} (${srv_ip})..."
     echo " - Config File      : ${CONFIG_FILE}"
-    echo " - Scan Window      : ${LOOKBACK_MINUTES} mins (Cooldown: ${ALERT_COOLDOWN_MINUTES} mins)"
+    echo " - Check Interval   : ${LOOKBACK_MINUTES} mins (Cooldown: ${ALERT_COOLDOWN_MINUTES} mins)"
     echo " - Telegram Enabled : ${TELEGRAM_ENABLED} (Chat ID: ${TELEGRAM_CHAT_ID:-Not set})"
     echo " - Email Enabled    : ${EMAIL_ENABLED} (Recipient: ${RESOLVED_EMAIL_TO})"
 
@@ -1637,7 +1637,7 @@ run_test_alert() {
 <code>==============================</code>
 <b>Server       :</b> <code>$(html_escape "$srv_host")</code> (${srv_ip})
 <b>Alert Time   :</b> ${now_str}
-<b>Scan Window  :</b> ${LOOKBACK_MINUTES} mins (Cooldown: ${ALERT_COOLDOWN_MINUTES}m)
+<b>Check Range  :</b> Last ${LOOKBACK_MINUTES} mins (Repeat: ${ALERT_COOLDOWN_MINUTES}m)
 
 <b>[1] SYSTEM TOTAL TRAFFIC</b>
 <b>Total Traffic:</b> <b>${sys_tot}</b> emails
@@ -1669,7 +1669,7 @@ EOF
 ============================================================
 Server        : ${srv_host} (${srv_ip})
 Alert Time    : ${now_str}
-Scan Window   : ${LOOKBACK_MINUTES} mins (Cooldown: ${ALERT_COOLDOWN_MINUTES}m)
+Check Range   : Last ${LOOKBACK_MINUTES} mins (Repeat: ${ALERT_COOLDOWN_MINUTES}m)
 
 ------------------------------------------------------------
 [1] SYSTEM TOTAL TRAFFIC
@@ -1888,23 +1888,22 @@ ui_msg_box() {
 }
 
 # ------------------------------------------------------------------------------
-# SUBMENU: TELEGRAM SETTINGS
+# SUBMENU [2.1]: TELEGRAM SETTINGS (COMPACT)
 # ------------------------------------------------------------------------------
 submenu_telegram() {
     while true; do
         load_config
-        local st_label="ENABLED (true)"
-        [[ "$TELEGRAM_ENABLED" != "true" ]] && st_label="DISABLED (false)"
-        local tok_mask="${TELEGRAM_BOT_TOKEN:-<Not configured>}"
-        local cid_mask="${TELEGRAM_CHAT_ID:-<Not configured>}"
+        local st_label="ON"
+        [[ "$TELEGRAM_ENABLED" != "true" ]] && st_label="OFF"
+        local tok_mask="${TELEGRAM_BOT_TOKEN:-<Not set>}"
+        local cid_mask="${TELEGRAM_CHAT_ID:-<Not set>}"
 
         local choice
-        choice=$(ui_select_menu "TELEGRAM ALERT SETTINGS" \
-            "Select a Telegram configuration option:" \
-            "1" "Telegram Alerts        : ${st_label} (Select to Toggle)" \
-            "2" "Set Telegram Bot Token : ${tok_mask}" \
-            "3" "Set Telegram Chat ID   : ${cid_mask}" \
-            "4" "Send Test Alert Now" \
+        choice=$(ui_select_menu "TELEGRAM SETTINGS" \
+            "Configure Telegram Bot alerts:" \
+            "1" "Telegram Alerts : ${st_label} (Select to Toggle)" \
+            "2" "Bot Token       : ${tok_mask}" \
+            "3" "Chat ID         : ${cid_mask}" \
             "0" "Back")
 
         case "$choice" in
@@ -1925,11 +1924,6 @@ submenu_telegram() {
                 new_cid=$(ui_input_box "TELEGRAM CHAT ID" "Enter User or Group Chat ID (e.g. -100123456789):" "$TELEGRAM_CHAT_ID")
                 update_cfg_var "TELEGRAM_CHAT_ID" "$new_cid"
                 ;;
-            4)
-                local out
-                out=$(run_test_alert 2>&1 || true)
-                ui_msg_box "TEST ALERT RESULT" "$out"
-                ;;
             0|"")
                 break
                 ;;
@@ -1938,24 +1932,24 @@ submenu_telegram() {
 }
 
 # ------------------------------------------------------------------------------
-# SUBMENU: EMAIL & SMTP SETTINGS
+# SUBMENU [2.2]: EMAIL & SMTP SETTINGS (COMPACT - ONE-CLICK MODE CYCLE)
 # ------------------------------------------------------------------------------
 submenu_email() {
     while true; do
         load_config
         resolve_zimbra_settings
-        local st_label="ENABLED (true)"
-        [[ "$EMAIL_ENABLED" != "true" ]] && st_label="DISABLED (false)"
+        local st_label="ON"
+        [[ "$EMAIL_ENABLED" != "true" ]] && st_label="OFF"
+        local smtp_badge="${SMTP_HOST:-Not set}"
+        [[ -n "$SMTP_HOST" ]] && smtp_badge="${SMTP_HOST}:${SMTP_PORT}"
 
         local choice
-        choice=$(ui_select_menu "EMAIL & SMTP ALERT SETTINGS" \
-            "Auto-detected Zimbra Admin Email: ${RESOLVED_EMAIL_TO}" \
-            "1" "Email Alerts           : ${st_label} (Select to Toggle)" \
-            "2" "Delivery Mode          : ${EMAIL_DELIVERY_MODE} (auto / local / smtp)" \
-            "3" "Alert Recipient (To)   : ${ALERT_EMAIL_TO} (-> ${RESOLVED_EMAIL_TO})" \
-            "4" "Alert Sender (From)    : ${ALERT_EMAIL_FROM} (-> ${RESOLVED_EMAIL_FROM})" \
-            "5" "External Fallback SMTP : ${SMTP_HOST:-Not set}" \
-            "6" "Send Test Alert Now" \
+        choice=$(ui_select_menu "EMAIL & SMTP SETTINGS" \
+            "Zimbra Admin Email: ${RESOLVED_EMAIL_TO}" \
+            "1" "Email Alerts    : ${st_label} (Select to Toggle)" \
+            "2" "Recipient Email : ${ALERT_EMAIL_TO} (-> ${RESOLVED_EMAIL_TO})" \
+            "3" "Delivery Mode   : ${EMAIL_DELIVERY_MODE} (Select to Cycle: auto/local/smtp)" \
+            "4" "Fallback SMTP   : ${smtp_badge}" \
             "0" "Back")
 
         case "$choice" in
@@ -1967,64 +1961,29 @@ submenu_email() {
                 fi
                 ;;
             2)
-                local mode_sel
-                mode_sel=$(ui_select_menu "SELECT EMAIL DELIVERY MODE" \
-                    "Choose how alert emails should be delivered:" \
-                    "1" "auto  - Local Zimbra Postfix first, fallback to External SMTP" \
-                    "2" "local - Only use Local Zimbra Postfix (No SMTP password needed)" \
-                    "3" "smtp  - Only use External SMTP Server" \
-                    "0" "Cancel")
-                case "$mode_sel" in
-                    1) update_cfg_var "EMAIL_DELIVERY_MODE" "auto" ;;
-                    2) update_cfg_var "EMAIL_DELIVERY_MODE" "local" ;;
-                    3) update_cfg_var "EMAIL_DELIVERY_MODE" "smtp" ;;
-                esac
+                local custom_to
+                custom_to=$(ui_input_box "RECIPIENT EMAIL" "Enter email(s) (comma-separated) or 'auto' for Zimbra Admin:" "$ALERT_EMAIL_TO")
+                update_cfg_var "ALERT_EMAIL_TO" "${custom_to:-auto}"
                 ;;
             3)
-                local to_sel
-                to_sel=$(ui_select_menu "SELECT ALERT RECIPIENT EMAIL" \
-                    "Choose recipient configuration:" \
-                    "1" "Auto-detect Zimbra System Admin Email (auto -> ${RESOLVED_EMAIL_TO})" \
-                    "2" "Enter custom recipient email(s) (comma-separated)" \
-                    "0" "Back")
-                if [[ "$to_sel" == "1" ]]; then
-                    update_cfg_var "ALERT_EMAIL_TO" "auto"
-                elif [[ "$to_sel" == "2" ]]; then
-                    local custom_to
-                    custom_to=$(ui_input_box "ALERT RECIPIENT EMAIL" "Enter one or more emails (comma-separated):" "$ALERT_EMAIL_TO")
-                    update_cfg_var "ALERT_EMAIL_TO" "$custom_to"
-                fi
+                case "$EMAIL_DELIVERY_MODE" in
+                    auto)  update_cfg_var "EMAIL_DELIVERY_MODE" "local" ;;
+                    local) update_cfg_var "EMAIL_DELIVERY_MODE" "smtp" ;;
+                    *)     update_cfg_var "EMAIL_DELIVERY_MODE" "auto" ;;
+                esac
                 ;;
             4)
-                local from_sel
-                from_sel=$(ui_select_menu "SELECT ALERT SENDER (FROM)" \
-                    "Choose sender address configuration:" \
-                    "1" "Auto-detect from Zimbra system (auto)" \
-                    "2" "Enter custom From email address" \
-                    "0" "Back")
-                if [[ "$from_sel" == "1" ]]; then
-                    update_cfg_var "ALERT_EMAIL_FROM" "auto"
-                elif [[ "$from_sel" == "2" ]]; then
-                    local custom_from
-                    custom_from=$(ui_input_box "ALERT SENDER EMAIL" "Enter sender From email address:" "$ALERT_EMAIL_FROM")
-                    update_cfg_var "ALERT_EMAIL_FROM" "$custom_from"
-                fi
-                ;;
-            5)
                 local shost sport suser spass
-                shost=$(ui_input_box "SMTP HOST" "Enter external SMTP server (e.g. smtp.gmail.com):" "$SMTP_HOST")
-                sport=$(ui_input_box "SMTP PORT" "Enter SMTP port (587 or 465):" "$SMTP_PORT")
-                suser=$(ui_input_box "SMTP USER" "Enter SMTP username:" "$SMTP_USER")
-                spass=$(ui_input_box "SMTP PASSWORD" "Enter SMTP password / App Password:" "$SMTP_PASS")
+                shost=$(ui_input_box "SMTP HOST" "External SMTP host (leave empty if not needed):" "$SMTP_HOST")
                 update_cfg_var "SMTP_HOST" "$shost"
-                update_cfg_var "SMTP_PORT" "$sport"
-                update_cfg_var "SMTP_USER" "$suser"
-                update_cfg_var "SMTP_PASS" "$spass"
-                ;;
-            6)
-                local out
-                out=$(run_test_alert 2>&1 || true)
-                ui_msg_box "TEST ALERT RESULT" "$out"
+                if [[ -n "$shost" ]]; then
+                    sport=$(ui_input_box "SMTP PORT" "Enter SMTP port (587 or 465):" "$SMTP_PORT")
+                    suser=$(ui_input_box "SMTP USER" "Enter SMTP username:" "$SMTP_USER")
+                    spass=$(ui_input_box "SMTP PASSWORD" "Enter SMTP password / App Password:" "$SMTP_PASS")
+                    update_cfg_var "SMTP_PORT" "$sport"
+                    update_cfg_var "SMTP_USER" "$suser"
+                    update_cfg_var "SMTP_PASS" "$spass"
+                fi
                 ;;
             0|"")
                 break
@@ -2034,7 +1993,7 @@ submenu_email() {
 }
 
 # ------------------------------------------------------------------------------
-# COMBINED SUBMENU [2]: NOTIFICATIONS & TEST ALERT (TELEGRAM + EMAIL + TEST)
+# SUBMENU [2]: ALERTS & TEST (TELEGRAM + EMAIL + TEST)
 # ------------------------------------------------------------------------------
 submenu_notifications() {
     while true; do
@@ -2045,28 +2004,145 @@ submenu_notifications() {
         [[ "$TELEGRAM_ENABLED" != "true" ]] && tg_badge="OFF"
         [[ -z "$TELEGRAM_BOT_TOKEN" ]] && tg_badge="${tg_badge} (No Token)"
 
-        local mail_badge="ON (${EMAIL_DELIVERY_MODE} -> ${RESOLVED_EMAIL_TO})"
+        local mail_badge="ON -> ${RESOLVED_EMAIL_TO}"
         [[ "$EMAIL_ENABLED" != "true" ]] && mail_badge="OFF"
 
         local choice
-        choice=$(ui_select_menu "NOTIFICATION CHANNELS & TEST ALERT" \
-            "Configure Telegram, Email/SMTP, or send a test notification:" \
-            "1" "Configure Telegram Alerts      [${tg_badge}]" \
-            "2" "Configure Email & SMTP Alerts  [${mail_badge}]" \
-            "3" "Send Test Alert Now            (Telegram & Email)" \
-            "0" "Back to Main Menu")
+        choice=$(ui_select_menu "ALERTS & TEST" \
+            "Configure Telegram, Email/SMTP, or send a test message:" \
+            "1" "Telegram Settings   [${tg_badge}]" \
+            "2" "Email/SMTP Settings [${mail_badge}]" \
+            "3" "Send Test Alert Now" \
+            "0" "Back")
 
         case "$choice" in
-            1)
-                submenu_telegram
-                ;;
-            2)
-                submenu_email
-                ;;
+            1) submenu_telegram ;;
+            2) submenu_email ;;
             3)
                 local test_out
                 test_out=$(run_test_alert 2>&1 || true)
                 ui_msg_box "TEST ALERT RESULT" "$test_out"
+                ;;
+            0|"") break ;;
+        esac
+    done
+}
+
+# ------------------------------------------------------------------------------
+# SUBMENU [3]: STREAMLINED SPAM LIMITS & SCHEDULE (FLAT, ZERO SUBMENU MAZE)
+# ------------------------------------------------------------------------------
+apply_email_volume_limits() {
+    local w_rcpt="$1"
+    local c_rcpt="$2"
+    local w_uniq=$(( (w_rcpt * 80) / 100 ))
+    local c_uniq=$(( (c_rcpt * 80) / 100 ))
+    local w_msgs=$(( (w_rcpt * 60) / 100 ))
+    local c_msgs=$(( (c_rcpt * 75) / 100 ))
+    (( w_uniq < 10 )) && w_uniq=10
+    (( c_uniq < 20 )) && c_uniq=20
+    (( w_msgs < 10 )) && w_msgs=10
+    (( c_msgs < 20 )) && c_msgs=20
+
+    update_cfg_num "WARN_RECIPIENTS" "$w_rcpt"
+    update_cfg_num "CRIT_RECIPIENTS" "$c_rcpt"
+    update_cfg_num "WARN_UNIQUE_RECIPIENTS" "$w_uniq"
+    update_cfg_num "CRIT_UNIQUE_RECIPIENTS" "$c_uniq"
+    update_cfg_num "WARN_MESSAGES_SENT" "$w_msgs"
+    update_cfg_num "CRIT_MESSAGES_SENT" "$c_msgs"
+}
+
+submenu_thresholds() {
+    while true; do
+        load_config
+        local cur_cron
+        cur_cron=$(get_current_cron_interval)
+
+        local choice
+        choice=$(ui_select_menu "SPAM LIMITS & CHECK SCHEDULE" \
+            "Check Range: Last ${LOOKBACK_MINUTES}m | Cron: ${cur_cron} | Repeat Alert: ${ALERT_COOLDOWN_MINUTES}m" \
+            "1" "Quick Preset       (Strict 50/100 | Normal 100/200 | Large 200/400)" \
+            "2" "Check Schedule     : ${cur_cron} (Log Range: ${LOOKBACK_MINUTES}m)" \
+            "3" "Repeat Cooldown    : ${ALERT_COOLDOWN_MINUTES} mins" \
+            "4" "Email Limit (${LOOKBACK_MINUTES}m)   : Warn >= ${WARN_RECIPIENTS} | Lock >= ${CRIT_RECIPIENTS}" \
+            "5" "Failed Rate (%)    : Warn >= ${WARN_FAILED_RATE_PCT}% | Lock >= ${CRIT_FAILED_RATE_PCT}%" \
+            "6" "Queue Limit / User : Warn >= ${WARN_QUEUE_PER_USER} | Lock >= ${CRIT_QUEUE_PER_USER}" \
+            "0" "Back")
+
+        local w_val="" cr_val=""
+        case "$choice" in
+            1)
+                local p_sel
+                p_sel=$(ui_select_menu "APPLY QUICK PRESET" \
+                    "Choose sensitivity profile for your Zimbra server:" \
+                    "1" "Strict      (Small server : Warn >= 50  | Lock >= 100 emails)" \
+                    "2" "Normal      (Recommended  : Warn >= 100 | Lock >= 200 emails)" \
+                    "3" "High-Volume (Large server : Warn >= 200 | Lock >= 400 emails)" \
+                    "0" "Cancel")
+                case "$p_sel" in
+                    1)
+                        apply_email_volume_limits 50 100
+                        update_cfg_num "WARN_QUEUE_PER_USER" 25
+                        update_cfg_num "CRIT_QUEUE_PER_USER" 60
+                        ui_msg_box "PRESET APPLIED" "Applied STRICT profile (Warn >= 50 | Lock >= 100 emails in ${LOOKBACK_MINUTES}m)."
+                        ;;
+                    2)
+                        apply_email_volume_limits 100 200
+                        update_cfg_num "WARN_QUEUE_PER_USER" 40
+                        update_cfg_num "CRIT_QUEUE_PER_USER" 100
+                        ui_msg_box "PRESET APPLIED" "Applied NORMAL profile (Warn >= 100 | Lock >= 200 emails in ${LOOKBACK_MINUTES}m)."
+                        ;;
+                    3)
+                        apply_email_volume_limits 200 400
+                        update_cfg_num "WARN_QUEUE_PER_USER" 80
+                        update_cfg_num "CRIT_QUEUE_PER_USER" 200
+                        ui_msg_box "PRESET APPLIED" "Applied HIGH-VOLUME profile (Warn >= 200 | Lock >= 400 emails in ${LOOKBACK_MINUTES}m)."
+                        ;;
+                esac
+                ;;
+            2)
+                local s_sel
+                s_sel=$(ui_select_menu "CHECK SCHEDULE (CRON & LOG TIME RANGE)" \
+                    "Select how often Linux Cron checks Zimbra logs:" \
+                    "1" "Every 1 min   (Check last 5 mins)" \
+                    "2" "Every 2 mins  (Check last 5 mins)" \
+                    "3" "Every 5 mins  (Check last 5 mins - Recommended)" \
+                    "4" "Every 10 mins (Check last 10 mins)" \
+                    "5" "Every 15 mins (Check last 15 mins)" \
+                    "6" "Every 30 mins (Check last 30 mins)" \
+                    "7" "Pause Cron Schedule" \
+                    "0" "Cancel")
+                case "$s_sel" in
+                    1) set_cron_interval_minutes "1";  update_cfg_num "LOOKBACK_MINUTES" 5 ;;
+                    2) set_cron_interval_minutes "2";  update_cfg_num "LOOKBACK_MINUTES" 5 ;;
+                    3) set_cron_interval_minutes "5";  update_cfg_num "LOOKBACK_MINUTES" 5 ;;
+                    4) set_cron_interval_minutes "10"; update_cfg_num "LOOKBACK_MINUTES" 10 ;;
+                    5) set_cron_interval_minutes "15"; update_cfg_num "LOOKBACK_MINUTES" 15 ;;
+                    6) set_cron_interval_minutes "30"; update_cfg_num "LOOKBACK_MINUTES" 30 ;;
+                    7) set_cron_interval_minutes "disable" ;;
+                esac
+                ;;
+            3)
+                w_val=$(ui_input_box "REPEAT COOLDOWN (MINUTES)" "Minutes to wait before repeating the same alert for 1 user:" "$ALERT_COOLDOWN_MINUTES")
+                [[ "$w_val" =~ ^[0-9]+$ ]] && update_cfg_num "ALERT_COOLDOWN_MINUTES" "$w_val"
+                ;;
+            4)
+                w_val=$(ui_input_box "WARNING EMAIL LIMIT (${LOOKBACK_MINUTES}m)" "Emails in ${LOOKBACK_MINUTES}m to send WARNING alert:" "$WARN_RECIPIENTS")
+                cr_val=$(ui_input_box "CRITICAL LOCK LIMIT (${LOOKBACK_MINUTES}m)" "Emails in ${LOOKBACK_MINUTES}m to trigger CRITICAL & Lock:" "$CRIT_RECIPIENTS")
+                if [[ "$w_val" =~ ^[0-9]+$ && "$cr_val" =~ ^[0-9]+$ ]]; then
+                    apply_email_volume_limits "$w_val" "$cr_val"
+                fi
+                ;;
+            5)
+                w_val=$(ui_input_box "WARNING FAILED RATE (%)" "Failed rate % (1-100) to send WARNING:" "$WARN_FAILED_RATE_PCT")
+                [[ "$w_val" =~ ^[0-9]+$ ]] && update_cfg_num "WARN_FAILED_RATE_PCT" "$w_val"
+                cr_val=$(ui_input_box "CRITICAL FAILED RATE (%)" "Failed rate % (1-100) to trigger CRITICAL:" "$CRIT_FAILED_RATE_PCT")
+                [[ "$cr_val" =~ ^[0-9]+$ ]] && update_cfg_num "CRIT_FAILED_RATE_PCT" "$cr_val"
+                ;;
+            6)
+                w_val=$(ui_input_box "WARNING QUEUE LIMIT" "Queued emails for 1 user to send WARNING:" "$WARN_QUEUE_PER_USER")
+                [[ "$w_val" =~ ^[0-9]+$ ]] && update_cfg_num "WARN_QUEUE_PER_USER" "$w_val"
+                cr_val=$(ui_input_box "CRITICAL QUEUE LIMIT" "Queued emails for 1 user to trigger CRITICAL:" "$CRIT_QUEUE_PER_USER")
+                [[ "$cr_val" =~ ^[0-9]+$ ]] && update_cfg_num "CRIT_QUEUE_PER_USER" "$cr_val"
                 ;;
             0|"")
                 break
@@ -2076,285 +2152,81 @@ submenu_notifications() {
 }
 
 # ------------------------------------------------------------------------------
-# SUBMENU [3]: GROUPED MULTI-SIGNAL SPAM RULES & THRESHOLDS
-# ------------------------------------------------------------------------------
-submenu_thresh_window() {
-    while true; do
-        load_config
-        local c val
-        c=$(ui_select_menu "SCAN WINDOW & ALERT COOLDOWN" \
-            "Independent evaluation window and repeat notification cooldown:" \
-            "1" "Scan Window (Minutes)           : ${LOOKBACK_MINUTES} mins" \
-            "2" "Alert Repeat Cooldown (Minutes) : ${ALERT_COOLDOWN_MINUTES} mins" \
-            "0" "Back")
-        case "$c" in
-            1)
-                val=$(ui_input_box "SCAN WINDOW (MINUTES)" "Enter lookback scan window in minutes (e.g. 5, 10):" "$LOOKBACK_MINUTES")
-                [[ "$val" =~ ^[0-9]+$ ]] && update_cfg_num "LOOKBACK_MINUTES" "$val"
-                ;;
-            2)
-                val=$(ui_input_box "ALERT COOLDOWN (MINUTES)" "Minutes before repeating the same alert level for a user:" "$ALERT_COOLDOWN_MINUTES")
-                [[ "$val" =~ ^[0-9]+$ ]] && update_cfg_num "ALERT_COOLDOWN_MINUTES" "$val"
-                ;;
-            0|"") break ;;
-        esac
-    done
-}
-
-submenu_thresh_volume() {
-    while true; do
-        load_config
-        local c w_val cr_val
-        c=$(ui_select_menu "VOLUME THRESHOLDS (${LOOKBACK_MINUTES} MINS)" \
-            "Configure Messages Sent, Total Recipients, and Unique Recipients:" \
-            "1" "Messages Sent (WARN / CRIT)         : ${WARN_MESSAGES_SENT} / ${CRIT_MESSAGES_SENT} msgs" \
-            "2" "Total Recipients (WARN / CRIT)      : ${WARN_RECIPIENTS} / ${CRIT_RECIPIENTS} rcpts" \
-            "3" "Unique Recipients (WARN / CRIT)     : ${WARN_UNIQUE_RECIPIENTS} / ${CRIT_UNIQUE_RECIPIENTS} rcpts" \
-            "4" "Min External Domains for Uniq Rule  : ${MIN_EXTERNAL_DOMAINS_FOR_UNIQUE} domains" \
-            "5" "Min Messages for CRITICAL Rcpt Bulk : ${CRIT_MIN_MESSAGES_FOR_BULK} msgs" \
-            "0" "Back")
-        case "$c" in
-            1)
-                w_val=$(ui_input_box "MESSAGES SENT - WARNING" "Messages sent in ${LOOKBACK_MINUTES}m to trigger WARNING:" "$WARN_MESSAGES_SENT")
-                [[ "$w_val" =~ ^[0-9]+$ ]] && update_cfg_num "WARN_MESSAGES_SENT" "$w_val"
-                cr_val=$(ui_input_box "MESSAGES SENT - CRITICAL" "Messages sent in ${LOOKBACK_MINUTES}m to trigger CRITICAL:" "$CRIT_MESSAGES_SENT")
-                [[ "$cr_val" =~ ^[0-9]+$ ]] && update_cfg_num "CRIT_MESSAGES_SENT" "$cr_val"
-                ;;
-            2)
-                w_val=$(ui_input_box "TOTAL RECIPIENTS - WARNING" "Total recipients in ${LOOKBACK_MINUTES}m to trigger WARNING:" "$WARN_RECIPIENTS")
-                [[ "$w_val" =~ ^[0-9]+$ ]] && update_cfg_num "WARN_RECIPIENTS" "$w_val"
-                cr_val=$(ui_input_box "TOTAL RECIPIENTS - CRITICAL" "Total recipients in ${LOOKBACK_MINUTES}m to trigger CRITICAL:" "$CRIT_RECIPIENTS")
-                [[ "$cr_val" =~ ^[0-9]+$ ]] && update_cfg_num "CRIT_RECIPIENTS" "$cr_val"
-                ;;
-            3)
-                w_val=$(ui_input_box "UNIQUE RECIPIENTS - WARNING" "Unique recipients in ${LOOKBACK_MINUTES}m to trigger WARNING:" "$WARN_UNIQUE_RECIPIENTS")
-                [[ "$w_val" =~ ^[0-9]+$ ]] && update_cfg_num "WARN_UNIQUE_RECIPIENTS" "$w_val"
-                cr_val=$(ui_input_box "UNIQUE RECIPIENTS - CRITICAL" "Unique recipients in ${LOOKBACK_MINUTES}m to trigger CRITICAL:" "$CRIT_UNIQUE_RECIPIENTS")
-                [[ "$cr_val" =~ ^[0-9]+$ ]] && update_cfg_num "CRIT_UNIQUE_RECIPIENTS" "$cr_val"
-                ;;
-            4)
-                w_val=$(ui_input_box "MIN EXTERNAL DOMAINS" "Minimum distinct external domains for Unique Recipients rule:" "$MIN_EXTERNAL_DOMAINS_FOR_UNIQUE")
-                [[ "$w_val" =~ ^[0-9]+$ ]] && update_cfg_num "MIN_EXTERNAL_DOMAINS_FOR_UNIQUE" "$w_val"
-                ;;
-            5)
-                w_val=$(ui_input_box "MIN MESSAGES FOR BULK CRITICAL" "Minimum distinct messages required to auto-lock on high recipients:" "$CRIT_MIN_MESSAGES_FOR_BULK")
-                [[ "$w_val" =~ ^[0-9]+$ ]] && update_cfg_num "CRIT_MIN_MESSAGES_FOR_BULK" "$w_val"
-                ;;
-            0|"") break ;;
-        esac
-    done
-}
-
-submenu_thresh_failrate() {
-    while true; do
-        load_config
-        local c val
-        c=$(ui_select_menu "FAILED RATE THRESHOLDS ((DEFERRED + BOUNCED) / RCPTS)" \
-            "Detect spam lists & rate-limited outbound floods:" \
-            "1" "Min Recipients for WARNING Check  : >= ${MIN_RECIPIENTS_FOR_FAIL_RATE} rcpts" \
-            "2" "WARNING Failed Rate (%)           : >= ${WARN_FAILED_RATE_PCT}%" \
-            "3" "Min Recipients for CRITICAL Check : >= ${CRIT_MIN_RECIPIENTS_FOR_FAIL_RATE} rcpts" \
-            "4" "CRITICAL Failed Rate (%)          : >= ${CRIT_FAILED_RATE_PCT}%" \
-            "0" "Back")
-        case "$c" in
-            1)
-                val=$(ui_input_box "MIN RECIPIENTS (WARNING)" "Minimum recipients before checking WARNING Failed Rate:" "$MIN_RECIPIENTS_FOR_FAIL_RATE")
-                [[ "$val" =~ ^[0-9]+$ ]] && update_cfg_num "MIN_RECIPIENTS_FOR_FAIL_RATE" "$val"
-                ;;
-            2)
-                val=$(ui_input_box "WARNING FAILED RATE (%)" "Failed percentage (1-100) to trigger WARNING:" "$WARN_FAILED_RATE_PCT")
-                [[ "$val" =~ ^[0-9]+$ ]] && update_cfg_num "WARN_FAILED_RATE_PCT" "$val"
-                ;;
-            3)
-                val=$(ui_input_box "MIN RECIPIENTS (CRITICAL)" "Minimum recipients before checking CRITICAL Failed Rate:" "$CRIT_MIN_RECIPIENTS_FOR_FAIL_RATE")
-                [[ "$val" =~ ^[0-9]+$ ]] && update_cfg_num "CRIT_MIN_RECIPIENTS_FOR_FAIL_RATE" "$val"
-                ;;
-            4)
-                val=$(ui_input_box "CRITICAL FAILED RATE (%)" "Failed percentage (1-100) to trigger CRITICAL:" "$CRIT_FAILED_RATE_PCT")
-                [[ "$val" =~ ^[0-9]+$ ]] && update_cfg_num "CRIT_FAILED_RATE_PCT" "$val"
-                ;;
-            0|"") break ;;
-        esac
-    done
-}
-
-submenu_thresh_botnet() {
-    while true; do
-        load_config
-        local c w_val cr_val
-        c=$(ui_select_menu "BOTNET SOURCE IPs & SENDER SPOOFING" \
-            "Detect distributed botnet logins and forged external From addresses:" \
-            "1" "Distinct Source IPs (WARN / CRIT)      : ${WARN_SOURCE_IPS} / ${CRIT_SOURCE_IPS} IPs" \
-            "2" "Min Messages for Source IP Rule (W/C)  : ${WARN_MIN_MESSAGES_FOR_IPS} / ${CRIT_MIN_MESSAGES_FOR_IPS} msgs" \
-            "3" "External Spoof From!=SASL (WARN / CRIT): ${WARN_SPOOF_COUNT} / ${CRIT_SPOOF_COUNT} msgs" \
-            "0" "Back")
-        case "$c" in
-            1)
-                w_val=$(ui_input_box "SOURCE IPs - WARNING" "Distinct IPs on 1 account in ${LOOKBACK_MINUTES}m for WARNING:" "$WARN_SOURCE_IPS")
-                [[ "$w_val" =~ ^[0-9]+$ ]] && update_cfg_num "WARN_SOURCE_IPS" "$w_val"
-                cr_val=$(ui_input_box "SOURCE IPs - CRITICAL" "Distinct IPs on 1 account in ${LOOKBACK_MINUTES}m for CRITICAL:" "$CRIT_SOURCE_IPS")
-                [[ "$cr_val" =~ ^[0-9]+$ ]] && update_cfg_num "CRIT_SOURCE_IPS" "$cr_val"
-                ;;
-            2)
-                w_val=$(ui_input_box "MIN MESSAGES (WARNING IPs)" "Minimum messages required for WARNING Source IPs:" "$WARN_MIN_MESSAGES_FOR_IPS")
-                [[ "$w_val" =~ ^[0-9]+$ ]] && update_cfg_num "WARN_MIN_MESSAGES_FOR_IPS" "$w_val"
-                cr_val=$(ui_input_box "MIN MESSAGES (CRITICAL IPs)" "Minimum messages required for CRITICAL Source IPs:" "$CRIT_MIN_MESSAGES_FOR_IPS")
-                [[ "$cr_val" =~ ^[0-9]+$ ]] && update_cfg_num "CRIT_MIN_MESSAGES_FOR_IPS" "$cr_val"
-                ;;
-            3)
-                w_val=$(ui_input_box "SPOOF FROM - WARNING" "External spoofed messages in ${LOOKBACK_MINUTES}m for WARNING:" "$WARN_SPOOF_COUNT")
-                [[ "$w_val" =~ ^[0-9]+$ ]] && update_cfg_num "WARN_SPOOF_COUNT" "$w_val"
-                cr_val=$(ui_input_box "SPOOF FROM - CRITICAL" "External spoofed messages in ${LOOKBACK_MINUTES}m for CRITICAL:" "$CRIT_SPOOF_COUNT")
-                [[ "$cr_val" =~ ^[0-9]+$ ]] && update_cfg_num "CRIT_SPOOF_COUNT" "$cr_val"
-                ;;
-            0|"") break ;;
-        esac
-    done
-}
-
-submenu_thresh_content_queue() {
-    while true; do
-        load_config
-        local c w_val cr_val
-        c=$(ui_select_menu "CONTENT SPAM (AMAVIS/RBL) & POSTFIX QUEUE" \
-            "Configure content filter detections and mail queue limits:" \
-            "1" "Amavis SPAM / RBL Rejects (WARN / CRIT): ${WARN_SPAM_SIGNALS} / ${CRIT_SPAM_SIGNALS} msgs" \
-            "2" "Amavis SpamAssassin Score Threshold    : >= ${AMAVIS_SPAM_SCORE_THRESHOLD}" \
-            "3" "Account Postfix Queue (WARN / CRIT)    : ${WARN_QUEUE_PER_USER} / ${CRIT_QUEUE_PER_USER} emails" \
-            "4" "Total System Queue Congestion Warning  : ${WARN_TOTAL_QUEUE} emails" \
-            "0" "Back")
-        case "$c" in
-            1)
-                w_val=$(ui_input_box "SPAM SIGNALS - WARNING" "Amavis SPAM / RBL rejects in ${LOOKBACK_MINUTES}m for WARNING:" "$WARN_SPAM_SIGNALS")
-                [[ "$w_val" =~ ^[0-9]+$ ]] && update_cfg_num "WARN_SPAM_SIGNALS" "$w_val"
-                cr_val=$(ui_input_box "SPAM SIGNALS - CRITICAL" "Amavis SPAM / RBL rejects in ${LOOKBACK_MINUTES}m for CRITICAL:" "$CRIT_SPAM_SIGNALS")
-                [[ "$cr_val" =~ ^[0-9]+$ ]] && update_cfg_num "CRIT_SPAM_SIGNALS" "$cr_val"
-                ;;
-            2)
-                w_val=$(ui_input_box "AMAVIS SPAM SCORE" "Minimum Amavis Hits score to flag as spam (e.g. 6.0):" "$AMAVIS_SPAM_SCORE_THRESHOLD")
-                [[ "$w_val" =~ ^[0-9]+(\.[0-9]+)?$ ]] && update_cfg_var "AMAVIS_SPAM_SCORE_THRESHOLD" "$w_val"
-                ;;
-            3)
-                w_val=$(ui_input_box "ACCOUNT QUEUE - WARNING" "Queued messages for 1 user to trigger WARNING:" "$WARN_QUEUE_PER_USER")
-                [[ "$w_val" =~ ^[0-9]+$ ]] && update_cfg_num "WARN_QUEUE_PER_USER" "$w_val"
-                cr_val=$(ui_input_box "ACCOUNT QUEUE - CRITICAL" "Queued messages for 1 user to trigger CRITICAL:" "$CRIT_QUEUE_PER_USER")
-                [[ "$cr_val" =~ ^[0-9]+$ ]] && update_cfg_num "CRIT_QUEUE_PER_USER" "$cr_val"
-                ;;
-            4)
-                w_val=$(ui_input_box "TOTAL SYSTEM QUEUE LIMIT" "Total Postfix queue size to trigger congestion warning:" "$WARN_TOTAL_QUEUE")
-                [[ "$w_val" =~ ^[0-9]+$ ]] && update_cfg_num "WARN_TOTAL_QUEUE" "$w_val"
-                ;;
-            0|"") break ;;
-        esac
-    done
-}
-
-submenu_thresholds() {
-    while true; do
-        load_config
-        local int_label="External & SASL"
-        [[ "$COUNT_INTERNAL_TO_INTERNAL" == "true" ]] && int_label="Count All (incl. Internal)"
-
-        local choice
-        choice=$(ui_select_menu "EDIT SPAM DETECTION RULES & THRESHOLDS" \
-            "Window: [${LOOKBACK_MINUTES} mins] | Cooldown: [${ALERT_COOLDOWN_MINUTES} mins] | Scope: [${int_label}]" \
-            "1" "Scan Window & Cooldown     (Window: ${LOOKBACK_MINUTES}m | Repeat Cooldown: ${ALERT_COOLDOWN_MINUTES}m)" \
-            "2" "Volume Thresholds          (Msgs: ${WARN_MESSAGES_SENT}/${CRIT_MESSAGES_SENT} | Rcpts: ${WARN_RECIPIENTS}/${CRIT_RECIPIENTS} | Uniq: ${WARN_UNIQUE_RECIPIENTS}/${CRIT_UNIQUE_RECIPIENTS})" \
-            "3" "Failed Rate Thresholds     (Min Rcpts: ${MIN_RECIPIENTS_FOR_FAIL_RATE} | Warn: ${WARN_FAILED_RATE_PCT}% | Crit: ${CRIT_FAILED_RATE_PCT}%)" \
-            "4" "Botnet & Spoofing Rules    (Source IPs: ${WARN_SOURCE_IPS}/${CRIT_SOURCE_IPS} | Spoof From: ${WARN_SPOOF_COUNT}/${CRIT_SPOOF_COUNT})" \
-            "5" "Content & Queue Rules      (Amavis/RBL: ${WARN_SPAM_SIGNALS}/${CRIT_SPAM_SIGNALS} | Queue: ${WARN_QUEUE_PER_USER}/${CRIT_QUEUE_PER_USER} | SysQ: ${WARN_TOTAL_QUEUE})" \
-            "6" "Traffic Counting Scope     (${int_label} - Toggle)" \
-            "0" "Back to Main Menu")
-
-        case "$choice" in
-            1) submenu_thresh_window ;;
-            2) submenu_thresh_volume ;;
-            3) submenu_thresh_failrate ;;
-            4) submenu_thresh_botnet ;;
-            5) submenu_thresh_content_queue ;;
-            6)
-                if [[ "$COUNT_INTERNAL_TO_INTERNAL" == "true" ]]; then
-                    update_cfg_var "COUNT_INTERNAL_TO_INTERNAL" "false"
-                else
-                    update_cfg_var "COUNT_INTERNAL_TO_INTERNAL" "true"
-                fi
-                ;;
-            0|"") break ;;
-        esac
-    done
-}
-
-# ------------------------------------------------------------------------------
-# SUBMENU [4]: AUTO-LOCK & UNLOCK ACCOUNTS
+# SUBMENU [4]: UNLOCK & AUTO-LOCK (COMPACT)
 # ------------------------------------------------------------------------------
 submenu_lock_control() {
     while true; do
         load_config
-        local lock_label="ENABLED (Auto-lock account on CRITICAL)"
-        [[ "$AUTO_LOCK_ON_CRITICAL" != "true" ]] && lock_label="DISABLED (Alert only, do not lock)"
+        local lock_label="ON"
+        [[ "$AUTO_LOCK_ON_CRITICAL" != "true" ]] && lock_label="OFF (Alert Only)"
 
-        local hold_label="DISABLED"
-        [[ "$AUTO_HOLD_QUEUE_ON_CRITICAL" == "true" ]] && hold_label="ENABLED (Hold user queue on CRITICAL)"
+        local hold_label="OFF"
+        [[ "$AUTO_HOLD_QUEUE_ON_CRITICAL" == "true" ]] && hold_label="ON"
 
         local choice
-        choice=$(ui_select_menu "AUTO-LOCK & UNLOCK ZIMBRA ACCOUNTS" \
-            "Manage automatic account remediation and unlock accounts:" \
-            "1" "Auto-Lock on CRITICAL  : ${lock_label}" \
-            "2" "Hold Queue on CRITICAL : ${hold_label}" \
-            "3" "Select & Unlock Recently Auto-Locked Account" \
-            "4" "Unlock Account Manually by Email Address" \
-            "0" "Back to Main Menu")
+        choice=$(ui_select_menu "UNLOCK & AUTO-LOCK" \
+            "Unlock accounts or toggle automatic remediation:" \
+            "1" "Unlock Account        (Select locked user or type email)" \
+            "2" "Auto-Lock on CRITICAL : ${lock_label} (Select to Toggle)" \
+            "3" "Hold Queue on Lock    : ${hold_label} (Select to Toggle)" \
+            "0" "Back")
 
         case "$choice" in
             1)
+                local locked_file="$STATE_DIR/locked_accounts.db"
+                if [[ -s "$locked_file" ]]; then
+                    local menu_args=()
+                    local idx=1
+                    local acc_map=()
+                    while IFS='|' read -r acc ltime; do
+                        [[ -z "$acc" ]] && continue
+                        menu_args+=("$idx" "${acc} (Locked: ${ltime})")
+                        acc_map[$idx]="$acc"
+                        idx=$(( idx + 1 ))
+                    done < "$locked_file"
+                    menu_args+=("M" "Type another email address manually")
+                    menu_args+=("0" "Back")
+
+                    local sel_idx
+                    sel_idx=$(ui_select_menu "UNLOCK ZIMBRA ACCOUNT" \
+                        "Select an account to unlock:" \
+                        "${menu_args[@]}")
+                    if [[ "$sel_idx" == "M" || "$sel_idx" == "m" ]]; then
+                        local manual_acc
+                        manual_acc=$(ui_input_box "UNLOCK ACCOUNT" "Enter email address to unlock:" "")
+                        if [[ -n "$manual_acc" ]]; then
+                            local u_out
+                            u_out=$(unlock_account "$manual_acc" 2>&1 || true)
+                            ui_msg_box "UNLOCK RESULT" "$u_out"
+                        fi
+                    elif [[ -n "$sel_idx" && "$sel_idx" != "0" && -n "${acc_map[$sel_idx]:-}" ]]; then
+                        local target_acc="${acc_map[$sel_idx]}"
+                        local u_out
+                        u_out=$(unlock_account "$target_acc" 2>&1 || true)
+                        ui_msg_box "UNLOCK RESULT" "$u_out"
+                    fi
+                else
+                    local manual_acc
+                    manual_acc=$(ui_input_box "UNLOCK ACCOUNT" "Enter email address to unlock (e.g. user@domain.com):" "")
+                    if [[ -n "$manual_acc" ]]; then
+                        local u_out
+                        u_out=$(unlock_account "$manual_acc" 2>&1 || true)
+                        ui_msg_box "UNLOCK RESULT" "$u_out"
+                    fi
+                fi
+                ;;
+            2)
                 if [[ "$AUTO_LOCK_ON_CRITICAL" == "true" ]]; then
                     update_cfg_var "AUTO_LOCK_ON_CRITICAL" "false"
                 else
                     update_cfg_var "AUTO_LOCK_ON_CRITICAL" "true"
                 fi
                 ;;
-            2)
+            3)
                 if [[ "$AUTO_HOLD_QUEUE_ON_CRITICAL" == "true" ]]; then
                     update_cfg_var "AUTO_HOLD_QUEUE_ON_CRITICAL" "false"
                 else
                     update_cfg_var "AUTO_HOLD_QUEUE_ON_CRITICAL" "true"
-                fi
-                ;;
-            3)
-                local locked_file="$STATE_DIR/locked_accounts.db"
-                if [[ ! -s "$locked_file" ]]; then
-                    ui_msg_box "NO LOCKED ACCOUNTS" "No accounts are currently recorded in the auto-locked list."
-                else
-                    local menu_args=()
-                    local idx=1
-                    local acc_map=()
-                    while IFS='|' read -r acc ltime; do
-                        [[ -z "$acc" ]] && continue
-                        menu_args+=("$idx" "${acc} (Locked at: ${ltime})")
-                        acc_map[$idx]="$acc"
-                        idx=$(( idx + 1 ))
-                    done < "$locked_file"
-                    menu_args+=("0" "Back")
-
-                    local sel_idx
-                    sel_idx=$(ui_select_menu "SELECT ACCOUNT TO UNLOCK" \
-                        "Choose an account to set back to 'active':" \
-                        "${menu_args[@]}")
-                    if [[ -n "$sel_idx" && "$sel_idx" != "0" && -n "${acc_map[$sel_idx]:-}" ]]; then
-                        local target_acc="${acc_map[$sel_idx]}"
-                        local u_out
-                        u_out=$(unlock_account "$target_acc" 2>&1 || true)
-                        ui_msg_box "UNLOCK RESULT" "$u_out"
-                    fi
-                fi
-                ;;
-            4)
-                local manual_acc
-                manual_acc=$(ui_input_box "UNLOCK ACCOUNT" "Enter email address to unlock (e.g. user@domain.com):" "")
-                if [[ -n "$manual_acc" ]]; then
-                    local u_out
-                    u_out=$(unlock_account "$manual_acc" 2>&1 || true)
-                    ui_msg_box "UNLOCK RESULT" "$u_out"
                 fi
                 ;;
             0|"")
@@ -2365,7 +2237,7 @@ submenu_lock_control() {
 }
 
 # ------------------------------------------------------------------------------
-# SUBMENU [5]: WHITELIST MANAGEMENT
+# SUBMENU [5]: WHITELIST (COMPACT)
 # ------------------------------------------------------------------------------
 submenu_whitelist() {
     while true; do
@@ -2377,25 +2249,23 @@ submenu_whitelist() {
         count_wl=$(grep -v '^[[:space:]]*#' "$WHITELIST_FILE" 2>/dev/null | grep -c '[^[:space:]]' || true)
 
         local choice
-        choice=$(ui_select_menu "MANAGE SENDER WHITELIST" \
-            "Currently ${count_wl} whitelisted entries (${WHITELIST_FILE}):" \
-            "1" "View Current Whitelist" \
-            "2" "Add Email or @domain.com to Whitelist" \
-            "3" "Select & Remove Entry from Whitelist" \
-            "0" "Back to Main Menu")
+        choice=$(ui_select_menu "WHITELIST (${count_wl} ENTRIES)" \
+            "Trusted senders & domains bypass spam checks:" \
+            "1" "View Whitelist" \
+            "2" "Add Email or @domain.com" \
+            "3" "Remove from Whitelist" \
+            "0" "Back")
 
         case "$choice" in
             1)
                 local list_txt
                 list_txt=$(grep -v '^[[:space:]]*#' "$WHITELIST_FILE" 2>/dev/null | sed '/^[[:space:]]*$/d' || true)
-                if [[ -z "$list_txt" ]]; then
-                    list_txt="(Whitelist is currently empty)"
-                fi
+                [[ -z "$list_txt" ]] && list_txt="(Whitelist is empty)"
                 ui_msg_box "WHITELIST ENTRIES" "$list_txt"
                 ;;
             2)
                 local new_wl
-                new_wl=$(ui_input_box "ADD TO WHITELIST" "Enter email (e.g. marketing@domain.com) or domain (@domain.com):" "")
+                new_wl=$(ui_input_box "ADD TO WHITELIST" "Enter email (marketing@domain.com) or domain (@domain.com):" "")
                 if [[ -n "$new_wl" ]]; then
                     echo "$new_wl" >> "$WHITELIST_FILE"
                     ui_msg_box "WHITELIST UPDATED" "Added '${new_wl}' to whitelist."
@@ -2420,7 +2290,7 @@ submenu_whitelist() {
                     wl_items+=("0" "Back")
                     local del_idx
                     del_idx=$(ui_select_menu "REMOVE WHITELIST ENTRY" \
-                        "Select entry to remove from whitelist:" \
+                        "Select entry to remove:" \
                         "${wl_items[@]}")
                     if [[ -n "$del_idx" && "$del_idx" != "0" && -n "${wl_map[$del_idx]:-}" ]]; then
                         local target_del="${wl_map[$del_idx]}"
@@ -2438,45 +2308,53 @@ submenu_whitelist() {
 }
 
 # ------------------------------------------------------------------------------
-# SUBMENU [6]: CRON CHECK SCHEDULE
+# SUBMENU [6]: LOGS & SERVICE ON/OFF
 # ------------------------------------------------------------------------------
-submenu_cron_schedule() {
-    local cur_cron
-    cur_cron=$(get_current_cron_interval)
+submenu_logs_and_service() {
+    while true; do
+        load_config
+        local svc_label="ON (Running)"
+        [[ "$MONITOR_ENABLED" != "true" ]] && svc_label="PAUSED (Disabled)"
 
-    local choice
-    choice=$(ui_select_menu "CHANGE CRON CHECK SCHEDULE" \
-        "Current Schedule: ${cur_cron} (${CRON_FILE})" \
-        "1" "Every 1 minute    (*/1 * * * *)" \
-        "2" "Every 2 minutes   (*/2 * * * *)" \
-        "3" "Every 5 minutes   (*/5 * * * * - Recommended)" \
-        "4" "Every 10 minutes  (*/10 * * * *)" \
-        "5" "Every 15 minutes  (*/15 * * * *)" \
-        "6" "Every 30 minutes  (*/30 * * * *)" \
-        "7" "Pause Automatic Cron Schedule" \
-        "0" "Back to Main Menu")
+        local choice
+        choice=$(ui_select_menu "LOGS & SERVICE STATUS" \
+            "Log file: ${MONITOR_LOG_FILE}" \
+            "1" "View Last 25 Monitor Log Lines" \
+            "2" "Service Status : ${svc_label} (Select to Toggle)" \
+            "0" "Back")
 
-    case "$choice" in
-        1) set_cron_interval_minutes "1";  ui_msg_box "SCHEDULE UPDATED" "Scan interval set to: Every 1 minute." ;;
-        2) set_cron_interval_minutes "2";  ui_msg_box "SCHEDULE UPDATED" "Scan interval set to: Every 2 minutes." ;;
-        3) set_cron_interval_minutes "5";  ui_msg_box "SCHEDULE UPDATED" "Scan interval set to: Every 5 minutes." ;;
-        4) set_cron_interval_minutes "10"; ui_msg_box "SCHEDULE UPDATED" "Scan interval set to: Every 10 minutes." ;;
-        5) set_cron_interval_minutes "15"; ui_msg_box "SCHEDULE UPDATED" "Scan interval set to: Every 15 minutes." ;;
-        6) set_cron_interval_minutes "30"; ui_msg_box "SCHEDULE UPDATED" "Scan interval set to: Every 30 minutes." ;;
-        7) set_cron_interval_minutes "disable"; ui_msg_box "SCHEDULE PAUSED" "Automatic cron scan has been paused." ;;
-    esac
+        case "$choice" in
+            1)
+                local log_txt="(No log entries yet)"
+                if [[ -f "$MONITOR_LOG_FILE" ]]; then
+                    log_txt=$(tail -n 25 "$MONITOR_LOG_FILE" 2>/dev/null || echo "(Empty)")
+                fi
+                ui_msg_box "RECENT MONITOR LOGS" "$log_txt"
+                ;;
+            2)
+                if [[ "$MONITOR_ENABLED" == "true" ]]; then
+                    update_cfg_var "MONITOR_ENABLED" "false"
+                else
+                    update_cfg_var "MONITOR_ENABLED" "true"
+                fi
+                ;;
+            0|"")
+                break
+                ;;
+        esac
+    done
 }
 
 # ------------------------------------------------------------------------------
-# MAIN CONTROL PANEL
+# MAIN CONTROL PANEL (6 CLEAN ITEMS)
 # ------------------------------------------------------------------------------
 run_interactive_menu() {
     while true; do
         load_config
         resolve_zimbra_settings
 
-        local mon_badge="ENABLED"
-        [[ "$MONITOR_ENABLED" != "true" ]] && mon_badge="DISABLED"
+        local mon_badge="ON"
+        [[ "$MONITOR_ENABLED" != "true" ]] && mon_badge="PAUSED"
 
         local lock_badge="ON"
         [[ "$AUTO_LOCK_ON_CRITICAL" != "true" ]] && lock_badge="OFF"
@@ -2484,22 +2362,20 @@ run_interactive_menu() {
         local cron_badge
         cron_badge=$(get_current_cron_interval)
 
-        local tg_badge="TG:ON"
-        [[ "$TELEGRAM_ENABLED" != "true" || -z "$TELEGRAM_BOT_TOKEN" ]] && tg_badge="TG:OFF/Unset"
-        local em_badge="Mail:${RESOLVED_EMAIL_TO}"
-        [[ "$EMAIL_ENABLED" != "true" ]] && em_badge="Mail:OFF"
+        local tg_badge="ON"
+        [[ "$TELEGRAM_ENABLED" != "true" || -z "$TELEGRAM_BOT_TOKEN" ]] && tg_badge="OFF"
+        local em_badge="ON"
+        [[ "$EMAIL_ENABLED" != "true" ]] && em_badge="OFF"
 
         local choice
-        choice=$(ui_select_menu "ZIMBRA SPAM MONITOR CONTROL PANEL v${VERSION}" \
-            "Status: [${mon_badge}] | Cron: [${cron_badge}] | Auto-Lock: [${lock_badge}]" \
-            "1" "View System Status & Top Senders (Live ${LOOKBACK_MINUTES}m Metrics & Queue)" \
-            "2" "Configure Alerts & Test (${tg_badge} | ${em_badge})" \
-            "3" "Edit Spam Rules & Thresholds (Window: ${LOOKBACK_MINUTES}m | Cooldown: ${ALERT_COOLDOWN_MINUTES}m)" \
-            "4" "Auto-Lock Settings & Unlock Accounts (Auto-Lock: ${lock_badge})" \
-            "5" "Manage Sender Whitelist (View / Add / Remove)" \
-            "6" "Change Cron Check Schedule (${cron_badge})" \
-            "7" "Enable / Disable Monitoring Service (Current: ${mon_badge})" \
-            "8" "View Recent Monitor Logs (/var/log/zimbra-spam-monitor.log)" \
+        choice=$(ui_select_menu "ZIMBRA SPAM MONITOR v${VERSION}" \
+            "Service: ${mon_badge} | Check: ${cron_badge} | Auto-Lock: ${lock_badge} | TG: ${tg_badge} | Mail: ${em_badge}" \
+            "1" "Live Status & Queue" \
+            "2" "Alerts & Test          (Telegram / Email / Send Test)" \
+            "3" "Spam Limits & Schedule (Limit: ${WARN_RECIPIENTS}/${CRIT_RECIPIENTS} | ${LOOKBACK_MINUTES}m | Repeat: ${ALERT_COOLDOWN_MINUTES}m)" \
+            "4" "Unlock & Auto-Lock     (Auto-Lock: ${lock_badge})" \
+            "5" "Whitelist              (Trusted Emails & Domains)" \
+            "6" "Logs & Service ON/OFF  (Service: ${mon_badge})" \
             "0" "Exit")
 
         case "$choice" in
@@ -2507,45 +2383,19 @@ run_interactive_menu() {
                 local st_out
                 st_out=$(show_status 2>&1 || true)
                 if [[ -n "$(detect_tui_bin)" ]]; then
-                    ui_msg_box "CURRENT SYSTEM STATUS" "$st_out"
+                    ui_msg_box "LIVE SYSTEM STATUS" "$st_out"
                 else
                     echo "$st_out"
                     read -r -p " Press Enter to return to menu..." _ || true
                 fi
                 ;;
-            2)
-                submenu_notifications
-                ;;
-            3)
-                submenu_thresholds
-                ;;
-            4)
-                submenu_lock_control
-                ;;
-            5)
-                submenu_whitelist
-                ;;
-            6)
-                submenu_cron_schedule
-                ;;
-            7)
-                if [[ "$MONITOR_ENABLED" == "true" ]]; then
-                    update_cfg_var "MONITOR_ENABLED" "false"
-                    ui_msg_box "MONITORING DISABLED" "Monitoring is now PAUSED (MONITOR_ENABLED=false)."
-                else
-                    update_cfg_var "MONITOR_ENABLED" "true"
-                    ui_msg_box "MONITORING ENABLED" "Monitoring is now ACTIVE (MONITOR_ENABLED=true)."
-                fi
-                ;;
-            8)
-                local log_txt="(No log entries yet)"
-                if [[ -f "$MONITOR_LOG_FILE" ]]; then
-                    log_txt=$(tail -n 25 "$MONITOR_LOG_FILE" 2>/dev/null || echo "(Empty)")
-                fi
-                ui_msg_box "LAST 25 LOG LINES (${MONITOR_LOG_FILE})" "$log_txt"
-                ;;
+            2) submenu_notifications ;;
+            3) submenu_thresholds ;;
+            4) submenu_lock_control ;;
+            5) submenu_whitelist ;;
+            6) submenu_logs_and_service ;;
             0|"")
-                echo "Exited Zimbra Spam Monitor Control Panel."
+                echo "Exited Zimbra Spam Monitor."
                 break
                 ;;
         esac

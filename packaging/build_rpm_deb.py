@@ -17,12 +17,12 @@ if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
 PKG_NAME = "zimbra-spam-monitor"
-PKG_VERSION = "1.2.0"
+PKG_VERSION = "1.2.1"
 PKG_RELEASE = "1"
 PKG_SUMMARY = "Zimbra Outbound Email Spam Monitor & Alert System (Telegram + Email)"
 PKG_DESC = (
     "Multi-signal outbound spam detection and alerting system for Zimbra Collaboration Suite.\n"
-    "- Evaluates 8 anti-spam metrics per short sliding window (default 5 minutes).\n"
+    "- Evaluates 8 anti-spam metrics per short check range (default last 5 minutes).\n"
     "- Correlates Zimbra Amavis Queue-ID hops and ignores old Postfix queue retries.\n"
     "- Inspects Postfix mail queue (postqueue) per sender and server-wide.\n"
     "- Sends instant alerts via Telegram Bot API and Email (Local Postfix / External SMTP).\n"
@@ -51,7 +51,7 @@ chmod 0644 /etc/cron.d/zimbra-spam-monitor 2>/dev/null || true
 chmod 0755 /usr/bin/zimbra-spam-monitor 2>/dev/null || true
 
 echo "======================================================================"
-echo " [OK] Installed successfully: zimbra-spam-monitor v1.2.0"
+echo " [OK] Installed successfully: zimbra-spam-monitor v1.2.1"
 echo "----------------------------------------------------------------------"
 echo " -> Run the command below to open the INTERACTIVE CONTROL PANEL:"
 echo "      zimbra-spam-monitor"

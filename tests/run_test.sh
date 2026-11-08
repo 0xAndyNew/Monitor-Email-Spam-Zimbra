@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# AUTOMATED TEST SUITE FOR ZIMBRA-SPAM-MONITOR v1.2.0
+# AUTOMATED TEST SUITE FOR ZIMBRA-SPAM-MONITOR v1.2.1
 # Verifies:
 # 1. Bash syntax & 100% ASCII encoding across all packaged files & README
-# 2. Binary structure of .deb & .rpm packages (v1.2.0-1)
+# 2. Binary structure of .deb & .rpm packages (v1.2.1-1)
 # 3. Zimbra Amavis double-Queue-ID correlation (zero 2x double counting, keeps IP)
 # 4. Multi-signal detection (Msgs, Rcpts, Uniq Rcpts, Failed Rate, Botnet IPs,
 #    External Spoofing, Amavis SPAM/RBL) + False-Positive protections:
@@ -55,8 +55,8 @@ for f in ascii_files:
     non_ascii = [b for b in raw if b > 127]
     assert not non_ascii, f"Non-ASCII bytes found in {f}"
 
-deb_path = root / "zimbra-spam-monitor_1.2.0-1_all.deb"
-rpm_path = root / "zimbra-spam-monitor-1.2.0-1.noarch.rpm"
+deb_path = root / "zimbra-spam-monitor_1.2.1-1_all.deb"
+rpm_path = root / "zimbra-spam-monitor-1.2.1-1.noarch.rpm"
 
 assert deb_path.exists() and deb_path.stat().st_size > 5000, "Missing or empty .deb"
 assert rpm_path.exists() and rpm_path.stat().st_size > 5000, "Missing or empty .rpm"
@@ -85,7 +85,7 @@ assert cpio_raw.startswith(b"070701"), "Invalid CPIO newc header inside RPM"
 assert b"./usr/bin/zimbra-spam-monitor" in cpio_raw, "Missing binary in RPM CPIO"
 assert b"./etc/zimbra-spam-monitor/config.conf" in cpio_raw, "Missing config.conf in RPM CPIO"
 assert b"TRAILER!!!" in cpio_raw, "Missing CPIO TRAILER"
-print(" -> [PASS] 100% ASCII encoding & valid v1.2.0 .deb / .rpm binary structures verified.")
+print(" -> [PASS] 100% ASCII encoding & valid v1.2.1 .deb / .rpm binary structures verified.")
 PYEOF
 
 echo "=== [3/8] Setting up simulated Zimbra + Postfix + Amavis environment ==="
@@ -344,14 +344,14 @@ echo "$STATUS_OUT" | grep -q "hacked_user@company.com"
 echo "$STATUS_OUT" | grep -q "normal@company.com         | 5     | 5 (5)"
 echo " -> [PASS] --status output verified (Amavis 2-hop counted as 5, not 10)."
 
-echo "=== [8/8] Verifying Interactive Control Panel Menu (--text-menu) ==="
+echo "=== [8/8] Verifying Streamlined Control Panel Menu (--text-menu) ==="
 # Navigate:
-# [2] Notifications -> [3] Send Test Alert -> Enter -> [0] Back
-# [3] Thresholds -> [2] Volume -> [1] Messages Sent (WARN=75, CRIT=180) -> [0] Back -> [0] Back
-# [4] Lock Control -> [3] Unlock phish_user (item 1) -> Enter -> [0] Back
+# [2] Alerts & Test -> [3] Send Test Alert Now -> Enter -> [0] Back
+# [3] Spam Limits & Schedule -> [4] Email Limit (WARN=120, CRIT=240) -> [0] Back
+# [4] Unlock & Auto-Lock -> [1] Unlock Account -> [1] phish_user -> Enter -> [0] Back
 # [5] Whitelist -> [2] Add vip@company.com -> Enter -> [0] Back
 # [0] Exit
-printf "2\n3\n\n0\n3\n2\n1\n75\n180\n0\n0\n4\n3\n1\n\n0\n5\n2\nvip@company.com\n\n0\n0\n" | \
+printf "2\n3\n\n0\n3\n4\n120\n240\n0\n4\n1\n1\n\n0\n5\n2\nvip@company.com\n\n0\n0\n" | \
 ZSM_CONFIG_FILE="$FAKE_CFG" \
 ZSM_ZMPROV_CMD="$MOCK_ZMPROV" \
 ZSM_SENDMAIL_CMD="$MOCK_SENDMAIL" \
@@ -359,9 +359,13 @@ ZSM_CURL_CMD="$MOCK_CURL" \
 ZSM_UI_MODE="text" \
 bash "$MONITOR_BIN" --text-menu >/dev/null 2>&1
 
-grep -q "^WARN_MESSAGES_SENT=75" "$FAKE_CFG"
+grep -q "^WARN_RECIPIENTS=120" "$FAKE_CFG"
+grep -q "^CRIT_RECIPIENTS=240" "$FAKE_CFG"
+grep -q "^WARN_UNIQUE_RECIPIENTS=96" "$FAKE_CFG"
+grep -q "^CRIT_UNIQUE_RECIPIENTS=192" "$FAKE_CFG"
+grep -q "^WARN_MESSAGES_SENT=72" "$FAKE_CFG"
 grep -q "^CRIT_MESSAGES_SENT=180" "$FAKE_CFG"
-echo " -> [PASS] Grouped Thresholds updated via Control Panel Menu (WARN_MESSAGES_SENT=75, CRIT_MESSAGES_SENT=180)."
+echo " -> [PASS] Streamlined Spam Limits updated & auto-synced via Control Panel Menu (120/240 -> Msgs 72/180, Uniq 96/192)."
 
 grep -q "ma phish_user@company.com zimbraAccountStatus active" "$FAKE_ZMPROV_OUT"
 echo " -> [PASS] Account unlocked via Control Panel Menu."
