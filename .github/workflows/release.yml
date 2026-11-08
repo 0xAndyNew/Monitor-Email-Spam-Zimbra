@@ -1,0 +1,35 @@
+name: Build & Publish Packages (.rpm & .deb)
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Build .deb and .rpm packages
+        run: |
+          python3 packaging/build_rpm_deb.py
+          ls -lh *.deb *.rpm
+
+      - name: Run Automated Test Suite
+        run: |
+          bash tests/run_test.sh
+
+      - name: Create GitHub Release & Upload Packages
+        uses: softprops/action-gh-release@v2
+        if: startsWith(github.ref, 'refs/tags/')
+        with:
+          files: |
+            zimbra-spam-monitor_1.0.0-1_all.deb
+            zimbra-spam-monitor-1.0.0-1.noarch.rpm
+          generate_release_notes: true
