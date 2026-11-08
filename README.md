@@ -1,51 +1,76 @@
-# Zimbra Outbound Spam Monitor (`zimbra-spam-monitor` v1.1.2)
+# Zimbra Outbound Spam Monitor (`zimbra-spam-monitor` v1.2.0)
 
-Automated outbound email spam detection, alerting (**Telegram** + **Email**), and account auto-locking tool for **Zimbra Collaboration Suite (ZCS)**.
+Multi-signal outbound email spam detection, alerting (**Telegram** + **Email**), and automatic compromised account locking tool for **Zimbra Collaboration Suite (ZCS)**.
 
-Includes a **100% ASCII-safe English Interactive Control Panel** (supports `whiptail`/`dialog` arrow-key TUI boxes as well as numbered text menus) to prevent any font or locale encoding issues across SSH terminals.
+Designed specifically for production Zimbra servers with **near-zero CPU/RAM overhead** (~0.1-0.3s per 5-minute scan, zero background daemons, zero periodic JVM calls) and a **100% ASCII-safe English Interactive Control Panel** (`whiptail`/`dialog` arrow-key TUI & numbered text fallback).
 
 ---
 
 ## 1. Quick Installation from GitHub Releases (`.rpm` & `.deb`)
 
-Releases page: https://github.com/0xAndyNew/Monitor-Email-Spam-Zimbra/releases/tag/v1.1.2
+Releases page: https://github.com/0xAndyNew/Monitor-Email-Spam-Zimbra/releases/tag/v1.2.0
 
 ### A. RHEL / CentOS / Rocky Linux / AlmaLinux (`.rpm`)
 Run as `root` on your Zimbra server:
 ```bash
-wget -O zimbra-spam-monitor-1.1.2-1.noarch.rpm https://github.com/0xAndyNew/Monitor-Email-Spam-Zimbra/releases/download/v1.1.2/zimbra-spam-monitor-1.1.2-1.noarch.rpm
-rpm -Uvh zimbra-spam-monitor-1.1.2-1.noarch.rpm
+wget -O zimbra-spam-monitor-1.2.0-1.noarch.rpm https://github.com/0xAndyNew/Monitor-Email-Spam-Zimbra/releases/download/v1.2.0/zimbra-spam-monitor-1.2.0-1.noarch.rpm
+rpm -Uvh zimbra-spam-monitor-1.2.0-1.noarch.rpm
 ```
-*(Or: `yum localinstall -y zimbra-spam-monitor-1.1.2-1.noarch.rpm`)*
+*(Or: `yum localinstall -y zimbra-spam-monitor-1.2.0-1.noarch.rpm`)*
 
 ### B. Ubuntu / Debian (`.deb`)
 Run as `root` on your Zimbra server:
 ```bash
-wget -O zimbra-spam-monitor_1.1.2-1_all.deb https://github.com/0xAndyNew/Monitor-Email-Spam-Zimbra/releases/download/v1.1.2/zimbra-spam-monitor_1.1.2-1_all.deb
-dpkg -i zimbra-spam-monitor_1.1.2-1_all.deb
+wget -O zimbra-spam-monitor_1.2.0-1_all.deb https://github.com/0xAndyNew/Monitor-Email-Spam-Zimbra/releases/download/v1.2.0/zimbra-spam-monitor_1.2.0-1_all.deb
+dpkg -i zimbra-spam-monitor_1.2.0-1_all.deb
 ```
 
 ---
 
-## 2. Interactive Control Panel Usage
+## 2. Multi-Signal Outbound Spam Detection Engine (Per 5-Minute Window)
 
-After installing the package, run:
+Instead of accumulating whole-day or 60-minute totals that cause false alerts after remediation, `zimbra-spam-monitor` evaluates each **independent 5-minute sliding window** (`LOOKBACK_MINUTES=5`) across **8 anti-spam indicators**:
+
+| # | Metric (Last 5 Mins) | Calculation | Default `WARNING` | Default `CRITICAL` |
+| :-: | :--- | :--- | :--- | :--- |
+| **1** | **Messages Sent** | Distinct root `Queue-ID` messages submitted | `>= 60` msgs | `>= 150` msgs |
+| **2** | **Total Recipients** | Total outbound `to=<...>` recipient deliveries | `>= 100` rcpts | `>= 200` rcpts *(with `Msgs >= 10`)* |
+| **3** | **Unique Recipients** | Distinct recipient addresses *(with `Ext Domains >= 5`)* | `>= 80` rcpts | `>= 160` rcpts *(with `Msgs >= 10`)* |
+| **4** | **Failed Rate (%)** | `(Deferred + Bounced) / Recipients * 100%` | `>= 30%` *(min `20` rcpts)* | `>= 50%` *(min `40` rcpts)* |
+| **5** | **Distinct Source IPs** | Distinct client IPs authenticating on 1 user | `>= 3` IPs *(min `10` msgs)* | `>= 5` IPs *(min `20` msgs)* |
+| **6** | **Sender Spoofing** | Authenticated `sasl_username != external From` | `>= 3` msgs | `>= 10` msgs |
+| **7** | **Amavis SPAM / RBL** | Zimbra Amavis `SPAM/SPAMMY/INFECTED` (`Hits >= 6.0`) or remote MX `5.7.1/4.7.28/RBL` rejects | `>= 3` msgs | `>= 10` msgs |
+| **8** | **Account Mail Queue** | Current messages queued in Postfix for 1 sender | `>= 40` emails | `>= 100` emails |
+
+### Built-in Zimbra Production Safeguards:
+- **Amavis Double-Queue-ID Correlation**: Links pre-filter `Queue-ID 1` (`127.0.0.1:10024/10026/10032`) to post-filter `Queue-ID 2` so outbound emails are **never double-counted (2x)** and retain the attacker's real **Source IP** and `sasl_username`.
+- **Postfix Queue Retry Protection**: Calculates true submission time (`log_time - delay`) so old `deferred` messages retried by Postfix 20-30 minutes later are **never mistaken for newly sent spam**.
+- **False-Positive Protection**:
+  - Single legitimate CC/BCC company announcements (`Messages Sent < 10`) will never trigger `CRITICAL` auto-lock on recipient count alone.
+  - Legitimate same-domain Zimbra personas/aliases (`sale01@company.com` sending as `sales@company.com`) are not flagged as external spoofing.
+- **Clean Post-Unlock Recovery**: Unlocking an account (`zimbra-spam-monitor --unlock` or Menu `[4]`) records an unlock cutoff timestamp so all prior spam logs are ignored; once outbound traffic stays below threshold in the next 5-minute window, the account is treated as `NORMAL`.
+
+---
+
+## 3. Interactive Control Panel Usage
+
+Run as `root`:
 ```bash
 zimbra-spam-monitor
 ```
-- Uses `whiptail` / `dialog` arrow-key menus (`UP`/`DOWN` + `ENTER`) automatically when available.
+- Uses `whiptail` / `dialog` arrow-key TUI boxes (`UP`/`DOWN` + `ENTER`) automatically when available.
 - Use `zimbra-spam-monitor --text-menu` if you prefer a numbered text menu (`1..8`).
 
-### Main Control Panel Layout:
+### Main Control Panel:
 ```text
 ==============================================================================
- ZIMBRA SPAM MONITOR CONTROL PANEL v1.1.2
+ ZIMBRA SPAM MONITOR CONTROL PANEL v1.2.0
 ------------------------------------------------------------------------------
  Status: [ENABLED] | Cron: [Every 5 mins] | Auto-Lock: [ON]
 ------------------------------------------------------------------------------
-  [1 ] View System Status & Top Senders
-  [2 ] Configure Alerts & Test (TG:ON | Mail:admin@domain.com)
-  [3 ] Edit Spam Thresholds (10m: 80/200 | 60m: 300/600)
+  [1 ] View System Status & Top Senders (Live 5m Metrics & Queue)
+  [2 ] Configure Alerts & Test (TG:ON | Mail:admin@company.com)
+  [3 ] Edit Spam Rules & Thresholds (Window: 5m | Cooldown: 30m)
   [4 ] Auto-Lock Settings & Unlock Accounts (Auto-Lock: ON)
   [5 ] Manage Sender Whitelist (View / Add / Remove)
   [6 ] Change Cron Check Schedule (Every 5 mins)
@@ -55,91 +80,84 @@ zimbra-spam-monitor
 ==============================================================================
 ```
 
-### Key Menu Features:
-1. **`[1]` View System Status & Top Senders**: Displays current system total traffic (`Sent | Deferred | Bounced`), Postfix queue counts (`Active | Deferred | Hold`), and top outbound senders.
-2. **`[2]` Configure Alerts & Test (Combined Menu)**:
-   - **`[1]` Configure Telegram Alerts**: Toggle On/Off, set `TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID`.
-   - **`[2]` Configure Email & SMTP Alerts**: Toggle On/Off, select delivery mode (`auto` / `local` / `smtp`), auto-detect Zimbra Admin email (`auto`) or set custom recipients, and configure optional fallback external SMTP.
-   - **`[3]` Send Test Alert Now**: Immediately sends a test alert to both Telegram and Email.
-3. **`[3]` Edit Spam Thresholds**: Select individual thresholds to edit:
-   - Short Scan Window (`LOOKBACK_MINUTES`, default `10` mins): Warning `80` / Critical `200`.
-   - Hourly Check (`60` mins): Warning `300` / Critical `600`.
-   - Postfix Queue per User: Warning `40` / Critical `100`.
-   - Total Server Queue Warning: `300`.
-   - Alert Cooldown Interval: `30` mins.
-4. **`[4]` Auto-Lock Settings & Unlock Accounts**:
-   - Toggle automatic account locking (`zmprov ma <user> zimbraAccountStatus locked`) when reaching `CRITICAL`.
-   - Toggle automatic Postfix queue hold (`postsuper -h`) on `CRITICAL`.
-   - Select & unlock recently auto-locked accounts directly from a list.
-5. **`[5]` Manage Sender Whitelist**: View, add, or select & remove whitelisted emails (`marketing@domain.com`) or domains (`@domain.com`).
-6. **`[6]` Change Cron Check Schedule**: One-select cron interval (`Every 1, 2, 5, 10, 15, 30 minutes`, or `Pause`).
+### Grouped Threshold Configuration (`Menu [3]`):
+```text
+==============================================================================
+ EDIT SPAM DETECTION RULES & THRESHOLDS
+------------------------------------------------------------------------------
+ Window: [5 mins] | Cooldown: [30 mins] | Scope: [External & SASL]
+------------------------------------------------------------------------------
+  [1 ] Scan Window & Cooldown     (Window: 5m | Repeat Cooldown: 30m)
+  [2 ] Volume Thresholds          (Msgs: 60/150 | Rcpts: 100/200 | Uniq: 80/160)
+  [3 ] Failed Rate Thresholds     (Min Rcpts: 20 | Warn: 30% | Crit: 50%)
+  [4 ] Botnet & Spoofing Rules    (Source IPs: 3/5 | Spoof From: 3/10)
+  [5 ] Content & Queue Rules      (Amavis/RBL: 3/10 | Queue: 40/100 | SysQ: 300)
+  [6 ] Traffic Counting Scope     (External & SASL - Toggle)
+  [0 ] Back to Main Menu
+==============================================================================
+```
 
 ---
 
-## 3. Sample Notification & Alert Frequency / Duration
+## 4. Sample Notification & Alert Frequency / Duration
 
 ### Sample Notification Format (Telegram & Email):
-At the exact time an alert is triggered, both `[1] ACCOUNT SPAM VOLUME` and `[3] SYSTEM TOTAL TRAFFIC` report the **current cumulative total** (`Sent | Deferred | Bounced`) from `/var/log/zimbra.log`, alongside the live Postfix mail queue (`Active | Deferred | Hold`):
-
 ```text
 ============================================================
          ZIMBRA SPAM ALERT - CRITICAL
 ============================================================
 Server        : mail.company.com (203.0.113.10)
-Alert Time    : 2026-11-08 14:35:02
-Spam Time     : 2026-11-08 (14:28:15 -> 14:35:01)
+Alert Time    : 2026-11-08 21:40:05
+Spam Time     : 2026-11-08 (21:35:12 -> 21:40:04)
 Spam Account  : ketoan@company.com
-Source IPs    : 113.161.72.45, 45.122.200.19
+Source IPs    : 113.161.72.45, 45.122.200.19, 185.220.101.8 (3 IPs)
+Reason        : Msgs (185>=150), Unique Rcpts (210>=160), Failed Rate (54.9%>=50%)
 
 ------------------------------------------------------------
-[1] ACCOUNT SPAM VOLUME
+[1] ACCOUNT SPAM METRICS (LAST 5 MINS)
 ------------------------------------------------------------
-Total Spam    : 245 emails
-                Sent: 180 | Deferred: 62 | Bounced: 3
+Messages Sent : 185 msgs
+Recipients    : 215 total (Unique: 210 | Domains: 38)
+Failed Rate   : 54.9% (118/215 failed)
+                Sent: 97 | Deferred: 86 | Bounced: 32
+Spam Signals  : Amavis SPAM: 14 | Spoof From: 0 | RBL: 9
 
 ------------------------------------------------------------
 [2] REMAINING MAIL QUEUE
 ------------------------------------------------------------
-Account Queue : 62 emails
-System Queue  : 85 emails
-                Active: 12 | Deferred: 73 | Hold: 0
+Account Queue : 86 emails
+System Queue  : 104 emails
+                Active: 10 | Deferred: 94 | Hold: 0
 
 ------------------------------------------------------------
 [3] SYSTEM TOTAL TRAFFIC
 ------------------------------------------------------------
-Total Traffic : 1280 emails
-                Sent: 1190 | Deferred: 82 | Bounced: 8
+Total Traffic : 1420 emails
+                Sent: 1285 | Deferred: 98 | Bounced: 37
 ============================================================
 ```
 
 ### Alert Frequency, Cooldown & Duration:
-1. **Background Scan Frequency (Default: Every `5` minutes)**:
-   - Cron executes `zimbra-spam-monitor --run` every `5` minutes (`/etc/cron.d/zimbra-spam-monitor`). Configurable via menu `[6]` (`1, 2, 5, 10, 15, 30` mins).
-2. **First Alert**:
-   - Sent **immediately** on the first scan cycle where an account exceeds a `WARNING` or `CRITICAL` threshold (10-min rate, 60-min rate, or Postfix queue count).
-3. **Repeat Frequency / Cooldown (Default: Every `30` minutes)**:
-   - Regulated by `ALERT_COOLDOWN_MINUTES=30` (menu `[3] -> [10]`). While the spam condition persists at the same severity level, a reminder alert is sent **at most once every 30 minutes** (preventing alert storms every 5 minutes).
-   - **Immediate Escalation**: If an account escalates from `WARNING` to `CRITICAL`, the `CRITICAL` alert is sent **immediately** on the next 5-minute scan without waiting for the 30-minute cooldown.
-4. **How Long Alerts Continue (Automatic Stop)**:
-   - Alerts repeat every `30` minutes **only while the account remains above threshold** (outbound volume in the last 10m / 60m or remaining Postfix queue `>= WARN_QUEUE_PER_USER`).
-   - **With `AUTO_LOCK_ON_CRITICAL="true"` (Default)**: When an account hits `CRITICAL`, it is locked immediately so no new spam can be sent. Once the 60-minute sliding window passes and the user's Postfix queue drops below `40` messages (or is cleared), **alerts stop automatically** (typically 1 initial alert, or 1-2 alerts total within 30-60 minutes).
-   - **With `WARNING` or `AUTO_LOCK_ON_CRITICAL="false"`**: Alerts repeat every `30` minutes until the outbound rate and Postfix queue drop below the `WARNING` thresholds, then **stop automatically**.
+1. **Background Scan Frequency (Default: Every `5` minutes)**: Cron runs `zimbra-spam-monitor --run` every `5` minutes (changeable in Menu `[6]`).
+2. **Immediate Initial Alert**: Sent immediately on the first 5-minute scan where an account violates a `WARNING` or `CRITICAL` rule.
+3. **Repeat Cooldown (Default: `30` minutes)**: Controlled by `ALERT_COOLDOWN_MINUTES=30`. Duplicate alerts at the same severity are suppressed for 30 minutes. Escalation from `WARNING` to `CRITICAL` bypasses cooldown and alerts immediately.
+4. **Automatic Stop**: Once the 5-minute metrics and Postfix queue drop below `WARNING` thresholds (or after the admin resets the password and runs `Unlock`), alerts stop immediately.
 
 ---
 
-## 4. Direct CLI Commands
+## 5. Direct CLI Commands
 
 ```bash
 zimbra-spam-monitor                        # Open Interactive Control Panel
-zimbra-spam-monitor --status               # Print status table & top senders
+zimbra-spam-monitor --status               # Print live 5-min status table & queue
 zimbra-spam-monitor --test                 # Send test alert to Telegram & Email
-zimbra-spam-monitor --unlock user@dom.com  # Unlock a Zimbra account & clear cooldown
+zimbra-spam-monitor --unlock user@dom.com  # Unlock Zimbra account & clear history
 zimbra-spam-monitor --whitelist-add a@b.c  # Add sender/domain to whitelist
 ```
 
 ---
 
-## 5. Uninstall
+## 6. Uninstall
 
 - **RHEL / CentOS / Rocky / AlmaLinux:**
   ```bash
@@ -152,7 +170,7 @@ zimbra-spam-monitor --whitelist-add a@b.c  # Add sender/domain to whitelist
 
 ---
 
-## 6. Building Packages from Source
+## 7. Building Packages from Source
 ```bash
 python3 packaging/build_rpm_deb.py
 bash tests/run_test.sh

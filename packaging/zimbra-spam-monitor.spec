@@ -1,5 +1,5 @@
 Name:           zimbra-spam-monitor
-Version:        1.1.2
+Version:        1.2.0
 Release:        1
 Summary:        Zimbra Outbound Email Spam Monitor & Alert System (Telegram + Email)
 License:        MIT
@@ -8,12 +8,14 @@ BuildArch:      noarch
 Requires:       bash, gawk, curl, crontabs
 
 %description
-Automated outbound spam detection and alerting system for Zimbra Collaboration Suite.
-- Scans /var/log/zimbra.log for short-window (minutes) and hourly outbound email rates.
-- Inspects Postfix mail queue (postqueue / mailq) per sender and server-wide.
+Multi-signal outbound spam detection and alerting system for Zimbra Collaboration Suite.
+- Evaluates 8 anti-spam metrics per short sliding window (default 5 minutes):
+  Messages Sent, Total Recipients, Unique Recipients, Failed Rate, Distinct Source IPs,
+  External Sender Spoofing, Amavis SPAM/INFECTED & RBL Rejections, and Postfix Queue.
+- Correlates Zimbra Amavis Queue-ID hops and ignores old Postfix queue retries.
 - Sends instant alerts via Telegram Bot API and Email (Local Postfix / External SMTP).
 - Automatically locks compromised accounts (zimbraAccountStatus locked) on Critical threshold.
-- Includes an interactive TUI / Menu control panel (run: zimbra-spam-monitor).
+- Includes a 100% ASCII-safe Interactive TUI / Menu control panel (run: zimbra-spam-monitor).
 
 %install
 mkdir -p %{buildroot}/usr/bin
@@ -33,7 +35,7 @@ mkdir -p /var/lib/zimbra-spam-monitor
 touch /var/log/zimbra-spam-monitor.log
 chmod 0640 /var/log/zimbra-spam-monitor.log
 echo "======================================================================"
-echo " [OK] Installed successfully: zimbra-spam-monitor v1.1.2"
+echo " [OK] Installed successfully: zimbra-spam-monitor v1.2.0"
 echo " -> Run the command below to open the Interactive Control Panel:"
 echo "      zimbra-spam-monitor"
 echo "======================================================================"
