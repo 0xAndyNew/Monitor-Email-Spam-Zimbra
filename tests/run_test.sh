@@ -211,9 +211,15 @@ EOF
 chmod +x "$MOCK_SENDMAIL"
 
 MOCK_CURL="$TEST_TMP/mock_curl.sh"
-cat << EOF > "$MOCK_CURL"
+cat << 'EOF' > "$MOCK_CURL"
 #!/usr/bin/env bash
-echo "\$*" >> "$FAKE_TG_OUT"
+for arg in "$@"; do
+    if [[ "$arg" == *"api.ipify.org"* || "$arg" == *"ifconfig.me"* || "$arg" == *"icanhazip.com"* ]]; then
+        echo "198.51.100.99"
+        exit 0
+    fi
+done
+echo "$*" >> "$FAKE_TG_OUT"
 echo '{"ok":true}'
 exit 0
 EOF
@@ -266,13 +272,15 @@ echo " -> [PASS] Zero false positives on Amavis 2-hop, Postfix old retries (dela
 
 # Verify exact metrics & formatting in generated alerts
 grep -q "ACCOUNT SPAM METRICS (LAST 5 MINS)" "$FAKE_MAIL_OUT"
+grep -q "Server        : mail.company.com (198.51.100.99)" "$FAKE_MAIL_OUT"
+grep -q "198.51.100.99" "$FAKE_STATE/public_ip.cache"
 grep -q "Messages Sent : 180 msgs" "$FAKE_MAIL_OUT"
 grep -q "Recipients    : 180 total (Unique: 180 | Domains: 10)" "$FAKE_MAIL_OUT"
 grep -q "Failed Rate   : 66.7% (120/180 failed)" "$FAKE_MAIL_OUT"
 grep -q "5 IPs" "$FAKE_MAIL_OUT"
 grep -q "Amavis SPAM: 12 | Spoof From: 12" "$FAKE_MAIL_OUT"
 grep -q "91.214.124.88 (1 IP)" "$FAKE_MAIL_OUT"
-echo " -> [PASS] Alert view verified (Messages Sent, Recipients, Unique/Domains, Failed Rate, Source IPs, Amavis/Spoof/RBL)."
+echo " -> [PASS] Alert view and public IP resolution verified (Cached to state/public_ip.cache)."
 
 echo "=== [5/8] Verifying Cooldown & Duplicate zmprov Prevention ==="
 LOCK_CALLS_BEFORE=$(wc -l < "$FAKE_ZMPROV_OUT")
@@ -336,10 +344,12 @@ echo "=== [7/8] Verifying --status Live 5m Dashboard ==="
 STATUS_OUT=$(ZSM_CONFIG_FILE="$FAKE_CFG" \
 ZSM_NOW_EPOCH="$FIXED_EPOCH" \
 ZSM_POSTQUEUE_CMD="$MOCK_PQ" \
+ZSM_CURL_CMD="$MOCK_CURL" \
 ZSM_HOSTNAME="mail.company.com" \
 bash "$MONITOR_BIN" --status)
 
 echo "$STATUS_OUT" | grep -q "LIVE SYSTEM STATUS (LAST 5 MINS)"
+echo "$STATUS_OUT" | grep -q "mail.company.com (198.51.100.99)"
 echo "$STATUS_OUT" | grep -q "hacked_user@company.com"
 echo "$STATUS_OUT" | grep -q "normal@company.com         | 5     | 5 (5)"
 echo " -> [PASS] --status output verified (Amavis 2-hop counted as 5, not 10)."

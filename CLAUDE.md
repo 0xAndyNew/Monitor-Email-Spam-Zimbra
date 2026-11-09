@@ -81,6 +81,7 @@ Available mock/override environment variables:
 - `ZSM_SENDMAIL_CMD`: Override `sendmail` executable path
 - `ZSM_CURL_CMD`: Override `curl` executable path
 - `ZSM_HOSTNAME`: Override detected hostname
+- `ZSM_SERVER_IP`: Override detected server public IP
 - `ZSM_UI_MODE`: Force UI mode (`auto`, `tui` for whiptail/dialog, `text` for plain numbers)
 
 ## Architecture and Structure
@@ -116,4 +117,6 @@ Detection evaluates an independent lookback window (default `LOOKBACK_MINUTES=5`
   - `cooldown.db`: Suppresses duplicate alerts for the same account within `ALERT_COOLDOWN_MINUTES=30`. Escalation from `WARNING` to `CRITICAL` bypasses cooldown.
   - `locked_accounts.db`: Records locked accounts to prevent duplicate `zmprov` JVM executions on subsequent cycles.
   - `unlock_cutoff.db`: Records unlock cutoff timestamp when an account is unlocked (`--unlock`); log lines prior to this timestamp are excluded.
+  - `public_ip.cache`: Caches resolved public IP address for 24 hours (86,400s) to eliminate recurring network overhead during 5-minute cron checks.
+- **Public IP Resolution & Local Client Safeguard**: Alerts and dashboards display the server's public IP (`SERVER_PUBLIC_IP="auto"`, dynamically looked up via HTTPS and cached for 24 hours). The log analysis engine cross-checks both public IP and local network interface IP to ensure internal Zimbra webmail submissions are reliably identified.
 - **100% ASCII Encoding Rule**: All code, configuration, documentation, and packaging files in this repository must contain strictly 7-bit ASCII characters (byte values 0-127). Non-ASCII characters will break the automated test suite.
