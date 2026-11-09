@@ -1,5 +1,10 @@
 # Zimbra Outbound Spam Monitor (`zimbra-spam-monitor` v1.2.1)
 
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![Release](https://img.shields.io/github/v/release/0xAndyNew/Monitor-Email-Spam-Zimbra?color=blue)](https://github.com/0xAndyNew/Monitor-Email-Spam-Zimbra/releases)
+[![Platform](https://img.shields.io/badge/platform-Linux%20%7C%20ZCS%208%2C%209%2C%2010-orange.svg)](#)
+[![Tests](https://img.shields.io/badge/tests-8%2F8%20passing-brightgreen.svg)](tests/run_test.sh)
+
 Multi-signal outbound email spam detection, alerting (**Telegram** + **Email**), and automatic compromised account locking tool for **Zimbra Collaboration Suite (ZCS)** on Linux.
 
 Designed specifically for production Zimbra Linux servers with **near-zero CPU/RAM overhead** (~0.1-0.3s per 5-minute check, zero background daemons, zero periodic JVM calls) and a **streamlined 100% ASCII-safe English Interactive Control Panel** (`whiptail`/`dialog` arrow-key TUI & numbered text fallback).
@@ -174,3 +179,17 @@ zimbra-spam-monitor --whitelist-add a@b.c  # Add sender/domain to whitelist
 python3 packaging/build_rpm_deb.py
 bash tests/run_test.sh
 ```
+
+---
+
+## 8. License
+
+This project is licensed under the [MIT License](LICENSE) - see the [LICENSE](LICENSE) file for details.
+
+---
+
+## 9. Author & Contributions
+
+- Author: **0xAndyNew**
+- GitHub: [0xAndyNew/Monitor-Email-Spam-Zimbra](https://github.com/0xAndyNew/Monitor-Email-Spam-Zimbra)
+- Issues & PRs: [GitHub Issues](https://github.com/0xAndyNew/Monitor-Email-Spam-Zimbra/issues)

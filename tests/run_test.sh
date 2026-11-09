@@ -49,6 +49,8 @@ ascii_files = [
     root / "packaging" / "logrotate.d" / "zimbra-spam-monitor",
     root / "packaging" / "zimbra-spam-monitor.spec",
     root / "README.md",
+    root / "LICENSE",
+    root / ".gitignore",
 ]
 for f in ascii_files:
     raw = f.read_bytes()
