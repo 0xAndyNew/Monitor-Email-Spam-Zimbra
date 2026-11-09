@@ -45,6 +45,7 @@ Instead of accumulating whole-day or 60-minute totals that cause false alerts af
 ### Built-in Zimbra Production Safeguards:
 - **Amavis Double-Queue-ID Correlation**: Links pre-filter `Queue-ID 1` (`127.0.0.1:10024/10026/10032`) to post-filter `Queue-ID 2` so outbound emails are **never double-counted (2x)** and retain the attacker's real **Source IP** and `sasl_username`.
 - **Postfix Queue Retry Protection**: Calculates true submission time (`log_time - delay`) so old `deferred` messages retried by Postfix 20-30 minutes later are **never mistaken for newly sent spam**.
+- **Public IP Auto-Resolution & 24h Cache**: Resolves and displays the server's public IP address in all alert headers and dashboards, caching results for 24 hours to ensure zero recurring network overhead during 5-minute cron runs, with automatic fallback to local IP if offline.
 - **False-Positive Protection**:
   - Single legitimate CC/BCC company announcements (`Messages Sent < 10`) will never trigger `CRITICAL` auto-lock on recipient count alone.
   - Legitimate same-domain Zimbra personas/aliases (`sale01@company.com` sending as `sales@company.com`) are not flagged as external spoofing.
