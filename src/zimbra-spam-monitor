@@ -29,6 +29,7 @@ CRON_FILE="${ZSM_CRON_FILE:-/etc/cron.d/zimbra-spam-monitor}"
 # DEFAULT CONFIGURATION (Overridden by /etc/zimbra-spam-monitor/config.conf)
 # ==============================================================================
 MONITOR_ENABLED="true"
+SERVER_PUBLIC_IP="auto"
 ZIMBRA_LOG_FILE="/var/log/zimbra.log"
 LOG_TAIL_LINES=200000
 COUNT_INTERNAL_TO_INTERNAL="false"
@@ -98,6 +99,7 @@ ZSM_ZMPROV_CMD="${ZSM_ZMPROV_CMD:-}"
 ZSM_SENDMAIL_CMD="${ZSM_SENDMAIL_CMD:-}"
 ZSM_CURL_CMD="${ZSM_CURL_CMD:-curl}"
 ZSM_HOSTNAME="${ZSM_HOSTNAME:-}"
+ZSM_SERVER_IP="${ZSM_SERVER_IP:-}"
 ZSM_UI_MODE="${ZSM_UI_MODE:-auto}" # "auto", "tui" (whiptail/dialog), or "text"
 
 # ANSI Colors for Text Menu
@@ -142,6 +144,7 @@ ensure_config_file_exists() {
     if [[ ! -f "$CONFIG_FILE" ]]; then
         cat <<EOF > "$CONFIG_FILE"
 MONITOR_ENABLED="${MONITOR_ENABLED}"
+SERVER_PUBLIC_IP="${SERVER_PUBLIC_IP}"
 ZIMBRA_LOG_FILE="${ZIMBRA_LOG_FILE}"
 LOG_TAIL_LINES=${LOG_TAIL_LINES}
 COUNT_INTERNAL_TO_INTERNAL="${COUNT_INTERNAL_TO_INTERNAL}"
@@ -241,13 +244,84 @@ get_server_hostname() {
     echo "$hn"
 }
 
-get_server_ip() {
-    local ip=""
-    ip=$(hostname -I 2>/dev/null | awk '{print $1}')
-    if [[ -z "$ip" ]]; then
-        ip="127.0.0.1"
+get_local_ip() {
+    local lip=""
+    lip=$(hostname -I 2>/dev/null | awk '{print $1}')
+    if [[ -z "$lip" ]]; then
+        lip="127.0.0.1"
     fi
-    echo "$ip"
+    echo "$lip"
+}
+
+get_server_ip() {
+    if [[ -n "${ZSM_SERVER_IP:-}" ]]; then
+        echo "$ZSM_SERVER_IP"
+        return
+    fi
+
+    if [[ -n "${SERVER_PUBLIC_IP:-}" && "$SERVER_PUBLIC_IP" != "auto" ]]; then
+        echo "$SERVER_PUBLIC_IP"
+        return
+    fi
+
+    local cache_file="$STATE_DIR/public_ip.cache"
+    local now_ts="${ZSM_NOW_EPOCH:-$(date +%s)}"
+
+    # Check cached public IP (valid for 24 hours / 86400 seconds)
+    if [[ -f "$cache_file" ]]; then
+        local file_ts diff_ts
+        file_ts=$(stat -c %Y "$cache_file" 2>/dev/null || stat -f %m "$cache_file" 2>/dev/null || date -r "$cache_file" +%s 2>/dev/null || echo 0)
+        if [[ "$file_ts" =~ ^[0-9]+$ ]]; then
+            if (( now_ts >= file_ts )); then
+                diff_ts=$(( now_ts - file_ts ))
+            else
+                diff_ts=$(( file_ts - now_ts ))
+            fi
+            if (( diff_ts < 86400 )); then
+                local cached_ip
+                cached_ip=$(head -n 1 "$cache_file" 2>/dev/null | tr -d '\r\n[:space:]')
+                if [[ "$cached_ip" =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$ || ( "$cached_ip" =~ ^[0-9a-fA-F:]+$ && "$cached_ip" == *:* ) ]]; then
+                    echo "$cached_ip"
+                    return
+                fi
+            fi
+        fi
+    fi
+
+    # Lookup public IP using external HTTPS services (3-second timeout)
+    local pub_ip=""
+    local url
+    for url in "https://api.ipify.org" "https://ifconfig.me/ip" "https://icanhazip.com"; do
+        pub_ip=$($ZSM_CURL_CMD -sS -m 3 "$url" 2>/dev/null | tr -d '\r\n[:space:]')
+        if [[ "$pub_ip" =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$ || ( "$pub_ip" =~ ^[0-9a-fA-F:]+$ && "$pub_ip" == *:* ) ]]; then
+            break
+        else
+            pub_ip=""
+        fi
+    done
+
+    if [[ -n "$pub_ip" ]]; then
+        mkdir -p "$STATE_DIR" 2>/dev/null || true
+        echo "$pub_ip" > "$cache_file" 2>/dev/null || true
+        if [[ -n "${ZSM_NOW_EPOCH:-}" ]]; then
+            touch -d "@$now_ts" "$cache_file" 2>/dev/null || true
+        fi
+        echo "$pub_ip"
+        return
+    fi
+
+    # If lookup failed, reuse stale cache if present
+    if [[ -f "$cache_file" ]]; then
+        local stale_ip
+        stale_ip=$(head -n 1 "$cache_file" 2>/dev/null | tr -d '\r\n[:space:]')
+        if [[ "$stale_ip" =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$ || ( "$stale_ip" =~ ^[0-9a-fA-F:]+$ && "$stale_ip" == *:* ) ]]; then
+            echo "$stale_ip"
+            return
+        fi
+    fi
+
+    # Fallback to local network IP
+    get_local_ip
 }
 
 # Fast auto-detection of Zimbra localconfig XML without spawning JVM
@@ -715,8 +789,9 @@ analyze_zimbra_log() {
     local now_epoch="${ZSM_NOW_EPOCH:-$(date +%s)}"
     local cur_year
     cur_year=$(date -d "@$now_epoch" '+%Y' 2>/dev/null || date '+%Y')
-    local srv_ip
+    local srv_ip local_ip
     srv_ip=$(get_server_ip)
+    local_ip=$(get_local_ip)
     local unlock_file="$STATE_DIR/unlock_cutoff.db"
 
     tail -n "$LOG_TAIL_LINES" "$ZIMBRA_LOG_FILE" 2>/dev/null | awk \
@@ -727,6 +802,7 @@ analyze_zimbra_log() {
         -v internal_domains="$RESOLVED_INTERNAL_DOMAINS" \
         -v default_domain="$RESOLVED_DEFAULT_DOMAIN" \
         -v srv_ip="$srv_ip" \
+        -v local_ip="$local_ip" \
         -v amavis_thresh="$AMAVIS_SPAM_SCORE_THRESHOLD" \
         -v unlock_file="$unlock_file" \
         -v sys_file="$sys_sum_file" '
@@ -901,7 +977,7 @@ analyze_zimbra_log() {
                     cip = substr(cip, RSTART + 1, RLENGTH - 2)
                 }
             }
-            if (qid != "" && (cip == "127.0.0.1" || cip == "::1" || cip == srv_ip)) {
+            if (qid != "" && (cip == "127.0.0.1" || cip == "::1" || cip == srv_ip || cip == local_ip)) {
                 q_local_client[qid] = 1
                 if (!(qid in q_root)) q_root[qid] = qid
                 if (!(qid in q_birth_ts)) q_birth_ts[qid] = ts

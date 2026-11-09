@@ -1,5 +1,10 @@
 # Zimbra Outbound Spam Monitor (`zimbra-spam-monitor` v1.2.1)
 
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![Release](https://img.shields.io/github/v/release/0xAndyNew/Monitor-Email-Spam-Zimbra?color=blue)](https://github.com/0xAndyNew/Monitor-Email-Spam-Zimbra/releases)
+[![Platform](https://img.shields.io/badge/platform-Linux%20%7C%20ZCS%208%2C%209%2C%2010-orange.svg)](#)
+[![Tests](https://img.shields.io/badge/tests-8%2F8%20passing-brightgreen.svg)](tests/run_test.sh)
+
 Multi-signal outbound email spam detection, alerting (**Telegram** + **Email**), and automatic compromised account locking tool for **Zimbra Collaboration Suite (ZCS)** on Linux.
 
 Designed specifically for production Zimbra Linux servers with **near-zero CPU/RAM overhead** (~0.1-0.3s per 5-minute check, zero background daemons, zero periodic JVM calls) and a **streamlined 100% ASCII-safe English Interactive Control Panel** (`whiptail`/`dialog` arrow-key TUI & numbered text fallback).
@@ -45,6 +50,7 @@ Instead of accumulating whole-day or 60-minute totals that cause false alerts af
 ### Built-in Zimbra Production Safeguards:
 - **Amavis Double-Queue-ID Correlation**: Links pre-filter `Queue-ID 1` (`127.0.0.1:10024/10026/10032`) to post-filter `Queue-ID 2` so outbound emails are **never double-counted (2x)** and retain the attacker's real **Source IP** and `sasl_username`.
 - **Postfix Queue Retry Protection**: Calculates true submission time (`log_time - delay`) so old `deferred` messages retried by Postfix 20-30 minutes later are **never mistaken for newly sent spam**.
+- **Public IP Auto-Resolution & 24h Cache**: Resolves and displays the server's public IP address in all alert headers and dashboards, caching results for 24 hours to ensure zero recurring network overhead during 5-minute cron runs, with automatic fallback to local IP if offline.
 - **False-Positive Protection**:
   - Single legitimate CC/BCC company announcements (`Messages Sent < 10`) will never trigger `CRITICAL` auto-lock on recipient count alone.
   - Legitimate same-domain Zimbra personas/aliases (`sale01@company.com` sending as `sales@company.com`) are not flagged as external spoofing.
@@ -173,3 +179,17 @@ zimbra-spam-monitor --whitelist-add a@b.c  # Add sender/domain to whitelist
 python3 packaging/build_rpm_deb.py
 bash tests/run_test.sh
 ```
+
+---
+
+## 8. License
+
+This project is licensed under the [MIT License](LICENSE) - see the [LICENSE](LICENSE) file for details.
+
+---
+
+## 9. Author & Contributions
+
+- Author: **0xAndyNew**
+- GitHub: [0xAndyNew/Monitor-Email-Spam-Zimbra](https://github.com/0xAndyNew/Monitor-Email-Spam-Zimbra)
+- Issues & PRs: [GitHub Issues](https://github.com/0xAndyNew/Monitor-Email-Spam-Zimbra/issues)
