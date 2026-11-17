@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # ==============================================================================
 # ZIMBRA OUTBOUND SPAM MONITOR & ALERT SYSTEM (zimbra-spam-monitor)
-# Version: 1.2.2
+# Version: 1.2.3
 # Supported OS: RHEL / CentOS / Rocky / AlmaLinux (.rpm) & Ubuntu / Debian (.deb)
 #
 # Features:
@@ -20,7 +20,7 @@
 
 set -u
 
-VERSION="1.2.2"
+VERSION="1.2.3"
 DEFAULT_CONFIG_FILE="/etc/zimbra-spam-monitor/config.conf"
 CONFIG_FILE="${ZSM_CONFIG_FILE:-$DEFAULT_CONFIG_FILE}"
 CRON_FILE="${ZSM_CRON_FILE:-/etc/cron.d/zimbra-spam-monitor}"
@@ -459,6 +459,14 @@ find_sendmail_bin() {
     echo ""
 }
 
+find_awk_bin() {
+    if command -v gawk >/dev/null 2>&1; then
+        echo "gawk"
+    else
+        echo "awk"
+    fi
+}
+
 is_whitelisted() {
     local email
     email=$(echo "$1" | tr '[:upper:]' '[:lower:]')
@@ -488,7 +496,8 @@ is_whitelisted() {
 # ALERT COOLDOWN, UNLOCK CUTOFF & LOCKED ACCOUNT HISTORY
 # ==============================================================================
 should_send_alert() {
-    local sender="$1"
+    local sender
+    sender=$(echo "$1" | tr '[:upper:]' '[:lower:]')
     local severity="$2"
     local state_file="$STATE_DIR/cooldown.db"
     local now_ts
@@ -498,7 +507,7 @@ should_send_alert() {
     [[ ! -f "$state_file" ]] && return 0
 
     local prev_line
-    prev_line=$(grep -F "^${sender}|" "$state_file" 2>/dev/null | tail -n 1 || true)
+    prev_line=$(awk -F'|' -v s="$sender" 'tolower($1) == s || tolower($1) == ("^" s) {line=$0} END {if (line != "") print line}' "$state_file" 2>/dev/null || true)
     if [[ -z "$prev_line" ]]; then
         return 0
     fi
@@ -518,7 +527,8 @@ should_send_alert() {
 }
 
 record_alert_state() {
-    local sender="$1"
+    local sender
+    sender=$(echo "$1" | tr '[:upper:]' '[:lower:]')
     local severity="$2"
     local state_file="$STATE_DIR/cooldown.db"
     local now_ts
@@ -526,10 +536,10 @@ record_alert_state() {
 
     mkdir -p "$STATE_DIR" 2>/dev/null || true
     if [[ -f "$state_file" ]]; then
-        grep -v -F "^${sender}|" "$state_file" > "${state_file}.tmp" 2>/dev/null || true
+        awk -F'|' -v s="$sender" 'tolower($1) != s && tolower($1) != ("^" s)' "$state_file" > "${state_file}.tmp" 2>/dev/null || true
         mv -f "${state_file}.tmp" "$state_file"
     fi
-    echo "^${sender}|${severity}|${now_ts}" >> "$state_file"
+    echo "${sender}|${severity}|${now_ts}" >> "$state_file"
 }
 
 is_account_already_locked() {
@@ -537,7 +547,15 @@ is_account_already_locked() {
     sender=$(echo "$1" | tr '[:upper:]' '[:lower:]')
     local locked_file="$STATE_DIR/locked_accounts.db"
     [[ ! -f "$locked_file" ]] && return 1
-    grep -q -i "^${sender}|" "$locked_file" 2>/dev/null
+    awk -F'|' -v s="$sender" 'tolower($1) == s {found=1; exit} END {exit(found ? 0 : 1)}' "$locked_file" 2>/dev/null
+}
+
+get_locked_account_time() {
+    local sender
+    sender=$(echo "$1" | tr '[:upper:]' '[:lower:]')
+    local locked_file="$STATE_DIR/locked_accounts.db"
+    [[ ! -f "$locked_file" ]] && return 0
+    awk -F'|' -v s="$sender" 'tolower($1) == s {ts=$2} END {if (ts != "") print ts}' "$locked_file" 2>/dev/null || true
 }
 
 record_unlock_cutoff() {
@@ -572,12 +590,12 @@ clear_alert_state() {
     sender=$(echo "$1" | tr '[:upper:]' '[:lower:]')
     local state_file="$STATE_DIR/cooldown.db"
     if [[ -f "$state_file" ]]; then
-        grep -v -F "^${sender}|" "$state_file" > "${state_file}.tmp" 2>/dev/null || true
+        awk -F'|' -v s="$sender" 'tolower($1) != s && tolower($1) != ("^" s)' "$state_file" > "${state_file}.tmp" 2>/dev/null || true
         mv -f "${state_file}.tmp" "$state_file"
     fi
     local locked_file="$STATE_DIR/locked_accounts.db"
     if [[ -f "$locked_file" ]]; then
-        grep -v -i "^${sender}|" "$locked_file" > "${locked_file}.tmp" 2>/dev/null || true
+        awk -F'|' -v s="$sender" 'tolower($1) != s' "$locked_file" > "${locked_file}.tmp" 2>/dev/null || true
         mv -f "${locked_file}.tmp" "$locked_file"
     fi
     record_unlock_cutoff "$sender"
@@ -587,11 +605,12 @@ record_locked_account() {
     local sender
     sender=$(echo "$1" | tr '[:upper:]' '[:lower:]')
     local locked_file="$STATE_DIR/locked_accounts.db"
-    local ts_str
-    ts_str=$(date '+%Y-%m-%d %H:%M:%S')
+    local now_ts ts_str
+    now_ts="${ZSM_NOW_EPOCH:-$(date +%s)}"
+    ts_str=$(date -d "@$now_ts" '+%Y-%m-%d %H:%M:%S' 2>/dev/null || date '+%Y-%m-%d %H:%M:%S')
     mkdir -p "$STATE_DIR" 2>/dev/null || true
     if [[ -f "$locked_file" ]]; then
-        grep -v -i "^${sender}|" "$locked_file" > "${locked_file}.tmp" 2>/dev/null || true
+        awk -F'|' -v s="$sender" 'tolower($1) != s' "$locked_file" > "${locked_file}.tmp" 2>/dev/null || true
         mv -f "${locked_file}.tmp" "$locked_file"
     fi
     echo "${sender}|${ts_str}" >> "$locked_file"
@@ -600,15 +619,30 @@ record_locked_account() {
 # ==============================================================================
 # AUTO-REMEDIATION ON CRITICAL (LOCK ACCOUNT & HOLD QUEUE)
 # ==============================================================================
+format_already_locked_msg() {
+    local account="$1"
+    local lock_ts
+    lock_ts=$(get_locked_account_time "$account")
+    if [[ -n "$lock_ts" ]]; then
+        echo "ALREADY LOCKED (Since ${lock_ts} | Skipped duplicate zmprov)"
+    else
+        echo "ALREADY LOCKED (Skipped duplicate zmprov call)"
+    fi
+}
+
 lock_zimbra_account() {
     local account="$1"
     if [[ "$AUTO_LOCK_ON_CRITICAL" != "true" ]]; then
-        echo "Auto-lock disabled (AUTO_LOCK_ON_CRITICAL=false)"
+        if is_account_already_locked "$account"; then
+            format_already_locked_msg "$account"
+        else
+            echo "NOT LOCKED (Active - Auto-lock disabled)"
+        fi
         return 0
     fi
 
     if is_account_already_locked "$account"; then
-        echo "Account already LOCKED (skipped duplicate zmprov call)"
+        format_already_locked_msg "$account"
         return 0
     fi
 
@@ -617,10 +651,10 @@ lock_zimbra_account() {
     if [[ -n "$ZSM_ZMPROV_CMD" ]]; then
         if $ZSM_ZMPROV_CMD ma "$account" zimbraAccountStatus locked >/dev/null 2>&1; then
             record_locked_account "$account"
-            echo "Account automatically LOCKED (zimbraAccountStatus = locked)"
+            echo "LOCKED (Auto-locked now via zmprov)"
             return 0
         else
-            echo "Failed to lock account via $ZSM_ZMPROV_CMD"
+            echo "NOT LOCKED (zmprov lock failed via $ZSM_ZMPROV_CMD)"
             return 1
         fi
     fi
@@ -628,14 +662,14 @@ lock_zimbra_account() {
     if [[ -x /opt/zimbra/bin/zmprov ]]; then
         if su - zimbra -c "/opt/zimbra/bin/zmprov ma '$account' zimbraAccountStatus locked" >/dev/null 2>&1; then
             record_locked_account "$account"
-            echo "Account automatically LOCKED (zimbraAccountStatus = locked)"
+            echo "LOCKED (Auto-locked now via zmprov)"
             return 0
         else
-            echo "Failed to execute zmprov lock command (check root/zimbra permissions)"
+            echo "NOT LOCKED (zmprov failed - check root/zimbra permissions)"
             return 1
         fi
     else
-        echo "/opt/zimbra/bin/zmprov not found; could not auto-lock account"
+        echo "NOT LOCKED (/opt/zimbra/bin/zmprov not found)"
         return 1
     fi
 }
@@ -655,7 +689,7 @@ hold_sender_queue() {
     [[ -z "$postsuper_bin" ]] && return 0
 
     $pq_bin -p 2>/dev/null | awk -v target="$sender" '
-        /^[0-9A-F]+[*!]?[[:space:]]/ {
+        /^[0-9A-Za-z]+[*!]?[[:space:]]+[0-9]+[[:space:]]/ {
             qid=$1; sub(/[*!]$/, "", qid); s=tolower($7);
             if (s == tolower(target)) print qid
         }
@@ -723,7 +757,7 @@ Content-Transfer-Encoding: 8bit
 ${body_text}
 EOF
 )
-    if printf "%s\n" "$email_payload" | $sm_bin -t >/dev/null 2>&1; then
+    if printf "%s\n" "$email_payload" | $sm_bin -f "$RESOLVED_EMAIL_FROM" -t -i >/dev/null 2>&1; then
         log_msg "INFO" "Email alert sent (Local Postfix) to ${RESOLVED_EMAIL_TO}"
         return 0
     else
@@ -844,8 +878,10 @@ analyze_zimbra_log() {
     local local_ips
     local_ips=$(get_local_ips)
     local unlock_file="$STATE_DIR/unlock_cutoff.db"
+    local awk_bin
+    awk_bin=$(find_awk_bin)
 
-    tail -n "$LOG_TAIL_LINES" "$ZIMBRA_LOG_FILE" 2>/dev/null | awk \
+    tail -n "$LOG_TAIL_LINES" "$ZIMBRA_LOG_FILE" 2>/dev/null | "$awk_bin" \
         -v now_epoch="$now_epoch" \
         -v cur_year="$cur_year" \
         -v win_mins="$LOOKBACK_MINUTES" \
@@ -1276,7 +1312,7 @@ analyze_postfix_queue() {
         total_q = 0; active_q = 0; hold_q = 0; def_q = 0
         cur_sender = ""; cur_reason = ""
     }
-    /^[0-9A-F]+[*!]?[[:space:]]/ {
+    /^[0-9A-Za-z]+[*!]?[[:space:]]+[0-9]+[[:space:]]/ {
         qid_raw = $1
         sender = tolower($7)
         if (sender == "" || sender ~ /^from=/) next
@@ -1362,8 +1398,8 @@ run_monitor_cycle() {
     q_summary=$(cat "$tmp_q_sum" 2>/dev/null || echo "0|0|0|0")
     IFS='|' read -r total_queue active_queue def_queue hold_queue <<< "$q_summary"
 
-    awk -F'|' '
-    FNR == NR {
+    awk -F'|' -v q_file="$tmp_q_stats" '
+    FILENAME != q_file {
         s = $1
         if (s == "") next
         users[s] = 1
@@ -1373,7 +1409,7 @@ run_monitor_cycle() {
         ips[s] = $13; tsp[s] = $14
         next
     }
-    {
+    FILENAME == q_file {
         s = $1
         if (s == "") next
         users[s] = 1
@@ -1516,10 +1552,12 @@ run_monitor_cycle() {
             continue
         fi
 
-        local action_taken="Alert Only (WARNING)"
+        local action_taken="NOT LOCKED (Active - Alert Only)"
         if [[ "$severity" == "CRITICAL" ]]; then
-            action_taken=$(lock_zimbra_account "$sender")
+            action_taken=$(lock_zimbra_account "$sender") || true
             hold_sender_queue "$sender"
+        elif is_account_already_locked "$sender"; then
+            action_taken=$(format_already_locked_msg "$sender")
         fi
 
         record_alert_state "$sender" "$severity"
@@ -1547,6 +1585,7 @@ run_monitor_cycle() {
 <b>Alert Time   :</b> ${now_str}
 <b>Spam Time    :</b> $(html_escape "$spam_time_str")
 <b>Spam Account :</b> <code>$(html_escape "$sender")</code>
+<b>Account State:</b> <b>$(html_escape "$action_taken")</b>
 <b>Source IPs   :</b> <code>$(html_escape "$ip_display")</code>
 <b>Reason       :</b> $(html_escape "$reasons")
 
@@ -1579,6 +1618,7 @@ Server        : ${srv_host} (${srv_ip})
 Alert Time    : ${now_str}
 Spam Time     : ${spam_time_str}
 Spam Account  : ${sender}
+Account State : ${action_taken}
 Source IPs    : ${ip_display}
 Reason        : ${reasons}
 

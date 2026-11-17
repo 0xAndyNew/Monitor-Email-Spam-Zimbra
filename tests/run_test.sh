@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# AUTOMATED TEST SUITE FOR ZIMBRA-SPAM-MONITOR v1.2.2
+# AUTOMATED TEST SUITE FOR ZIMBRA-SPAM-MONITOR v1.2.3
 # Verifies:
 # 1. Bash syntax & 100% ASCII encoding across all packaged files & README
-# 2. Binary structure of .deb & .rpm packages (v1.2.2-1)
+# 2. Binary structure of .deb & .rpm packages (v1.2.3-1)
 # 3. Zimbra Amavis double-Queue-ID correlation (zero 2x double counting, keeps IP)
 # 4. Multi-signal detection (Msgs, Rcpts, Uniq Rcpts, Failed Rate, Botnet IPs,
 #    External Spoofing, Amavis SPAM/RBL) + False-Positive protections:
@@ -57,8 +57,8 @@ for f in ascii_files:
     non_ascii = [b for b in raw if b > 127]
     assert not non_ascii, f"Non-ASCII bytes found in {f}"
 
-deb_path = root / "zimbra-spam-monitor_1.2.2-1_all.deb"
-rpm_path = root / "zimbra-spam-monitor-1.2.2-1.noarch.rpm"
+deb_path = root / "zimbra-spam-monitor_1.2.3-1_all.deb"
+rpm_path = root / "zimbra-spam-monitor-1.2.3-1.noarch.rpm"
 
 assert deb_path.exists() and deb_path.stat().st_size > 5000, "Missing or empty .deb"
 assert rpm_path.exists() and rpm_path.stat().st_size > 5000, "Missing or empty .rpm"
@@ -87,7 +87,7 @@ assert cpio_raw.startswith(b"070701"), "Invalid CPIO newc header inside RPM"
 assert b"./usr/bin/zimbra-spam-monitor" in cpio_raw, "Missing binary in RPM CPIO"
 assert b"./etc/zimbra-spam-monitor/config.conf" in cpio_raw, "Missing config.conf in RPM CPIO"
 assert b"TRAILER!!!" in cpio_raw, "Missing CPIO TRAILER"
-print(" -> [PASS] 100% ASCII encoding & valid v1.2.2 .deb / .rpm binary structures verified.")
+print(" -> [PASS] 100% ASCII encoding & valid v1.2.3 .deb / .rpm binary structures verified.")
 PYEOF
 
 echo "=== [3/8] Setting up simulated Zimbra + Postfix + Amavis environment ==="
@@ -300,8 +300,12 @@ for clean_acc in "marketing@company.com" "old_retry@company.com" "sale_alias@com
 done
 echo " -> [PASS] Zero false positives on Amavis 2-hop, Postfix old retries (delay=1800), internal aliases, and whitelist."
 
-# Verify exact metrics & formatting in generated alerts
+# Verify exact metrics, Account State & formatting in generated alerts
 grep -q "Server        : mail.company.com (103.56.158.99)" "$FAKE_MAIL_OUT"
+grep -q "Account State : LOCKED (Auto-locked now via zmprov)" "$FAKE_MAIL_OUT"
+grep -q "Account State : NOT LOCKED (Active - Alert Only)" "$FAKE_MAIL_OUT"
+grep -q "Account State" "$FAKE_TG_OUT"
+grep -q "LOCKED (Auto-locked now via zmprov)" "$FAKE_TG_OUT"
 grep -q "webmail_warn@company.com" "$FAKE_MAIL_OUT"
 grep -q "ACCOUNT SPAM METRICS (LAST 5 MINS)" "$FAKE_MAIL_OUT"
 grep -q "Messages Sent : 180 msgs" "$FAKE_MAIL_OUT"
@@ -310,13 +314,13 @@ grep -q "Failed Rate   : 66.7% (120/180 failed)" "$FAKE_MAIL_OUT"
 grep -q "5 IPs" "$FAKE_MAIL_OUT"
 grep -q "Amavis SPAM: 12 | Spoof From: 12" "$FAKE_MAIL_OUT"
 grep -q "91.214.124.88 (1 IP)" "$FAKE_MAIL_OUT"
-echo " -> [PASS] Alert view verified (DNS public IP 103.56.158.99, LAN webmail preserved, all 8 metrics intact)."
+echo " -> [PASS] Alert view verified (Account State LOCKED/NOT LOCKED, DNS IP 103.56.158.99, LAN webmail, 8 metrics)."
 
-echo "=== [5/8] Verifying Cooldown & Duplicate zmprov Prevention ==="
+echo "=== [5/8] Verifying Cooldown, 30m Repeat w/ Long Queue IDs & Auto-Stop ==="
 LOCK_CALLS_BEFORE=$(wc -l < "$FAKE_ZMPROV_OUT")
 MAIL_CALLS_BEFORE=$(grep -c -- "---END_MAIL---" "$FAKE_MAIL_OUT")
 
-# Advance 4 minutes (within 30m cooldown): should skip duplicate alerts &zmprov calls
+# Advance 4 minutes (within 30m cooldown): should skip duplicate alerts & zmprov calls
 NEXT_EPOCH=$(( FIXED_EPOCH + 240 ))
 ZSM_CONFIG_FILE="$FAKE_CFG" \
 ZSM_NOW_EPOCH="$NEXT_EPOCH" \
@@ -324,6 +328,10 @@ ZSM_POSTQUEUE_CMD="$MOCK_PQ" \
 ZSM_ZMPROV_CMD="$MOCK_ZMPROV" \
 ZSM_SENDMAIL_CMD="$MOCK_SENDMAIL" \
 ZSM_CURL_CMD="$MOCK_CURL" \
+ZSM_DIG_CMD="$MOCK_DIG" \
+ZSM_HOST_CMD="/nonexistent/host" \
+ZSM_NSLOOKUP_CMD="/nonexistent/nslookup" \
+ZSM_HOSTNAME_CMD="$MOCK_HOSTNAME" \
 ZSM_HOSTNAME="mail.company.com" \
 bash "$MONITOR_BIN" --run
 
@@ -334,6 +342,72 @@ if [[ "$LOCK_CALLS_BEFORE" != "$LOCK_CALLS_AFTER" || "$MAIL_CALLS_BEFORE" != "$M
     exit 1
 fi
 echo " -> [PASS] 30-min cooldown suppressed duplicate alerts and prevented redundant zmprov JVM calls."
+
+# Advance 31 minutes with 105 Postfix Long Queue IDs still stuck for already-locked phish_user
+LONG_PQ="$TEST_TMP/mock_long_pq.sh"
+{
+    echo "#!/usr/bin/env bash"
+    echo "cat << 'LQOUT'"
+    echo "-Queue ID-  --Size-- ----Arrival Time---- -Sender/Recipient-------"
+    for i in $(seq 1 105); do
+        printf "4XxY9z3kM%04d   1500 Sun Nov  8 14:59:00  phish_user@company.com\n" "$i"
+        printf "                                         victim%d@gmail.com\n" "$i"
+    done
+    echo "-- 157 Kbytes in 105 Requests."
+    echo "LQOUT"
+} > "$LONG_PQ"
+chmod +x "$LONG_PQ"
+
+REPEAT_EPOCH=$(( FIXED_EPOCH + 1860 ))
+ZSM_CONFIG_FILE="$FAKE_CFG" \
+ZSM_NOW_EPOCH="$REPEAT_EPOCH" \
+ZSM_POSTQUEUE_CMD="$LONG_PQ" \
+ZSM_ZMPROV_CMD="$MOCK_ZMPROV" \
+ZSM_SENDMAIL_CMD="$MOCK_SENDMAIL" \
+ZSM_CURL_CMD="$MOCK_CURL" \
+ZSM_DIG_CMD="$MOCK_DIG" \
+ZSM_HOST_CMD="/nonexistent/host" \
+ZSM_NSLOOKUP_CMD="/nonexistent/nslookup" \
+ZSM_HOSTNAME_CMD="$MOCK_HOSTNAME" \
+ZSM_HOSTNAME="mail.company.com" \
+bash "$MONITOR_BIN" --run
+
+LOCK_CALLS_REPEAT=$(wc -l < "$FAKE_ZMPROV_OUT")
+MAIL_CALLS_REPEAT=$(grep -c -- "---END_MAIL---" "$FAKE_MAIL_OUT")
+if [[ "$LOCK_CALLS_REPEAT" != "$LOCK_CALLS_BEFORE" ]] || (( MAIL_CALLS_REPEAT <= MAIL_CALLS_AFTER )); then
+    echo " -> [FAIL] 30m repeat alert with leftover Long Queue IDs did not fire as expected!"
+    exit 1
+fi
+grep -q "Account State : ALREADY LOCKED (" "$FAKE_MAIL_OUT"
+grep -q "Account Queue : 105 emails" "$FAKE_MAIL_OUT"
+echo " -> [PASS] 30m repeat sent w/ ALREADY LOCKED state & 105 Long Queue IDs (without duplicate zmprov)."
+
+# Clear queue and advance another 31 minutes: alerts must stop completely
+EMPTY_PQ="$TEST_TMP/empty_pq.sh"
+printf "#!/usr/bin/env bash\necho 'Mail queue is empty'\n" > "$EMPTY_PQ"
+chmod +x "$EMPTY_PQ"
+
+STOP_EPOCH=$(( FIXED_EPOCH + 3720 ))
+MAIL_BEFORE_CLEAR=$(grep -c -- "---END_MAIL---" "$FAKE_MAIL_OUT")
+ZSM_CONFIG_FILE="$FAKE_CFG" \
+ZSM_NOW_EPOCH="$STOP_EPOCH" \
+ZSM_POSTQUEUE_CMD="$EMPTY_PQ" \
+ZSM_ZMPROV_CMD="$MOCK_ZMPROV" \
+ZSM_SENDMAIL_CMD="$MOCK_SENDMAIL" \
+ZSM_CURL_CMD="$MOCK_CURL" \
+ZSM_DIG_CMD="$MOCK_DIG" \
+ZSM_HOST_CMD="/nonexistent/host" \
+ZSM_NSLOOKUP_CMD="/nonexistent/nslookup" \
+ZSM_HOSTNAME_CMD="$MOCK_HOSTNAME" \
+ZSM_HOSTNAME="mail.company.com" \
+bash "$MONITOR_BIN" --run
+
+MAIL_AFTER_CLEAR=$(grep -c -- "---END_MAIL---" "$FAKE_MAIL_OUT")
+if [[ "$MAIL_BEFORE_CLEAR" != "$MAIL_AFTER_CLEAR" ]]; then
+    echo " -> [FAIL] Alerts did not stop after queue was cleared!"
+    exit 1
+fi
+echo " -> [PASS] Alerts stopped automatically once queue was cleared."
 
 echo "=== [6/8] Verifying Admin --unlock Cutoff & Recovery to NORMAL ==="
 UNLOCK_EPOCH=$(( FIXED_EPOCH + 300 ))
