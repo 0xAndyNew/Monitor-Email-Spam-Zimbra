@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# AUTOMATED TEST SUITE FOR ZIMBRA-SPAM-MONITOR v1.2.1
+# AUTOMATED TEST SUITE FOR ZIMBRA-SPAM-MONITOR v1.2.2
 # Verifies:
 # 1. Bash syntax & 100% ASCII encoding across all packaged files & README
-# 2. Binary structure of .deb & .rpm packages (v1.2.1-1)
+# 2. Binary structure of .deb & .rpm packages (v1.2.2-1)
 # 3. Zimbra Amavis double-Queue-ID correlation (zero 2x double counting, keeps IP)
 # 4. Multi-signal detection (Msgs, Rcpts, Uniq Rcpts, Failed Rate, Botnet IPs,
 #    External Spoofing, Amavis SPAM/RBL) + False-Positive protections:
@@ -55,8 +55,8 @@ for f in ascii_files:
     non_ascii = [b for b in raw if b > 127]
     assert not non_ascii, f"Non-ASCII bytes found in {f}"
 
-deb_path = root / "zimbra-spam-monitor_1.2.1-1_all.deb"
-rpm_path = root / "zimbra-spam-monitor-1.2.1-1.noarch.rpm"
+deb_path = root / "zimbra-spam-monitor_1.2.2-1_all.deb"
+rpm_path = root / "zimbra-spam-monitor-1.2.2-1.noarch.rpm"
 
 assert deb_path.exists() and deb_path.stat().st_size > 5000, "Missing or empty .deb"
 assert rpm_path.exists() and rpm_path.stat().st_size > 5000, "Missing or empty .rpm"
@@ -85,7 +85,7 @@ assert cpio_raw.startswith(b"070701"), "Invalid CPIO newc header inside RPM"
 assert b"./usr/bin/zimbra-spam-monitor" in cpio_raw, "Missing binary in RPM CPIO"
 assert b"./etc/zimbra-spam-monitor/config.conf" in cpio_raw, "Missing config.conf in RPM CPIO"
 assert b"TRAILER!!!" in cpio_raw, "Missing CPIO TRAILER"
-print(" -> [PASS] 100% ASCII encoding & valid v1.2.1 .deb / .rpm binary structures verified.")
+print(" -> [PASS] 100% ASCII encoding & valid v1.2.2 .deb / .rpm binary structures verified.")
 PYEOF
 
 echo "=== [3/8] Setting up simulated Zimbra + Postfix + Amavis environment ==="
@@ -176,6 +176,13 @@ for i in $(seq 1 180); do
     fi
 done
 
+# Case I: Local Webmail spammer connecting via LAN IP [10.2.1.23] without SASL (65 msgs -> WARNING, Source IPs: webmail/local)
+for i in $(seq 1 65); do
+    printf "Nov  8 14:59:10 mail postfix/smtpd[1005]: QWEB%03d: client=mail.company.com[10.2.1.23]\n" "$i" >> "$FAKE_LOG"
+    printf "Nov  8 14:59:10 mail postfix/qmgr[1002]: QWEB%03d: from=<webmail_warn@company.com>, size=1300, nrcpt=1 (queue active)\n" "$i" >> "$FAKE_LOG"
+    printf "Nov  8 14:59:11 mail postfix/smtp[1004]: QWEB%03d: to=<ext%d@gmail.com>, relay=mx.gmail.com[142.250.1.1]:25, delay=0.4, status=sent (250 OK)\n" "$i" "$i" >> "$FAKE_LOG"
+done
+
 echo "marketing@company.com" > "$FAKE_WL"
 
 MOCK_PQ="$TEST_TMP/mock_postqueue.sh"
@@ -219,6 +226,29 @@ exit 0
 EOF
 chmod +x "$MOCK_CURL"
 
+MOCK_HOSTNAME="$TEST_TMP/mock_hostname.sh"
+cat << 'EOF' > "$MOCK_HOSTNAME"
+#!/usr/bin/env bash
+if [[ "$1" == "-I" ]]; then
+    echo "10.2.1.23"
+else
+    echo "mail.company.com"
+fi
+EOF
+chmod +x "$MOCK_HOSTNAME"
+
+MOCK_DIG="$TEST_TMP/mock_dig.sh"
+cat << 'EOF' > "$MOCK_DIG"
+#!/usr/bin/env bash
+if [[ "$*" == *"@1.1.1.1"* || "$*" == *"@8.8.8.8"* ]]; then
+    echo "edge.company.com."
+    echo "103.56.158.99"
+else
+    echo "10.2.1.23"
+fi
+EOF
+chmod +x "$MOCK_DIG"
+
 cp "$ROOT_DIR/config/config.conf" "$FAKE_CFG"
 sed -i "s|^ZIMBRA_LOG_FILE=.*|ZIMBRA_LOG_FILE=\"$FAKE_LOG\"|" "$FAKE_CFG"
 sed -i "s|^INTERNAL_DOMAINS=.*|INTERNAL_DOMAINS=\"company.com\"|" "$FAKE_CFG"
@@ -238,6 +268,10 @@ ZSM_POSTQUEUE_CMD="$MOCK_PQ" \
 ZSM_ZMPROV_CMD="$MOCK_ZMPROV" \
 ZSM_SENDMAIL_CMD="$MOCK_SENDMAIL" \
 ZSM_CURL_CMD="$MOCK_CURL" \
+ZSM_DIG_CMD="$MOCK_DIG" \
+ZSM_HOST_CMD="/nonexistent/host" \
+ZSM_NSLOOKUP_CMD="/nonexistent/nslookup" \
+ZSM_HOSTNAME_CMD="$MOCK_HOSTNAME" \
 ZSM_HOSTNAME="mail.company.com" \
 bash "$MONITOR_BIN" --run
 
@@ -265,6 +299,8 @@ done
 echo " -> [PASS] Zero false positives on Amavis 2-hop, Postfix old retries (delay=1800), internal aliases, and whitelist."
 
 # Verify exact metrics & formatting in generated alerts
+grep -q "Server        : mail.company.com (103.56.158.99)" "$FAKE_MAIL_OUT"
+grep -q "webmail_warn@company.com" "$FAKE_MAIL_OUT"
 grep -q "ACCOUNT SPAM METRICS (LAST 5 MINS)" "$FAKE_MAIL_OUT"
 grep -q "Messages Sent : 180 msgs" "$FAKE_MAIL_OUT"
 grep -q "Recipients    : 180 total (Unique: 180 | Domains: 10)" "$FAKE_MAIL_OUT"
@@ -272,7 +308,7 @@ grep -q "Failed Rate   : 66.7% (120/180 failed)" "$FAKE_MAIL_OUT"
 grep -q "5 IPs" "$FAKE_MAIL_OUT"
 grep -q "Amavis SPAM: 12 | Spoof From: 12" "$FAKE_MAIL_OUT"
 grep -q "91.214.124.88 (1 IP)" "$FAKE_MAIL_OUT"
-echo " -> [PASS] Alert view verified (Messages Sent, Recipients, Unique/Domains, Failed Rate, Source IPs, Amavis/Spoof/RBL)."
+echo " -> [PASS] Alert view verified (DNS public IP 103.56.158.99, LAN webmail preserved, all 8 metrics intact)."
 
 echo "=== [5/8] Verifying Cooldown & Duplicate zmprov Prevention ==="
 LOCK_CALLS_BEFORE=$(wc -l < "$FAKE_ZMPROV_OUT")
@@ -332,17 +368,35 @@ if [[ "$MAIL_BEFORE_RECOVERY" != "$MAIL_AFTER_RECOVERY" ]]; then
 fi
 echo " -> [PASS] Unlocked account sending < threshold emails treated as NORMAL immediately."
 
-echo "=== [7/8] Verifying --status Live 5m Dashboard ==="
+echo "=== [7/8] Verifying --status Live 5m Dashboard & DNS Server IP ==="
 STATUS_OUT=$(ZSM_CONFIG_FILE="$FAKE_CFG" \
 ZSM_NOW_EPOCH="$FIXED_EPOCH" \
 ZSM_POSTQUEUE_CMD="$MOCK_PQ" \
+ZSM_DIG_CMD="$MOCK_DIG" \
+ZSM_HOST_CMD="/nonexistent/host" \
+ZSM_NSLOOKUP_CMD="/nonexistent/nslookup" \
+ZSM_HOSTNAME_CMD="$MOCK_HOSTNAME" \
 ZSM_HOSTNAME="mail.company.com" \
 bash "$MONITOR_BIN" --status)
 
 echo "$STATUS_OUT" | grep -q "LIVE SYSTEM STATUS (LAST 5 MINS)"
+echo "$STATUS_OUT" | grep -q "Zimbra Server   : mail.company.com (103.56.158.99)"
 echo "$STATUS_OUT" | grep -q "hacked_user@company.com"
 echo "$STATUS_OUT" | grep -q "normal@company.com         | 5     | 5 (5)"
-echo " -> [PASS] --status output verified (Amavis 2-hop counted as 5, not 10)."
+
+# Also verify manual SERVER_IP override in config.conf takes precedence
+CFG_MANUAL_IP="$TEST_TMP/config_manual_ip.conf"
+cp "$FAKE_CFG" "$CFG_MANUAL_IP"
+sed -i 's|^SERVER_IP=.*|SERVER_IP="203.0.113.77"|' "$CFG_MANUAL_IP"
+STATUS_MANUAL=$(ZSM_CONFIG_FILE="$CFG_MANUAL_IP" \
+ZSM_NOW_EPOCH="$FIXED_EPOCH" \
+ZSM_POSTQUEUE_CMD="$MOCK_PQ" \
+ZSM_DIG_CMD="$MOCK_DIG" \
+ZSM_HOSTNAME_CMD="$MOCK_HOSTNAME" \
+ZSM_HOSTNAME="mail.company.com" \
+bash "$MONITOR_BIN" --status)
+echo "$STATUS_MANUAL" | grep -q "Zimbra Server   : mail.company.com (203.0.113.77)"
+echo " -> [PASS] --status output verified (DNS resolved IP 103.56.158.99, manual SERVER_IP override 203.0.113.77, Amavis 2-hop=5)."
 
 echo "=== [8/8] Verifying Streamlined Control Panel Menu (--text-menu) ==="
 # Navigate:
@@ -356,6 +410,11 @@ ZSM_CONFIG_FILE="$FAKE_CFG" \
 ZSM_ZMPROV_CMD="$MOCK_ZMPROV" \
 ZSM_SENDMAIL_CMD="$MOCK_SENDMAIL" \
 ZSM_CURL_CMD="$MOCK_CURL" \
+ZSM_DIG_CMD="$MOCK_DIG" \
+ZSM_HOST_CMD="/nonexistent/host" \
+ZSM_NSLOOKUP_CMD="/nonexistent/nslookup" \
+ZSM_HOSTNAME_CMD="$MOCK_HOSTNAME" \
+ZSM_HOSTNAME="mail.company.com" \
 ZSM_UI_MODE="text" \
 bash "$MONITOR_BIN" --text-menu >/dev/null 2>&1
 

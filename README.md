@@ -1,4 +1,4 @@
-# Zimbra Outbound Spam Monitor (`zimbra-spam-monitor` v1.2.1)
+# Zimbra Outbound Spam Monitor (`zimbra-spam-monitor` v1.2.2)
 
 Multi-signal outbound email spam detection, alerting (**Telegram** + **Email**), and automatic compromised account locking tool for **Zimbra Collaboration Suite (ZCS)** on Linux.
 
@@ -8,21 +8,21 @@ Designed specifically for production Zimbra Linux servers with **near-zero CPU/R
 
 ## 1. Quick Installation from GitHub Releases (`.rpm` & `.deb`)
 
-Releases page: https://github.com/0xAndyNew/Monitor-Email-Spam-Zimbra/releases/tag/v1.2.1
+Releases page: https://github.com/0xAndyNew/Monitor-Email-Spam-Zimbra/releases/tag/v1.2.2
 
 ### A. RHEL / CentOS / Rocky Linux / AlmaLinux (`.rpm`)
 Run as `root` on your Zimbra server:
 ```bash
-wget -O zimbra-spam-monitor-1.2.1-1.noarch.rpm https://github.com/0xAndyNew/Monitor-Email-Spam-Zimbra/releases/download/v1.2.1/zimbra-spam-monitor-1.2.1-1.noarch.rpm
-rpm -Uvh zimbra-spam-monitor-1.2.1-1.noarch.rpm
+wget -O zimbra-spam-monitor-1.2.2-1.noarch.rpm https://github.com/0xAndyNew/Monitor-Email-Spam-Zimbra/releases/download/v1.2.2/zimbra-spam-monitor-1.2.2-1.noarch.rpm
+rpm -Uvh zimbra-spam-monitor-1.2.2-1.noarch.rpm
 ```
-*(Or: `yum localinstall -y zimbra-spam-monitor-1.2.1-1.noarch.rpm`)*
+*(Or: `yum localinstall -y zimbra-spam-monitor-1.2.2-1.noarch.rpm`)*
 
 ### B. Ubuntu / Debian (`.deb`)
 Run as `root` on your Zimbra server:
 ```bash
-wget -O zimbra-spam-monitor_1.2.1-1_all.deb https://github.com/0xAndyNew/Monitor-Email-Spam-Zimbra/releases/download/v1.2.1/zimbra-spam-monitor_1.2.1-1_all.deb
-dpkg -i zimbra-spam-monitor_1.2.1-1_all.deb
+wget -O zimbra-spam-monitor_1.2.2-1_all.deb https://github.com/0xAndyNew/Monitor-Email-Spam-Zimbra/releases/download/v1.2.2/zimbra-spam-monitor_1.2.2-1_all.deb
+dpkg -i zimbra-spam-monitor_1.2.2-1_all.deb
 ```
 
 ---
@@ -64,7 +64,7 @@ zimbra-spam-monitor
 ### Main Control Panel (6 Clean Items):
 ```text
 ==============================================================================
- ZIMBRA SPAM MONITOR v1.2.1
+ ZIMBRA SPAM MONITOR v1.2.2
 ------------------------------------------------------------------------------
  Service: ON | Check: Every 5 mins | Auto-Lock: ON | TG: ON | Mail: ON
 ------------------------------------------------------------------------------

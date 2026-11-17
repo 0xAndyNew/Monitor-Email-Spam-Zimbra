@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # ==============================================================================
 # ZIMBRA OUTBOUND SPAM MONITOR & ALERT SYSTEM (zimbra-spam-monitor)
-# Version: 1.2.1
+# Version: 1.2.2
 # Supported OS: RHEL / CentOS / Rocky / AlmaLinux (.rpm) & Ubuntu / Debian (.deb)
 #
 # Features:
@@ -20,7 +20,7 @@
 
 set -u
 
-VERSION="1.2.1"
+VERSION="1.2.2"
 DEFAULT_CONFIG_FILE="/etc/zimbra-spam-monitor/config.conf"
 CONFIG_FILE="${ZSM_CONFIG_FILE:-$DEFAULT_CONFIG_FILE}"
 CRON_FILE="${ZSM_CRON_FILE:-/etc/cron.d/zimbra-spam-monitor}"
@@ -33,6 +33,7 @@ ZIMBRA_LOG_FILE="/var/log/zimbra.log"
 LOG_TAIL_LINES=200000
 COUNT_INTERNAL_TO_INTERNAL="false"
 INTERNAL_DOMAINS="auto"
+SERVER_IP="auto"
 
 LOOKBACK_MINUTES=5
 ALERT_COOLDOWN_MINUTES=30
@@ -98,7 +99,14 @@ ZSM_ZMPROV_CMD="${ZSM_ZMPROV_CMD:-}"
 ZSM_SENDMAIL_CMD="${ZSM_SENDMAIL_CMD:-}"
 ZSM_CURL_CMD="${ZSM_CURL_CMD:-curl}"
 ZSM_HOSTNAME="${ZSM_HOSTNAME:-}"
+ZSM_SERVER_IP="${ZSM_SERVER_IP:-}"
+ZSM_DIG_CMD="${ZSM_DIG_CMD:-dig}"
+ZSM_HOST_CMD="${ZSM_HOST_CMD:-host}"
+ZSM_NSLOOKUP_CMD="${ZSM_NSLOOKUP_CMD:-nslookup}"
+ZSM_HOSTNAME_CMD="${ZSM_HOSTNAME_CMD:-hostname}"
 ZSM_UI_MODE="${ZSM_UI_MODE:-auto}" # "auto", "tui" (whiptail/dialog), or "text"
+_CACHED_SERVER_IP=""
+_CACHED_SERVER_IP_KEY=""
 
 # ANSI Colors for Text Menu
 if [[ -t 1 || -t 2 ]]; then
@@ -146,6 +154,7 @@ ZIMBRA_LOG_FILE="${ZIMBRA_LOG_FILE}"
 LOG_TAIL_LINES=${LOG_TAIL_LINES}
 COUNT_INTERNAL_TO_INTERNAL="${COUNT_INTERNAL_TO_INTERNAL}"
 INTERNAL_DOMAINS="${INTERNAL_DOMAINS}"
+SERVER_IP="${SERVER_IP}"
 LOOKBACK_MINUTES=${LOOKBACK_MINUTES}
 ALERT_COOLDOWN_MINUTES=${ALERT_COOLDOWN_MINUTES}
 WARN_MESSAGES_SENT=${WARN_MESSAGES_SENT}
@@ -236,24 +245,135 @@ get_server_hostname() {
         hn=$(awk -F'[<>]' '/name="zimbra_server_hostname"/{getline; if ($2 == "value") print $3}' /opt/zimbra/conf/localconfig.xml 2>/dev/null | head -n 1)
     fi
     if [[ -z "$hn" ]]; then
-        hn=$(hostname -f 2>/dev/null || hostname 2>/dev/null || echo "zimbra-server")
+        hn=$("$ZSM_HOSTNAME_CMD" -f 2>/dev/null || "$ZSM_HOSTNAME_CMD" 2>/dev/null || echo "zimbra-server")
     fi
     echo "$hn"
 }
 
-get_server_ip() {
+is_valid_ipv4() {
+    [[ "$1" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]
+}
+
+is_private_ipv4() {
+    local ip="$1"
+    [[ "$ip" =~ ^10\. ]] || \
+    [[ "$ip" =~ ^127\. ]] || \
+    [[ "$ip" =~ ^192\.168\. ]] || \
+    [[ "$ip" =~ ^169\.254\. ]] || \
+    [[ "$ip" =~ ^172\.(1[6-9]|2[0-9]|3[0-1])\. ]]
+}
+
+# Query DNS directly (bypasses /etc/hosts) using dig, host, or nslookup
+dns_lookup_ipv4() {
+    local domain="$1"
+    local resolver="${2:-}"
     local ip=""
-    ip=$(hostname -I 2>/dev/null | awk '{print $1}')
+
+    if command -v "$ZSM_DIG_CMD" >/dev/null 2>&1; then
+        if [[ -n "$resolver" ]]; then
+            ip=$("$ZSM_DIG_CMD" +short +time=2 +tries=1 "@${resolver}" A "$domain" 2>/dev/null | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' | head -n 1)
+        else
+            ip=$("$ZSM_DIG_CMD" +short +time=2 +tries=1 A "$domain" 2>/dev/null | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' | head -n 1)
+        fi
+        if is_valid_ipv4 "$ip"; then
+            echo "$ip"
+            return 0
+        fi
+    fi
+
+    if command -v "$ZSM_HOST_CMD" >/dev/null 2>&1; then
+        if [[ -n "$resolver" ]]; then
+            ip=$("$ZSM_HOST_CMD" -W 2 -t A "$domain" "$resolver" 2>/dev/null | awk '/has address/ {print $4; exit}')
+        else
+            ip=$("$ZSM_HOST_CMD" -W 2 -t A "$domain" 2>/dev/null | awk '/has address/ {print $4; exit}')
+        fi
+        if is_valid_ipv4 "$ip"; then
+            echo "$ip"
+            return 0
+        fi
+    fi
+
+    if command -v "$ZSM_NSLOOKUP_CMD" >/dev/null 2>&1; then
+        if [[ -n "$resolver" ]]; then
+            ip=$("$ZSM_NSLOOKUP_CMD" -timeout=2 "$domain" "$resolver" 2>/dev/null | awk '/^Name:/{in_ans=1} in_ans && /^Address:/{ip=$2; sub(/#.*/, "", ip); if (ip ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/) {print ip; exit}}')
+        else
+            ip=$("$ZSM_NSLOOKUP_CMD" -timeout=2 "$domain" 2>/dev/null | awk '/^Name:/{in_ans=1} in_ans && /^Address:/{ip=$2; sub(/#.*/, "", ip); if (ip ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/) {print ip; exit}}')
+        fi
+        if is_valid_ipv4 "$ip"; then
+            echo "$ip"
+            return 0
+        fi
+    fi
+
+    return 1
+}
+
+get_server_ip() {
+    if [[ -n "$ZSM_SERVER_IP" ]]; then
+        echo "$ZSM_SERVER_IP"
+        return
+    fi
+    if [[ -n "${SERVER_IP:-}" && "$SERVER_IP" != "auto" ]]; then
+        echo "$SERVER_IP"
+        return
+    fi
+
+    local srv_host cache_key
+    srv_host=$(get_server_hostname)
+    cache_key="${ZSM_SERVER_IP}|${SERVER_IP:-auto}|${srv_host}|${ZSM_DIG_CMD}|${ZSM_HOST_CMD}|${ZSM_NSLOOKUP_CMD}"
+    if [[ -n "${_CACHED_SERVER_IP:-}" && "${_CACHED_SERVER_IP_KEY:-}" == "$cache_key" ]]; then
+        echo "$_CACHED_SERVER_IP"
+        return
+    fi
+
+    local ip=""
+    local pub_ip=""
+    if [[ -n "$srv_host" && "$srv_host" != "localhost" ]]; then
+        ip=$(dns_lookup_ipv4 "$srv_host" || true)
+        # If local DNS returns a private/NAT IP (e.g. Split-DNS) or fails, query public DNS
+        if [[ -z "$ip" ]] || is_private_ipv4 "$ip"; then
+            local resolver
+            for resolver in 1.1.1.1 8.8.8.8; do
+                pub_ip=$(dns_lookup_ipv4 "$srv_host" "$resolver" || true)
+                if is_valid_ipv4 "$pub_ip" && ! is_private_ipv4 "$pub_ip"; then
+                    ip="$pub_ip"
+                    break
+                fi
+            done
+        fi
+        if [[ -z "$ip" ]] && command -v getent >/dev/null 2>&1; then
+            ip=$(getent ahostsv4 "$srv_host" 2>/dev/null | awk 'NR==1 {print $1}')
+        fi
+    fi
+
+    if [[ -z "$ip" ]]; then
+        ip=$("$ZSM_HOSTNAME_CMD" -I 2>/dev/null | awk '{print $1}')
+    fi
     if [[ -z "$ip" ]]; then
         ip="127.0.0.1"
     fi
+
     echo "$ip"
+}
+
+get_local_ips() {
+    local lip=""
+    local dns_ip=""
+    lip=$("$ZSM_HOSTNAME_CMD" -I 2>/dev/null || true)
+    dns_ip=$(get_server_ip)
+    echo "${lip} ${dns_ip}"
 }
 
 # Fast auto-detection of Zimbra localconfig XML without spawning JVM
 resolve_zimbra_settings() {
     local srv_host
     srv_host=$(get_server_hostname)
+    local ip_cache_key="${ZSM_SERVER_IP}|${SERVER_IP:-auto}|${srv_host}|${ZSM_DIG_CMD}|${ZSM_HOST_CMD}|${ZSM_NSLOOKUP_CMD}"
+    if [[ "${_CACHED_SERVER_IP_KEY:-}" != "$ip_cache_key" ]]; then
+        _CACHED_SERVER_IP=""
+        _CACHED_SERVER_IP=$(get_server_ip)
+        _CACHED_SERVER_IP_KEY="$ip_cache_key"
+    fi
     if [[ "$srv_host" == *.*.* ]]; then
         RESOLVED_DEFAULT_DOMAIN="${srv_host#*.}"
     else
@@ -715,8 +835,8 @@ analyze_zimbra_log() {
     local now_epoch="${ZSM_NOW_EPOCH:-$(date +%s)}"
     local cur_year
     cur_year=$(date -d "@$now_epoch" '+%Y' 2>/dev/null || date '+%Y')
-    local srv_ip
-    srv_ip=$(get_server_ip)
+    local local_ips
+    local_ips=$(get_local_ips)
     local unlock_file="$STATE_DIR/unlock_cutoff.db"
 
     tail -n "$LOG_TAIL_LINES" "$ZIMBRA_LOG_FILE" 2>/dev/null | awk \
@@ -726,7 +846,7 @@ analyze_zimbra_log() {
         -v count_internal="$COUNT_INTERNAL_TO_INTERNAL" \
         -v internal_domains="$RESOLVED_INTERNAL_DOMAINS" \
         -v default_domain="$RESOLVED_DEFAULT_DOMAIN" \
-        -v srv_ip="$srv_ip" \
+        -v local_ips="$local_ips" \
         -v amavis_thresh="$AMAVIS_SPAM_SCORE_THRESHOLD" \
         -v unlock_file="$unlock_file" \
         -v sys_file="$sys_sum_file" '
@@ -734,6 +854,11 @@ analyze_zimbra_log() {
         win_cutoff = now_epoch - (win_mins * 60)
         sys_tot = 0; sys_snt = 0; sys_def = 0; sys_bnc = 0
         amavis_limit = amavis_thresh + 0
+
+        n_lip = split(local_ips, lip_arr, /[[:space:],]+/)
+        for (i = 1; i <= n_lip; i++) {
+            if (lip_arr[i] != "") is_local_ip[lip_arr[i]] = 1
+        }
 
         split("Jan Feb Mar Apr May Jun Jul Aug Sep Oct Nov Dec", mnames, " ")
         for (i = 1; i <= 12; i++) {
@@ -901,7 +1026,7 @@ analyze_zimbra_log() {
                     cip = substr(cip, RSTART + 1, RLENGTH - 2)
                 }
             }
-            if (qid != "" && (cip == "127.0.0.1" || cip == "::1" || cip == srv_ip)) {
+            if (qid != "" && (cip == "127.0.0.1" || cip == "::1" || (cip in is_local_ip))) {
                 q_local_client[qid] = 1
                 if (!(qid in q_root)) q_root[qid] = qid
                 if (!(qid in q_birth_ts)) q_birth_ts[qid] = ts
