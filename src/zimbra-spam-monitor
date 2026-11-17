@@ -29,6 +29,7 @@ CRON_FILE="${ZSM_CRON_FILE:-/etc/cron.d/zimbra-spam-monitor}"
 # DEFAULT CONFIGURATION (Overridden by /etc/zimbra-spam-monitor/config.conf)
 # ==============================================================================
 MONITOR_ENABLED="true"
+SERVER_PUBLIC_IP="auto"
 ZIMBRA_LOG_FILE="/var/log/zimbra.log"
 LOG_TAIL_LINES=200000
 COUNT_INTERNAL_TO_INTERNAL="false"
@@ -150,6 +151,7 @@ ensure_config_file_exists() {
     if [[ ! -f "$CONFIG_FILE" ]]; then
         cat <<EOF > "$CONFIG_FILE"
 MONITOR_ENABLED="${MONITOR_ENABLED}"
+SERVER_PUBLIC_IP="${SERVER_PUBLIC_IP}"
 ZIMBRA_LOG_FILE="${ZIMBRA_LOG_FILE}"
 LOG_TAIL_LINES=${LOG_TAIL_LINES}
 COUNT_INTERNAL_TO_INTERNAL="${COUNT_INTERNAL_TO_INTERNAL}"
@@ -315,6 +317,10 @@ get_server_ip() {
     fi
     if [[ -n "${SERVER_IP:-}" && "$SERVER_IP" != "auto" ]]; then
         echo "$SERVER_IP"
+        return
+    fi
+    if [[ -n "${SERVER_PUBLIC_IP:-}" && "$SERVER_PUBLIC_IP" != "auto" ]]; then
+        echo "$SERVER_PUBLIC_IP"
         return
     fi
 

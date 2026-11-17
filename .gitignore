@@ -1,0 +1,29 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Test artifacts and temporary files
+*.tmp
+/tmp/
+test_tmp/
+.pytest_cache/
+
+# Local cache & logs (when developing/testing locally)
+*.log
+*.cache
+/var/
+/etc/
+
+# OS generated files
+.DS_Store
+Thumbs.db
+ehthumbs.db
+desktop.ini
+
+# IDE & Editor folders
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
