@@ -7,6 +7,8 @@
 
 Ultra-lightweight multi-signal & multi-window outbound email spam detection, alerting (**Telegram** + **Email** + **Webhook** + **JSONL**), and automatic single-account locking tool for **Zimbra Collaboration Suite (ZCS)** on Linux.
 
+> **Vietnamese Guide:** [Doc Huong Dan Su Dung & Van Hanh Tieng Viet (HDSD.md)](HDSD.md)
+
 Built specifically for production single-server and multi-domain Zimbra servers with **ultra-low CPU/RAM footprint** (early timestamp pruning, per-second `mktime()` cache, C-speed `grep` pre-filters, native `ldapsearch` domain cache, zero background daemons, zero periodic JVM calls, self `renice`/`ionice`) and a **100% ASCII-safe English Interactive Control Panel**.
 
 ---
@@ -63,10 +65,11 @@ dpkg -i zimbra-spam-monitor_1.3.1-1_all.deb
 - **Zero False-Lock Protections**:
   - Single legitimate CC/BCC announcements (`Msgs < 10`) never trigger `CRITICAL` auto-lock; Spoof & Amavis counts are per unique message (`root_qid`), not multiplied by CC recipients.
   - Auto-forwarding users receiving spam that remote MX (e.g. Gmail) rejects with `5.7.1` from `webmail/local` origin stay `WARNING` only unless accompanied by SASL, spoofing, or volume signals.
+  - Tracks Postfix SMTP (`postfix/smtp[`), delivery error (`postfix/error[`), and single-server internal mailbox delivery post-Amavis (`postfix/lmtp[` on port 7025) while strictly ignoring incoming external deliveries.
   - Mobile 4G/5G users rotating IPs inside the same carrier `/24` subnet count as 1 subnet.
   - Retried `deferred` deliveries for the same `(root_qid, rcpt)` are deduplicated to their final status.
   - Held (`!`) queue messages are excluded from Account Queue thresholds so locked accounts stop re-alerting once held.
-  - Per-account Custom Limits in `whitelist.conf` (`marketing@company.com 500 1000`) allow higher volume while still catching spoofing, malware, or hijacks.
+  - Per-account Custom Limits in `whitelist.conf` (`marketing@company.com 500 1000`) allow higher volume while still catching spoofing or malware, with automatic duplicate removal (`upsert_whitelist_entry`).
 - **Immediate & Resilient Containment**:
   - **Per-Account Cache Flush**: Immediately runs `zmprov fc account <user>` after locking to terminate active Webmail/SOAP/ActiveSync tokens without impacting other users.
   - **Decoupled Remediation**: Lock attempts run before alert cooldown -- if `zmprov` fails transiently, the next cycle retries immediately instead of waiting 30 minutes.
@@ -109,6 +112,20 @@ zimbra-spam-monitor
 ==============================================================================
 ```
 
+### Key Menu Capabilities:
+- **[1] Live Status & Queue**: Real-time table of recent outbound senders, Postfix queue breakdown, and active list of locked accounts (`Locked Accounts: <count> (<list>)`).
+- **[2] Alerts & Test**: Manage Telegram Bot Token, Chat ID, Email alert settings, Webhook integration, and send test alerts.
+- **[3] Spam Limits & Schedule**:
+  - `[1..3]` Check interval, lookback window, and alert cooldown.
+  - `[4]` 5-minute message and recipient thresholds.
+  - `[5]` Failed delivery rate percentage.
+  - `[6]` Postfix queue limit per user.
+  - `[7]` Hourly Limit (1h Low-and-Slow message limits).
+  - `[8]` Composite Risk Score Engine toggle (`ON`/`OFF`).
+- **[4] Unlock & Auto-Lock**: Toggle auto-lock (`AUTO_LOCK_ON_CRITICAL`), manage auto-hold, and unlock accounts with automatic history clearance.
+- **[5] Whitelist & Limits**: Add/remove full bypass (`marketing@domain.com` or `@domain.com`) or Per-Account Custom Limits (`marketing@domain.com 500 1000`) with automatic deduplication.
+- **[6] Logs, RBL & Audit**: Toggle service status, view live logs, inspect events JSONL, run Self-RBL check, or launch the read-only Zimbra posture audit.
+
 ---
 
 ## 4. Direct CLI Commands
@@ -122,6 +139,25 @@ zimbra-spam-monitor --whitelist-add a@b.c       # Full bypass whitelist entry
 zimbra-spam-monitor --whitelist-add a@b.c 500 1000  # Per-account custom WARN/CRIT limits
 zimbra-spam-monitor --check-rbl                 # Read-only DNSBL blacklist check for server IP
 zimbra-spam-monitor --audit                     # 100% read-only Zimbra anti-spam posture audit
+```
+
+### Sample Live Status Output (`--status`):
+```text
+==============================================================================
+ ZIMBRA SPAM MONITOR v1.3.1 - LIVE SYSTEM STATUS (LAST 5 MINS)
+==============================================================================
+ Zimbra Server   : mail.company.com (103.56.158.99)
+ Monitor Status  : ON | Range: 5m | Cooldown: 30m | Auto-Lock: true
+ Alert Channels  : TG=true | Mail=true (admin@company.com) | Webhook=false | Outbox=0
+ Locked Accounts : 0 (None)
+ System Outbound : 12 emails (Sent: 12 | Deferred: 0 | Bounced: 0)
+ Postfix Queue   : 0 emails (Active: 0 | Deferred: 0 | Hold: 0)
+------------------------------------------------------------------------------
+ Sender Account             | Sent  | Rcpts (Deliv) | Fail (%) | Queue | Risk
+------------------------------------------------------------------------------
+ user1@company.com          | 5     | 5 (5)         | 0%       | 0     | 0
+ user2@company.com          | 7     | 7 (7)         | 0%       | 0     | 0
+==============================================================================
 ```
 
 ---
