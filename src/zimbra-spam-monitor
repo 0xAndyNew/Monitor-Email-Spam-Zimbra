@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # ==============================================================================
 # ZIMBRA OUTBOUND SPAM MONITOR & ALERT SYSTEM (zimbra-spam-monitor)
-# Version: 1.3.0
+# Version: 1.3.1
 # Supported OS: RHEL / CentOS / Rocky / AlmaLinux (.rpm) & Ubuntu / Debian (.deb)
 #
 # Safety Guarantee:
@@ -10,7 +10,7 @@
 # - Only writes to its own config/state/log files and locks confirmed CRITICAL
 #   compromised accounts (with optional per-account cache flush & queue hold).
 #
-# Key Capabilities (v1.3.0):
+# Key Capabilities (v1.3.1):
 # 1. Ultra-low CPU/RAM engine: Early timestamp pruning, per-second mktime() cache,
 #    C-speed grep pre-filter for mailbox/audit logs, single-pass whitelist load,
 #    24h Server IP & LDAP Multi-Domain cache (zero periodic JVM), self nice/ionice.
@@ -32,7 +32,7 @@
 
 set -u
 
-VERSION="1.3.0"
+VERSION="1.3.1"
 DEFAULT_CONFIG_FILE="/etc/zimbra-spam-monitor/config.conf"
 CONFIG_FILE="${ZSM_CONFIG_FILE:-$DEFAULT_CONFIG_FILE}"
 CRON_FILE="${ZSM_CRON_FILE:-/etc/cron.d/zimbra-spam-monitor}"
@@ -1098,6 +1098,7 @@ update_and_summarize_rolling_history() {
         r = $4 + 0
         if (s == "" || b < cut_24h || b > now_ts + 300) next
         if ((s in ut) && (b + 300) <= ut[s]) next
+        if (FILENAME == ARGV[1] && (s in ut) && b <= ut[s]) next
         key = b "|" s
         if (!(key in bm) || m > bm[key]) bm[key] = m
         if (!(key in br) || r > br[key]) br[key] = r
@@ -2223,7 +2224,7 @@ analyze_zimbra_log() {
         }
 
         # 3. Local Zimbra Webmail / Trusted Submission (non-SASL smtpd)
-        if (index($0, "postfix/smtpd[") > 0 && index($0, ": client=") > 0) {
+        if ((index($0, "postfix/smtpd[") > 0 || index($0, "/smtpd[") > 0) && index($0, ": client=") > 0) {
             qid = ""
             if (match($0, /: [0-9A-Za-z]+: client=/)) {
                 qid = substr($0, RSTART + 2, RLENGTH - 11)
@@ -2284,8 +2285,8 @@ analyze_zimbra_log() {
             next
         }
 
-        # 5. Postfix Delivery / Amavis Handoff
-        if ((index($0, "postfix/smtp[") > 0 || index($0, "postfix/error[") > 0) && index($0, "to=<") > 0 && index($0, "status=") > 0) {
+        # 5. Postfix Delivery / Amavis Handoff (smtp, error, and internal post-Amavis lmtp)
+        if ((index($0, "postfix/smtp[") > 0 || index($0, "postfix/error[") > 0 || index($0, "postfix/lmtp[") > 0) && index($0, "to=<") > 0 && index($0, "status=") > 0) {
             qid = ""
             if (match($0, /: [0-9A-Za-z]+: to=</)) {
                 qid = substr($0, RSTART + 2, RLENGTH - 8)
@@ -3098,6 +3099,7 @@ _cleanup_run_cycle() {
     if [[ -n "$_RUN_LOCK_DIR" && -d "$_RUN_LOCK_DIR" ]]; then
         rm -rf "$_RUN_LOCK_DIR" 2>/dev/null || true
     fi
+    exec 9>&- 2>/dev/null || true
 }
 
 run_monitor_cycle() {
@@ -3815,12 +3817,20 @@ show_status() {
         outbox_cnt=$(find "$STATE_DIR/outbox" -maxdepth 1 -name '*.msg' 2>/dev/null | wc -l | tr -d ' ')
     fi
 
+    local locked_cnt=0 locked_preview="None"
+    if [[ -s "$STATE_DIR/locked_accounts.db" ]]; then
+        locked_cnt=$(grep -c '[^[:space:]]' "$STATE_DIR/locked_accounts.db" 2>/dev/null || echo "0")
+        locked_preview=$(awk -F'|' 'NF>=1 && $1!="" {printf "%s%s", (c++ ? ", " : ""), $1; if (c>=4) exit}' "$STATE_DIR/locked_accounts.db" 2>/dev/null || echo "None")
+        (( locked_cnt > 4 )) && locked_preview="${locked_preview} (+$(( locked_cnt - 4 )) more)"
+    fi
+
     echo "=============================================================================="
     echo " ZIMBRA SPAM MONITOR v${VERSION} - LIVE SYSTEM STATUS (LAST ${LOOKBACK_MINUTES} MINS)"
     echo "=============================================================================="
     echo " Zimbra Server   : $(get_server_hostname) ($(get_server_ip))"
     echo " Monitor Status  : ${MONITOR_ENABLED} | Range: ${LOOKBACK_MINUTES}m | Cooldown: ${ALERT_COOLDOWN_MINUTES}m | Auto-Lock: ${AUTO_LOCK_ON_CRITICAL}"
     echo " Alert Channels  : TG=${TELEGRAM_ENABLED} | Mail=${EMAIL_ENABLED} (${RESOLVED_EMAIL_TO}) | Webhook=${WEBHOOK_ENABLED} | Outbox=${outbox_cnt}"
+    echo " Locked Accounts : ${locked_cnt} (${locked_preview})"
     echo " System Outbound : ${sys_tot} emails (Sent: ${sys_snt} | Deferred: ${sys_def} | Bounced: ${sys_bnc})"
     echo " Postfix Queue   : ${total_queue} emails (Active: ${active_queue} | Deferred: ${def_queue} | Hold: ${hold_queue})"
     echo "------------------------------------------------------------------------------"
@@ -4388,6 +4398,9 @@ submenu_thresholds() {
         local cur_cron
         cur_cron=$(get_current_cron_interval)
 
+        local risk_label="ON"
+        [[ "$RISK_SCORE_ENABLED" != "true" ]] && risk_label="OFF"
+
         local choice
         choice=$(ui_select_menu "SPAM LIMITS & CHECK SCHEDULE" \
             "Range: ${LOOKBACK_MINUTES}m | 1h Limit: ${WARN_HOURLY_MESSAGES}/${CRIT_HOURLY_MESSAGES} | Cron: ${cur_cron} | Repeat: ${ALERT_COOLDOWN_MINUTES}m" \
@@ -4397,6 +4410,8 @@ submenu_thresholds() {
             "4" "Email Limit (${LOOKBACK_MINUTES}m)   : Warn >= ${WARN_RECIPIENTS} | Lock >= ${CRIT_RECIPIENTS}" \
             "5" "Failed Rate (%)    : Warn >= ${WARN_FAILED_RATE_PCT}% | Lock >= ${CRIT_FAILED_RATE_PCT}%" \
             "6" "Queue Limit / User : Warn >= ${WARN_QUEUE_PER_USER} | Lock >= ${CRIT_QUEUE_PER_USER}" \
+            "7" "Hourly Limit (1h)  : Warn >= ${WARN_HOURLY_MESSAGES} | Lock >= ${CRIT_HOURLY_MESSAGES} msgs" \
+            "8" "Risk Score Engine  : ${risk_label} (Warn >= ${WARN_RISK_SCORE} | Lock >= ${CRIT_RISK_SCORE})" \
             "0" "Back")
 
         local w_val="" cr_val=""
@@ -4480,6 +4495,23 @@ submenu_thresholds() {
                 [[ "$w_val" =~ ^[0-9]+$ ]] && update_cfg_num "WARN_QUEUE_PER_USER" "$w_val"
                 cr_val=$(ui_input_box "CRITICAL QUEUE LIMIT" "Queued emails for 1 user to trigger CRITICAL:" "$CRIT_QUEUE_PER_USER")
                 [[ "$cr_val" =~ ^[0-9]+$ ]] && update_cfg_num "CRIT_QUEUE_PER_USER" "$cr_val"
+                ;;
+            7)
+                w_val=$(ui_input_box "1-HOUR WARNING MESSAGES" "Messages in 1 hour to send WARNING:" "$WARN_HOURLY_MESSAGES")
+                cr_val=$(ui_input_box "1-HOUR CRITICAL LOCK MESSAGES" "Messages in 1 hour to trigger CRITICAL & Lock:" "$CRIT_HOURLY_MESSAGES")
+                if [[ "$w_val" =~ ^[0-9]+$ && "$cr_val" =~ ^[0-9]+$ ]]; then
+                    update_cfg_num "WARN_HOURLY_MESSAGES" "$w_val"
+                    update_cfg_num "CRIT_HOURLY_MESSAGES" "$cr_val"
+                    update_cfg_num "WARN_HOURLY_RECIPIENTS" "$(( (w_val * 5) / 3 ))"
+                    update_cfg_num "CRIT_HOURLY_RECIPIENTS" "$(( (cr_val * 5) / 3 ))"
+                fi
+                ;;
+            8)
+                if [[ "$RISK_SCORE_ENABLED" == "true" ]]; then
+                    update_cfg_var "RISK_SCORE_ENABLED" "false"
+                else
+                    update_cfg_var "RISK_SCORE_ENABLED" "true"
+                fi
                 ;;
             0|"") break ;;
         esac
@@ -4627,6 +4659,42 @@ remove_whitelist_exact() {
     _WL_LOADED=0
 }
 
+# Upsert entry in whitelist.conf: removes any existing entry with the same email/@domain key before adding
+upsert_whitelist_entry() {
+    local entry_line="$1"
+    [[ -z "$entry_line" ]] && return 0
+    mkdir -p "$(dirname "$WHITELIST_FILE")" 2>/dev/null || true
+    touch "$WHITELIST_FILE" 2>/dev/null || true
+
+    local norm_line="${entry_line//:/ }"
+    norm_line="${norm_line//\// }"
+    local entry_key=""
+    read -r entry_key _ <<< "$norm_line"
+    entry_key="${entry_key,,}"
+    [[ -z "$entry_key" ]] && return 0
+
+    local tmp_wl
+    tmp_wl=$(make_safe_tmp "zsm_wlu")
+    awk -v k="$entry_key" '
+        {
+            raw = $0
+            sub(/\r$/, "", raw)
+            clean = raw
+            sub(/#.*/, "", clean)
+            gsub(/^[[:space:]]+|[[:space:]]+$/, "", clean)
+            if (clean != "") {
+                gsub(/[:\/]/, " ", clean)
+                split(clean, parts, /[[:space:]]+/)
+                if (tolower(parts[1]) == k) next
+            }
+            print $0
+        }
+    ' "$WHITELIST_FILE" > "$tmp_wl"
+    printf '%s\n' "$entry_line" >> "$tmp_wl"
+    mv -f "$tmp_wl" "$WHITELIST_FILE"
+    _WL_LOADED=0
+}
+
 submenu_whitelist() {
     while true; do
         load_config
@@ -4656,8 +4724,7 @@ submenu_whitelist() {
                 local new_wl
                 new_wl=$(ui_input_box "ADD TO WHITELIST" "Enter email (marketing@domain.com) or domain (@domain.com):" "")
                 if [[ -n "$new_wl" ]]; then
-                    echo "$new_wl" >> "$WHITELIST_FILE"
-                    _WL_LOADED=0
+                    upsert_whitelist_entry "$new_wl"
                     ui_msg_box "WHITELIST UPDATED" "Added '${new_wl}' to whitelist."
                 fi
                 ;;
@@ -4696,9 +4763,8 @@ submenu_whitelist() {
                     cl_warn=$(ui_input_box "CUSTOM WARN LIMIT (${LOOKBACK_MINUTES}m)" "Warning recipient limit for ${cl_acc}:" "500")
                     cl_crit=$(ui_input_box "CUSTOM CRIT LIMIT (${LOOKBACK_MINUTES}m)" "Critical lock recipient limit for ${cl_acc}:" "1000")
                     if [[ "$cl_warn" =~ ^[0-9]+$ && "$cl_crit" =~ ^[0-9]+$ ]]; then
-                        echo "${cl_acc} ${cl_warn} ${cl_crit}" >> "$WHITELIST_FILE"
-                        _WL_LOADED=0
-                        ui_msg_box "CUSTOM LIMIT ADDED" "Added '${cl_acc} ${cl_warn} ${cl_crit}' to ${WHITELIST_FILE}."
+                        upsert_whitelist_entry "${cl_acc} ${cl_warn} ${cl_crit}"
+                        ui_msg_box "CUSTOM LIMIT ADDED" "Saved '${cl_acc} ${cl_warn} ${cl_crit}' in ${WHITELIST_FILE}."
                     fi
                 fi
                 ;;
@@ -4874,7 +4940,7 @@ case "$ACTION" in
         fi
         load_config
         shift
-        echo "$*" >> "$WHITELIST_FILE"
+        upsert_whitelist_entry "$*"
         echo "[OK] Added '$*' to whitelist (${WHITELIST_FILE})."
         ;;
     --check-rbl|check-rbl)

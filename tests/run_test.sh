@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# AUTOMATED TEST SUITE FOR ZIMBRA-SPAM-MONITOR v1.3.0 (15 STAGES)
+# AUTOMATED TEST SUITE FOR ZIMBRA-SPAM-MONITOR v1.3.1 (15 STAGES)
 # Verifies:
 #  1. Bash syntax & static Zero-Server/OS-Mutation safety audit
-#  2. 100% 7-bit ASCII encoding & valid v1.3.0-1 .deb / .rpm binary structures
+#  2. 100% 7-bit ASCII encoding & valid v1.3.1-1 .deb / .rpm binary structures
 #  3. Simulated single-server Zimbra environment (zimbra/mailbox/audit logs + mocks)
 #  4. Multi-signal scan cycle (--run), Amavis 2-hop, cache flush, exact 5m sys_tot
 #  5. Cooldown, Long Queue IDs, decoupled lock retry on zmprov fail, Held exclusion
@@ -62,7 +62,7 @@ for pat, label in forbidden_patterns:
 print(" -> [PASS] Bash syntax valid & 0 forbidden server/OS mutation commands detected.")
 PYEOF
 
-echo "=== [2/15] Verifying 100% ASCII encoding & v1.3.0 .deb / .rpm structures ==="
+echo "=== [2/15] Verifying 100% ASCII encoding & v1.3.1 .deb / .rpm structures ==="
 "$PY_CMD" - "$ROOT_DIR" << 'PYEOF'
 import gzip, struct, sys
 from pathlib import Path
@@ -86,8 +86,8 @@ for f in ascii_files:
     non_ascii = [b for b in raw if b > 127]
     assert not non_ascii, f"Non-ASCII bytes found in {f}"
 
-deb_path = root / "zimbra-spam-monitor_1.3.0-1_all.deb"
-rpm_path = root / "zimbra-spam-monitor-1.3.0-1.noarch.rpm"
+deb_path = root / "zimbra-spam-monitor_1.3.1-1_all.deb"
+rpm_path = root / "zimbra-spam-monitor-1.3.1-1.noarch.rpm"
 
 assert deb_path.exists() and deb_path.stat().st_size > 5000, "Missing or empty .deb"
 assert rpm_path.exists() and rpm_path.stat().st_size > 5000, "Missing or empty .rpm"
@@ -116,7 +116,7 @@ assert cpio_raw.startswith(b"070701"), "Invalid CPIO newc header inside RPM"
 assert b"./usr/bin/zimbra-spam-monitor" in cpio_raw, "Missing binary in RPM CPIO"
 assert b"./etc/zimbra-spam-monitor/config.conf" in cpio_raw, "Missing config.conf in RPM CPIO"
 assert b"TRAILER!!!" in cpio_raw, "Missing CPIO TRAILER"
-print(" -> [PASS] 100% ASCII encoding & valid v1.3.0-1 .deb / .rpm binary structures verified.")
+print(" -> [PASS] 100% ASCII encoding & valid v1.3.1-1 .deb / .rpm binary structures verified.")
 PYEOF
 
 echo "=== [3/15] Setting up simulated single-server Zimbra environment ==="
@@ -726,11 +726,12 @@ for i in $(seq 1 12); do
     printf "%s mail postfix/smtp[1004]: QSPF%03d: to=<v%d@gmail.com>, relay=mx.gmail.com[1.2.3.4]:25, delay=0.3, status=deferred (421 temp)\n" "$S11_STR" "$i" "$i" >> "$FAKE_LOG"
 done
 
-# 11c: Internal-to-internal Amavis Blocked BANNED malware (must be caught even when COUNT_INTERNAL_TO_INTERNAL=false!)
+# 11c: Internal-to-internal Amavis Blocked BANNED malware via smtp/lmtp (must be caught even when COUNT_INTERNAL_TO_INTERNAL=false!)
 for i in $(seq 1 4); do
     printf "%s mail postfix/submission/smtpd[1001]: QINT%03d: client=office[192.0.2.70], sasl_method=LOGIN, sasl_username=int_malware@company.com\n" "$S11_STR" "$i" >> "$FAKE_LOG"
     printf "%s mail amavis[2001]: (2001-%02d) Blocked BANNED (.exe) {DiscardedInternal}, ORIGINATING [192.0.2.70]:50000 <int_malware@company.com> -> <staff%d@company.com>, Queue-ID: QINT%03d\n" "$S11_STR" "$i" "$i" "$i" >> "$FAKE_LOG"
     printf "%s mail postfix/smtp[1003]: QINT%03d: to=<staff%d@company.com>, relay=127.0.0.1[127.0.0.1]:10024, delay=0.2, status=sent (250 2.7.0 Ok, discarded)\n" "$S11_STR" "$i" "$i" >> "$FAKE_LOG"
+    printf "%s mail postfix/lmtp[1005]: QINT%03d: to=<staff%d@company.com>, relay=mail.company.com[127.0.0.1]:7025, delay=0.1, status=sent (250 2.1.5 Delivery OK)\n" "$S11_STR" "$i" "$i" >> "$FAKE_LOG"
 done
 
 # 11d: Local pickup webshell (uid=33, 22 msgs with external From) + benign root@localhost (30 msgs -> ignored!)
@@ -988,6 +989,7 @@ STATUS_OUT=$(ZSM_CONFIG_FILE="$FAKE_CFG" ZSM_NOW_EPOCH="$FIXED_EPOCH" ZSM_POSTQU
     ZSM_HOSTNAME_CMD="$MOCK_HOSTNAME" ZSM_HOSTNAME="mail.company.com" bash "$MONITOR_BIN" --status)
 echo "$STATUS_OUT" | grep -q "LIVE SYSTEM STATUS (LAST 5 MINS)"
 echo "$STATUS_OUT" | grep -q "Zimbra Server   : mail.company.com (103.56.158.99)"
+echo "$STATUS_OUT" | grep -q "Locked Accounts :"
 echo "$STATUS_OUT" | grep -q "normal@company.com         | 5     | 5 (5)"
 [[ -f "$FAKE_STATE/server_ip.cache" ]] && grep -q "103.56.158.99" "$FAKE_STATE/server_ip.cache"
 
@@ -1005,11 +1007,13 @@ printf "admin@company.com\nsub-admin@company.com\n" > "$FAKE_WL"
 
 # Navigate:
 # [2] Alerts & Test -> [3] Send Test Alert -> Enter -> [0] Back
-# [3] Spam Limits -> [4] Email Limit (120, 240) -> [0] Back
+# [3] Spam Limits -> [4] Email Limit (120, 240)
+#                 -> [7] Hourly Limit (150, 300)
+#                 -> [8] Toggle Risk Score -> [0] Back
 # [5] Whitelist -> [3] Remove -> [1] admin@company.com -> Enter
 #               -> [4] Add Custom Limit -> vip@company.com, 400, 800 -> Enter -> [0] Back
 # [0] Exit
-printf "2\n3\n\n0\n3\n4\n120\n240\n0\n5\n3\n1\n\n4\nvip@company.com\n400\n800\n\n0\n0\n" | \
+printf "2\n3\n\n0\n3\n4\n120\n240\n7\n150\n300\n8\n0\n5\n3\n1\n\n4\nvip@company.com\n400\n800\n\n0\n0\n" | \
 ZSM_CONFIG_FILE="$FAKE_CFG" \
 ZSM_ZMPROV_CMD="$MOCK_ZMPROV" \
 ZSM_SENDMAIL_CMD="$MOCK_SENDMAIL" \
@@ -1026,12 +1030,24 @@ grep -q "^WARN_RECIPIENTS=120" "$FAKE_CFG"
 grep -q "^CRIT_RECIPIENTS=240" "$FAKE_CFG"
 grep -q "^WARN_MESSAGES_SENT=72" "$FAKE_CFG"
 grep -q "^CRIT_MESSAGES_SENT=180" "$FAKE_CFG"
+grep -q "^WARN_HOURLY_MESSAGES=150" "$FAKE_CFG"
+grep -q "^CRIT_HOURLY_MESSAGES=300" "$FAKE_CFG"
+grep -q '^RISK_SCORE_ENABLED="false"' "$FAKE_CFG"
 if grep -qi "^admin@company.com$" "$FAKE_WL"; then
     echo " -> [FAIL] admin@company.com was not removed from whitelist!"
     exit 1
 fi
 grep -q "^sub-admin@company.com$" "$FAKE_WL"
 grep -q "^vip@company.com 400 800$" "$FAKE_WL"
+
+# Verify upsert_whitelist_entry deduplication
+ZSM_CONFIG_FILE="$FAKE_CFG" bash "$MONITOR_BIN" --whitelist-add "vip@company.com 500 1000" >/dev/null
+UP_CNT=$(grep -c -i "^vip@company.com" "$FAKE_WL" || true)
+if [[ "$UP_CNT" -ne 1 ]]; then
+    echo " -> [FAIL] upsert_whitelist_entry created duplicate entry for vip@company.com (count: $UP_CNT)!"
+    exit 1
+fi
+grep -q "^vip@company.com 500 1000$" "$FAKE_WL"
 echo " -> [PASS] Control Panel Menu, custom limit add & exact whitelist removal verified."
 
 echo ""

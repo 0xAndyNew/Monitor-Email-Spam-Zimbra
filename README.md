@@ -1,4 +1,4 @@
-# Zimbra Outbound Spam Monitor (`zimbra-spam-monitor` v1.3.0)
+# Zimbra Outbound Spam Monitor (`zimbra-spam-monitor` v1.3.1)
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Release](https://img.shields.io/github/v/release/0xAndyNew/Monitor-Email-Spam-Zimbra?color=blue)](https://github.com/0xAndyNew/Monitor-Email-Spam-Zimbra/releases)
@@ -22,21 +22,21 @@ Built specifically for production single-server and multi-domain Zimbra servers 
 
 ## 1. Quick Installation from GitHub Releases (`.rpm` & `.deb`)
 
-Releases page: https://github.com/0xAndyNew/Monitor-Email-Spam-Zimbra/releases/tag/v1.3.0
+Releases page: https://github.com/0xAndyNew/Monitor-Email-Spam-Zimbra/releases/tag/v1.3.1
 
 ### A. RHEL / CentOS / Rocky Linux / AlmaLinux (`.rpm`)
 Run as `root` on your Zimbra server:
 ```bash
-wget -O zimbra-spam-monitor-1.3.0-1.noarch.rpm https://github.com/0xAndyNew/Monitor-Email-Spam-Zimbra/releases/download/v1.3.0/zimbra-spam-monitor-1.3.0-1.noarch.rpm
-rpm -Uvh zimbra-spam-monitor-1.3.0-1.noarch.rpm
+wget -O zimbra-spam-monitor-1.3.1-1.noarch.rpm https://github.com/0xAndyNew/Monitor-Email-Spam-Zimbra/releases/download/v1.3.1/zimbra-spam-monitor-1.3.1-1.noarch.rpm
+rpm -Uvh zimbra-spam-monitor-1.3.1-1.noarch.rpm
 ```
-*(Or: `yum localinstall -y zimbra-spam-monitor-1.3.0-1.noarch.rpm`)*
+*(Or: `yum localinstall -y zimbra-spam-monitor-1.3.1-1.noarch.rpm`)*
 
 ### B. Ubuntu / Debian (`.deb`)
 Run as `root` on your Zimbra server:
 ```bash
-wget -O zimbra-spam-monitor_1.3.0-1_all.deb https://github.com/0xAndyNew/Monitor-Email-Spam-Zimbra/releases/download/v1.3.0/zimbra-spam-monitor_1.3.0-1_all.deb
-dpkg -i zimbra-spam-monitor_1.3.0-1_all.deb
+wget -O zimbra-spam-monitor_1.3.1-1_all.deb https://github.com/0xAndyNew/Monitor-Email-Spam-Zimbra/releases/download/v1.3.1/zimbra-spam-monitor_1.3.1-1_all.deb
+dpkg -i zimbra-spam-monitor_1.3.1-1_all.deb
 ```
 
 ---
@@ -95,7 +95,7 @@ zimbra-spam-monitor
 
 ```text
 ==============================================================================
- ZIMBRA SPAM MONITOR v1.3.0
+ ZIMBRA SPAM MONITOR v1.3.1
 ------------------------------------------------------------------------------
  Service: ON | Check: Every 5 mins | Auto-Lock: ON | TG: ON | Mail: ON
 ------------------------------------------------------------------------------
