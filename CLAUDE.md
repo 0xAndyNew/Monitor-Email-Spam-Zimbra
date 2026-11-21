@@ -4,119 +4,92 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-`zimbra-spam-monitor` is a multi-signal outbound email spam detection, alerting (Telegram + Email), and automatic account locking tool for Zimbra Collaboration Suite (ZCS) on Linux. It operates without persistent background daemons, executing via 5-minute cron checks with near-zero CPU/RAM overhead and avoiding unnecessary Zimbra JVM (`zmprov`) invocations.
+`zimbra-spam-monitor` (v1.3.0) is an ultra-lightweight, multi-signal & multi-window outbound email spam detection, alerting (Telegram + Email + Webhook + JSONL), and single-account auto-locking tool for Zimbra Collaboration Suite (ZCS) on Linux. It operates without persistent background daemons via cron checks, minimizes CPU/RAM with early timestamp pruning and per-second `mktime()` caching, and avoids periodic Zimbra JVM (`zmprov`) calls.
+
+## Strict Safety Invariant (Zero Mail Server / OS Mutation)
+
+- NEVER add any command that mutates Mail Server or OS configuration (`postconf -e`, `zmlocalconfig -e`, `zmprov mcf/ms/mc/md/cd/dd`, `zmcontrol`, `postfix reload/restart`, `apt/yum/dnf`, `iptables/nft/firewall-cmd`, `fail2ban-client`, `sysctl -w`, `systemctl`).
+- The automated test suite (`tests/run_test.sh` stage 1) statically scans `src/zimbra-spam-monitor` and fails if any forbidden mutation pattern appears.
+- Only read-only queries (`ldapsearch`, `postqueue -p`, `postconf -h`, DNS lookups, log reads) and targeted single-account remediation (`zmprov ma <validated_email> zimbraAccountStatus locked/active`, `zmprov fc account <validated_email>`, optional `postsuper -h/-H`) are permitted.
 
 ## Common Development Commands
 
 ### Running Tests
 
 ```bash
-# Run the full automated test suite (8 test stages)
+# Run the full 15-stage automated test suite
 bash tests/run_test.sh
 ```
 
-The test suite exercises:
-1. Bash syntax validation (`bash -n`)
-2. 100% ASCII-safe character validation and `.deb`/`.rpm` binary structure inspection
-3. Simulated Zimbra + Postfix + Amavis log environment setup
-4. Multi-signal log scan cycle (`--run`)
-5. Alert cooldown & duplicate `zmprov` lock prevention
-6. Admin `--unlock` cutoff timestamp recovery
-7. `--status` live 5-minute dashboard output
-8. Interactive Control Panel text menu navigation (`--text-menu`)
+The 15 stages cover:
+1. Bash syntax (`bash -n`) & static Zero-Server/OS-Mutation safety audit
+2. 100% 7-bit ASCII encoding & `.deb`/`.rpm` `v1.3.0-1` binary structure inspection
+3. Simulated single-server Zimbra environment (`zimbra.log`, `mailbox.log`, `audit.log` + mocks)
+4. Multi-signal scan (`--run`), Amavis 2-hop correlation, `zmprov fc account`, exact 5m `sys_tot`
+5. Cooldown, Long Queue IDs, decoupled lock retry on `zmprov` failure, Held (`!`) queue exclusion
+6. Locked-account desync recovery (benign external unlock cleanup vs `RE-LOCKED` on active spam)
+7. Security regressions (Command Injection block, `curl` stdin secret hiding, safe `update_cfg_var`)
+8. Counting accuracy (per-message Spoof/Amavis, deduped deferred retries, `status=expired`)
+9. Multi-window Low-and-Slow (`1h` rolling buckets + idempotency across repeated runs)
+10. Single-server `mailbox.log` real Webmail `/24` IPs, mobile 4G `/24` safety, `audit.log` brute-force & auth-after-fail
+11. Auto-forward safeguard, spoofed QID queue hold, internal Amavis malware, local `postfix/pickup` webshell
+12. Per-account Custom Limits, Composite Risk Score, `ldapsearch` multi-domain cache, logrotate `.1`
+13. Self-RBL (`127.255.255.x` query-error guard & state-change alerting), read-only `--audit`, Webhook, JSONL, Outbox retry
+14. Admin `--unlock` (clears rolling history), `--status` dashboard & 24h `server_ip.cache`
+15. Interactive Control Panel (`--text-menu`) & exact whitelist removal
 
-### Syntax & Linting
+### Syntax & Packaging
 
 ```bash
-# Validate Bash scripts syntax
 bash -n src/zimbra-spam-monitor
 bash -n packaging/build-packages.sh
-```
-
-### Building Packages
-
-```bash
-# Build both .deb and .rpm packages using the standalone Python builder
 python3 packaging/build_rpm_deb.py
-
-# Alternatively, via shell wrapper
-bash packaging/build-packages.sh
 ```
 
-Generated packages are placed in the repository root:
-- `zimbra-spam-monitor_<version>-<release>_all.deb`
-- `zimbra-spam-monitor-<version>-<release>.noarch.rpm`
+Generated packages in repository root:
+- `zimbra-spam-monitor_1.3.0-1_all.deb`
+- `zimbra-spam-monitor-1.3.0-1.noarch.rpm`
 
-### Running the CLI Locally / Testing Mocks
-
-The script supports environment variable overrides to test without a live Zimbra installation:
-
-```bash
-# Test status output with mock inputs
-ZSM_CONFIG_FILE="config/config.conf" \
-ZSM_UI_MODE="text" \
-bash src/zimbra-spam-monitor --status
-
-# Test the text-based interactive menu
-ZSM_CONFIG_FILE="config/config.conf" \
-ZSM_UI_MODE="text" \
-bash src/zimbra-spam-monitor --text-menu
-
-# Test background scan with mock utilities
-ZSM_CONFIG_FILE="/path/to/custom.conf" \
-ZSM_NOW_EPOCH=$(date +%s) \
-ZSM_POSTQUEUE_CMD="/path/to/mock_postqueue.sh" \
-ZSM_ZMPROV_CMD="/path/to/mock_zmprov.sh" \
-ZSM_SENDMAIL_CMD="/path/to/mock_sendmail.sh" \
-ZSM_CURL_CMD="curl" \
-bash src/zimbra-spam-monitor --run
-```
+### Local CLI & Mock Environment Variables
 
 Available mock/override environment variables:
-- `ZSM_CONFIG_FILE`: Override path to `config.conf` (default: `/etc/zimbra-spam-monitor/config.conf`)
-- `ZSM_CRON_FILE`: Override path to cron file (default: `/etc/cron.d/zimbra-spam-monitor`)
-- `ZSM_NOW_EPOCH`: Override current system epoch timestamp for deterministic log window testing
-- `ZSM_POSTQUEUE_CMD`: Override `postqueue` executable path
-- `ZSM_ZMPROV_CMD`: Override `zmprov` executable path
-- `ZSM_SENDMAIL_CMD`: Override `sendmail` executable path
-- `ZSM_CURL_CMD`: Override `curl` executable path
-- `ZSM_HOSTNAME`: Override detected hostname
-- `ZSM_SERVER_IP`: Override detected server public IP
-- `ZSM_UI_MODE`: Force UI mode (`auto`, `tui` for whiptail/dialog, `text` for plain numbers)
+- `ZSM_CONFIG_FILE`: Override path to `config.conf`
+- `ZSM_CRON_FILE`: Override path to cron file
+- `ZSM_NOW_EPOCH`: Override epoch timestamp for deterministic window testing
+- `ZSM_POSTQUEUE_CMD`, `ZSM_POSTSUPER_CMD`, `ZSM_POSTCONF_CMD`: Override Postfix binaries
+- `ZSM_ZMPROV_CMD`, `ZSM_LDAPSEARCH_CMD`: Override Zimbra/LDAP binaries
+- `ZSM_SENDMAIL_CMD`, `ZSM_CURL_CMD`: Override mail/HTTP binaries
+- `ZSM_DIG_CMD`, `ZSM_HOST_CMD`, `ZSM_NSLOOKUP_CMD`, `ZSM_HOSTNAME_CMD`: Override DNS/host tools
+- `ZSM_HOSTNAME`, `ZSM_SERVER_IP`: Override hostname / server IP
+- `ZSM_MAILBOX_LOG_FILE`, `ZSM_AUDIT_LOG_FILE`, `ZSM_LOCALCONFIG_FILE`: Override Zimbra file paths
+- `ZSM_TG_RATE_SLEEP`: Override inter-message Telegram sleep seconds (default `1`, `0` in tests)
+- `ZSM_UI_MODE`: Force UI mode (`auto`, `tui`, `text`)
 
 ## Architecture and Structure
 
 ### File Organization
 
-- `src/zimbra-spam-monitor`: Main executable script (monolithic Bash script containing CLI, TUI, log analysis, remediation, and alerting logic).
-- `config/config.conf`: Default configuration template with all detection thresholds, delivery settings, and file paths.
-- `config/whitelist.conf`: Whitelist file containing trusted email addresses and `@domain.com` patterns.
-- `packaging/build_rpm_deb.py`: Pure-Python cross-platform package builder that constructs `.deb` (ar + tar.gz) and `.rpm` (RPM v4 binary format with CPIO payload) without external distro packaging tools.
-- `packaging/zimbra-spam-monitor.spec`: RPM spec file definition for standard rpmbuild environments.
-- `packaging/cron.d/zimbra-spam-monitor`: Cron schedule running `--run` every 5 minutes by default.
-- `packaging/logrotate.d/zimbra-spam-monitor`: Log rotation configuration for `/var/log/zimbra-spam-monitor.log`.
-- `tests/run_test.sh`: Self-contained integration test suite with synthetic log generators and mock Zimbra binaries.
-
-### Multi-Signal Outbound Spam Detection Engine
-
-Detection evaluates an independent lookback window (default `LOOKBACK_MINUTES=5`) over `/var/log/zimbra.log` (`analyze_zimbra_log`) across 8 indicators:
-1. **Messages Sent**: Distinct root queue IDs submitted (`WARN_MESSAGES_SENT=60`, `CRIT_MESSAGES_SENT=150`).
-2. **Total Recipients**: Outbound `to=<...>` deliveries (`WARN_RECIPIENTS=100`, `CRIT_RECIPIENTS=200`, requires `CRIT_MIN_MESSAGES_FOR_BULK=10` to avoid locking single CC/BCC announcements).
-3. **Unique Recipients**: Distinct recipients across external domains (`WARN_UNIQUE_RECIPIENTS=80`, `CRIT_UNIQUE_RECIPIENTS=160`, min 5 external domains).
-4. **Failed Rate (%)**: `(Deferred + Bounced) / Recipients * 100%` (`WARN_FAILED_RATE_PCT=30%` at >= 20 rcpts, `CRIT_FAILED_RATE_PCT=50%` at >= 40 rcpts).
-5. **Distinct Source IPs**: Authenticated client IPs per account (`WARN_SOURCE_IPS=3` at >= 10 msgs, `CRIT_SOURCE_IPS=5` at >= 20 msgs).
-6. **Sender Spoofing**: Mismatch between `sasl_username` and external `From:` address (`WARN_SPOOF_COUNT=3`, `CRIT_SPOOF_COUNT=10`). Legitimate same-domain Zimbra personas/aliases are ignored.
-7. **Amavis SPAM / RBL Rejections**: Amavis spam score >= `AMAVIS_SPAM_SCORE_THRESHOLD` (default 6.0), `INFECTED`, or remote MX `5.7.1`/`4.7.28`/RBL rejections (`WARN_SPAM_SIGNALS=3`, `CRIT_SPAM_SIGNALS=10`).
-8. **Postfix Queue Inspection**: Current queued messages per sender via `postqueue -p` (`WARN_QUEUE_PER_USER=40`, `CRIT_QUEUE_PER_USER=100`, `WARN_TOTAL_QUEUE=300`).
+- `src/zimbra-spam-monitor`: Monolithic Bash executable containing CLI, TUI, ultra-low-RAM log analysis engine, remediation, outbox/alerting, Self-RBL, and read-only `--audit`.
+- `config/config.conf`: Default configuration template (all v1.3.0 knobs have safe defaults in script for seamless v1.2.x upgrades).
+- `config/whitelist.conf`: Supports both full bypass (`email` / `@domain`) and Per-Account Custom Limits (`email WARN CRIT`).
+- `packaging/build_rpm_deb.py`: Pure-Python builder creating `.deb` (ar + tar.gz) and `.rpm` (RPM v4 + CPIO).
+- `packaging/zimbra-spam-monitor.spec`: RPM spec file for `rpmbuild`.
+- `packaging/cron.d/zimbra-spam-monitor`: Default 5-minute cron schedule.
+- `packaging/logrotate.d/zimbra-spam-monitor`: Rotates both `/var/log/zimbra-spam-monitor.log` and `/var/log/zimbra-spam-monitor-events.jsonl`.
+- `tests/run_test.sh`: 15-stage self-contained integration & security test suite.
 
 ### Critical Production Invariants
 
-- **Amavis Double Queue-ID Correlation**: Correlates pre-filter queue ID (`127.0.0.1:10024/10026/10032`) with post-filter queue ID (`queued as <qid2>`) so outbound messages are never double-counted while retaining the originating source IP and `sasl_username`.
-- **Postfix Retry Timestamp Calculation**: Calculates `log_timestamp - delay` to identify true submission time, preventing old deferred mail retries (e.g. `delay=1800`) from being counted as fresh 5-minute outbound spam.
-- **State Management & Cooldown** (`/var/lib/zimbra-spam-monitor`):
-  - `cooldown.db`: Suppresses duplicate alerts for the same account within `ALERT_COOLDOWN_MINUTES=30`. Escalation from `WARNING` to `CRITICAL` bypasses cooldown.
-  - `locked_accounts.db`: Records locked accounts to prevent duplicate `zmprov` JVM executions on subsequent cycles.
-  - `unlock_cutoff.db`: Records unlock cutoff timestamp when an account is unlocked (`--unlock`); log lines prior to this timestamp are excluded.
-  - `public_ip.cache`: Caches resolved public IP address for 24 hours (86,400s) to eliminate recurring network overhead during 5-minute cron checks.
-- **Public IP Resolution & Local Client Safeguard**: Alerts and dashboards display the server's public IP (`SERVER_PUBLIC_IP="auto"`, dynamically looked up via HTTPS and cached for 24 hours). The log analysis engine cross-checks both public IP and local network interface IP to ensure internal Zimbra webmail submissions are reliably identified.
-- **100% ASCII Encoding Rule**: All code, configuration, documentation, and packaging files in this repository must contain strictly 7-bit ASCII characters (byte values 0-127). Non-ASCII characters will break the automated test suite.
+- **Early Timestamp Pruning & `mktime()` Cache**: Lines older than `prune_cutoff = scan_cutoff - 120` are skipped immediately before field splitting, regex, or hash allocation; per-second timestamp keys (`prev_ts_key`) avoid 99.5% of `mktime()` calls.
+- **Amavis Double Queue-ID Correlation & Retry Deduplication**: Links pre-filter (`127.0.0.1`/`localhost`/`[::1]:100xx`) to post-filter `queued as <qid2>`, deduplicates `(acct, root_qid, rcpt)` status transitions in O(1), counts Spoof/Amavis once per unique `root_qid`, and uses `log_time - delay` to ignore old queue retries.
+- **Single-Server Auxiliary Log Correlation**: Pre-filters `mailbox.log` (`smtp - Sending message`) and `audit.log` (`cmd=Auth|authentication failed`) with C-speed `grep` to extract real Webmail `oip=` IPs (counted by `/24` subnet) and detect brute-force / auth-after-fail.
+- **State Directory** (`/var/lib/zimbra-spam-monitor`):
+  - `cooldown.db`: Alert cooldown state (bypassed on WARN->CRITICAL escalation or RE-LOCK).
+  - `locked_accounts.db`: `account|timestamp|lock_epoch` (backward-compatible with 2-field v1.2.x files) with desync self-healing.
+  - `unlock_cutoff.db`: Per-account unlock cutoff epoch.
+  - `rolling_history.db`: Idempotent 5-minute submission buckets (`max`-merged, 24h TTL) for 1h/24h low-and-slow detection.
+  - `server_ip.cache` & `domains.cache`: 24h caches for DNS Server IP and `ldapsearch` hosted domains (zero periodic JVM).
+  - `outbox/`: Retry queue (up to 6 retries / 60m) for failed Telegram/Email/Webhook alerts.
+  - `rbl_state.db` & `rbl_last_check.ts`: Self-RBL state-change tracker.
+  - `attacker_ips.log`: Passive attacker IP log for external SIEM/firewall consumption.
+- **100% 7-Bit ASCII Encoding Rule**: All repository files must strictly contain 7-bit ASCII bytes (0-127).

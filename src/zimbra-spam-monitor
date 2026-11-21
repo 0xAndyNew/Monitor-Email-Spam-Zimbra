@@ -1,44 +1,65 @@
 #!/usr/bin/env bash
 # ==============================================================================
 # ZIMBRA OUTBOUND SPAM MONITOR & ALERT SYSTEM (zimbra-spam-monitor)
-# Version: 1.2.3
+# Version: 1.3.0
 # Supported OS: RHEL / CentOS / Rocky / AlmaLinux (.rpm) & Ubuntu / Debian (.deb)
 #
-# Features:
-# 1. Streamlined Interactive Control Panel (TUI Arrow-Key & Number Menu)
-# 2. Multi-Signal Outbound Spam Engine per short check interval (default 5 mins):
-#    - Messages Sent, Total Recipients, Unique Recipients, External Domains
-#    - Failed Rate ((Deferred + Bounced) / Recipients %) with min floor
-#    - Distinct Source IPs (Botnet detection) & External Sender Spoofing
-#    - Zimbra Amavis (SPAM/SPAMMY/INFECTED/Hits) & Remote RBL/Spam Rejections
-#    - Amavis Queue-ID hop correlation (zero 2x double counting, preserves IP)
-#    - Postfix queue retry awareness via submission timestamps & delay=
-# 3. Inspects Postfix Mail Queue (postqueue -p) per sender & server-wide
-# 4. Sends instant alerts via Telegram Bot API and Email (Local Postfix / SMTP)
-# 5. Auto-locks compromised accounts on CRITICAL without redundant zmprov calls
+# Safety Guarantee:
+# - Strictly READ-ONLY with respect to Mail Server & OS configuration.
+# - NEVER modifies Postfix, Zimbra global/server config, firewall, or OS packages.
+# - Only writes to its own config/state/log files and locks confirmed CRITICAL
+#   compromised accounts (with optional per-account cache flush & queue hold).
+#
+# Key Capabilities (v1.3.0):
+# 1. Ultra-low CPU/RAM engine: Early timestamp pruning, per-second mktime() cache,
+#    C-speed grep pre-filter for mailbox/audit logs, single-pass whitelist load,
+#    24h Server IP & LDAP Multi-Domain cache (zero periodic JVM), self nice/ionice.
+# 2. Multi-Signal + Multi-Window (5m burst + 1h/24h low-and-slow) Spam Detection:
+#    - Messages Sent, Total Recipients (deduped across retries), Unique Recipients
+#    - Failed Rate (sent/deferred/bounced/expired), Distinct /24 Source Subnets
+#    - External Sender Spoofing & Amavis SPAM/INFECTED/BANNED + RBL Rejects
+#    - Local pickup webshell detection & Internal malware/phishing detection
+#    - Single-server mailbox.log real Webmail IP & audit.log Brute-Force/Auth-After-Fail
+#    - Per-Account Custom Limits & Composite Risk Score (0-100)
+#    - Auto-forward false-positive safeguard & Logrotate (.1) continuity
+# 3. Reliable Remediation & Alerting:
+#    - Injection-safe zmprov lock (stdin) + timeout + per-account cache flush
+#    - Decoupled remediation from alert cooldown (retries failed locks next cycle)
+#    - Locked-account desync recovery & spoof-aware Postfix queue hold
+#    - Outbox retry queue, Telegram 429/rate-limit protection, Webhook, JSONL log
+#    - Self-RBL blacklist monitor, Monitor Health Check, & Read-Only --audit
 # ==============================================================================
 
 set -u
 
-VERSION="1.2.3"
+VERSION="1.3.0"
 DEFAULT_CONFIG_FILE="/etc/zimbra-spam-monitor/config.conf"
 CONFIG_FILE="${ZSM_CONFIG_FILE:-$DEFAULT_CONFIG_FILE}"
 CRON_FILE="${ZSM_CRON_FILE:-/etc/cron.d/zimbra-spam-monitor}"
 
 # ==============================================================================
 # DEFAULT CONFIGURATION (Overridden by /etc/zimbra-spam-monitor/config.conf)
+# Backward-compatible with v1.2.x config files on upgrade.
 # ==============================================================================
 MONITOR_ENABLED="true"
 SERVER_PUBLIC_IP="auto"
+SERVER_IP="auto"
 ZIMBRA_LOG_FILE="/var/log/zimbra.log"
+ZIMBRA_MAILBOX_LOG_FILE="/opt/zimbra/log/mailbox.log"
+ZIMBRA_AUDIT_LOG_FILE="/opt/zimbra/log/audit.log"
 LOG_TAIL_LINES=200000
+LOG_MAX_TAIL_LINES=500000
+AUX_LOG_TAIL_LINES=50000
 COUNT_INTERNAL_TO_INTERNAL="false"
 INTERNAL_DOMAINS="auto"
-SERVER_IP="auto"
+AUTO_DISCOVER_ZIMBRA_DOMAINS="true"
+TRUSTED_SUBMISSION_IPS=""
 
 LOOKBACK_MINUTES=5
 ALERT_COOLDOWN_MINUTES=30
+MAX_ALERTS_PER_CYCLE=8
 
+# Short-window (LOOKBACK_MINUTES) thresholds
 WARN_MESSAGES_SENT=60
 CRIT_MESSAGES_SENT=150
 
@@ -55,6 +76,7 @@ WARN_FAILED_RATE_PCT=30
 CRIT_MIN_RECIPIENTS_FOR_FAIL_RATE=40
 CRIT_FAILED_RATE_PCT=50
 
+SOURCE_IP_COUNT_MODE="subnet" # "subnet" (/24 IPv4, /64 IPv6) or "exact"
 WARN_SOURCE_IPS=3
 WARN_MIN_MESSAGES_FOR_IPS=10
 CRIT_SOURCE_IPS=5
@@ -71,32 +93,80 @@ WARN_QUEUE_PER_USER=40
 CRIT_QUEUE_PER_USER=100
 WARN_TOTAL_QUEUE=300
 
-AUTO_LOCK_ON_CRITICAL="true"
-AUTO_HOLD_QUEUE_ON_CRITICAL="false"
+# Multi-window (1h / 24h) low-and-slow spam thresholds
+WARN_HOURLY_MESSAGES=300
+CRIT_HOURLY_MESSAGES=600
+WARN_HOURLY_RECIPIENTS=500
+CRIT_HOURLY_RECIPIENTS=1000
+WARN_DAILY_MESSAGES=1500
+WARN_DAILY_RECIPIENTS=2500
 
+# Auth brute-force & local pickup thresholds
+WARN_AUTH_FAIL_PER_IP=50
+AUTH_FAIL_BEFORE_SUCCESS_MIN=5
+AUTH_ALERT_COOLDOWN_MINUTES=60
+WARN_PICKUP_EXTERNAL_MESSAGES=20
+
+# Composite Risk Score (0-100)
+RISK_SCORE_ENABLED="true"
+WARN_RISK_SCORE=60
+CRIT_RISK_SCORE=85
+
+# Auto-remediation (strictly single-account scope)
+AUTO_LOCK_ON_CRITICAL="true"
+FLUSH_CACHE_ON_LOCK="true"
+LOCK_RELOCK_GRACE_SECONDS=120
+AUTO_HOLD_QUEUE_ON_CRITICAL="false"
+ZMPROV_TIMEOUT_SECONDS=120
+
+# Telegram notifications
 TELEGRAM_ENABLED="true"
 TELEGRAM_BOT_TOKEN=""
 TELEGRAM_CHAT_ID=""
 
+# Email & SMTP notifications
 EMAIL_ENABLED="true"
 EMAIL_DELIVERY_MODE="auto"
 ALERT_EMAIL_TO="auto"
 ALERT_EMAIL_FROM="auto"
-
 SMTP_HOST=""
 SMTP_PORT="587"
 SMTP_USER=""
 SMTP_PASS=""
 SMTP_TLS="true"
 
+# Generic / Slack / Discord Webhook notifications
+WEBHOOK_ENABLED="false"
+WEBHOOK_URL=""
+WEBHOOK_FORMAT="generic" # "generic", "slack", or "discord"
+
+# Self-RBL Blacklist Monitor (Read-only DNS)
+RBL_CHECK_ENABLED="true"
+RBL_CHECK_INTERVAL_MINUTES=60
+RBL_CHECK_IPS=""
+RBL_PROVIDERS="zen.spamhaus.org bl.spamcop.net bl.mailspike.net dnsbl-1.uceprotect.net psbl.surriel.com"
+
+# Health Check & Optional Daily Summary
+HEALTH_CHECK_ENABLED="true"
+LOG_STALE_MINUTES=30
+HEALTH_ALERT_COOLDOWN_MINUTES=360
+DAILY_SUMMARY_ENABLED="false"
+DAILY_SUMMARY_HOUR="08"
+
+# State & Log Paths
 WHITELIST_FILE="/etc/zimbra-spam-monitor/whitelist.conf"
 STATE_DIR="/var/lib/zimbra-spam-monitor"
 MONITOR_LOG_FILE="/var/log/zimbra-spam-monitor.log"
+JSON_LOG_ENABLED="true"
+JSON_LOG_FILE="/var/log/zimbra-spam-monitor-events.jsonl"
 
 # Test / Mock environment overrides
 ZSM_NOW_EPOCH="${ZSM_NOW_EPOCH:-}"
 ZSM_POSTQUEUE_CMD="${ZSM_POSTQUEUE_CMD:-}"
+ZSM_POSTSUPER_CMD="${ZSM_POSTSUPER_CMD:-}"
+ZSM_POSTCONF_CMD="${ZSM_POSTCONF_CMD:-}"
 ZSM_ZMPROV_CMD="${ZSM_ZMPROV_CMD:-}"
+ZSM_LDAPSEARCH_CMD="${ZSM_LDAPSEARCH_CMD:-}"
 ZSM_SENDMAIL_CMD="${ZSM_SENDMAIL_CMD:-}"
 ZSM_CURL_CMD="${ZSM_CURL_CMD:-curl}"
 ZSM_HOSTNAME="${ZSM_HOSTNAME:-}"
@@ -105,9 +175,21 @@ ZSM_DIG_CMD="${ZSM_DIG_CMD:-dig}"
 ZSM_HOST_CMD="${ZSM_HOST_CMD:-host}"
 ZSM_NSLOOKUP_CMD="${ZSM_NSLOOKUP_CMD:-nslookup}"
 ZSM_HOSTNAME_CMD="${ZSM_HOSTNAME_CMD:-hostname}"
-ZSM_UI_MODE="${ZSM_UI_MODE:-auto}" # "auto", "tui" (whiptail/dialog), or "text"
+ZSM_MAILBOX_LOG_FILE="${ZSM_MAILBOX_LOG_FILE:-}"
+ZSM_AUDIT_LOG_FILE="${ZSM_AUDIT_LOG_FILE:-}"
+ZSM_LOCALCONFIG_FILE="${ZSM_LOCALCONFIG_FILE:-/opt/zimbra/conf/localconfig.xml}"
+ZSM_TG_RATE_SLEEP="${ZSM_TG_RATE_SLEEP:-1}"
+ZSM_UI_MODE="${ZSM_UI_MODE:-auto}"
+
+# In-memory caches (populated once per process)
 _CACHED_SERVER_IP=""
 _CACHED_SERVER_IP_KEY=""
+_TG_SENT_IN_CYCLE=0
+_WL_LOADED=0
+declare -A _WL_BYPASS_EMAIL=()
+declare -A _WL_BYPASS_DOMAIN=()
+declare -A _WL_LIMIT_EMAIL=()
+declare -A _WL_LIMIT_DOMAIN=()
 
 # ANSI Colors for Text Menu
 if [[ -t 1 || -t 2 ]]; then
@@ -127,21 +209,90 @@ else
 fi
 
 # ==============================================================================
-# HELPER FUNCTIONS & CONFIGURATION MANAGEMENT
+# HELPER FUNCTIONS, SAFE TEMP FILES & CONFIGURATION MANAGEMENT
 # ==============================================================================
+lower_priority_self() {
+    # Lower only this monitor process priority so Zimbra/Postfix always get CPU/IO first
+    if command -v renice >/dev/null 2>&1; then
+        renice +10 $$ >/dev/null 2>&1 || true
+    fi
+    if command -v ionice >/dev/null 2>&1; then
+        ionice -c3 -p $$ >/dev/null 2>&1 || true
+    fi
+}
+
+make_safe_tmp() {
+    local prefix="${1:-zsm}"
+    local tmpf=""
+    (
+        umask 077
+        if command -v mktemp >/dev/null 2>&1; then
+            mktemp "/tmp/${prefix}.XXXXXX" 2>/dev/null || mktemp 2>/dev/null
+        else
+            local fallback="${STATE_DIR}/.${prefix}.$$.$RANDOM"
+            : > "$fallback"
+            chmod 600 "$fallback" 2>/dev/null || true
+            echo "$fallback"
+        fi
+    )
+}
+
+run_with_timeout() {
+    local secs="$1"
+    shift
+    if command -v timeout >/dev/null 2>&1 && [[ "$secs" =~ ^[0-9]+$ ]] && (( secs > 0 )); then
+        timeout "$secs" "$@"
+    else
+        "$@"
+    fi
+}
+
+is_valid_email_account() {
+    local acct="$1"
+    [[ ${#acct} -le 254 ]] && [[ "$acct" =~ ^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$ ]]
+}
+
+json_escape() {
+    local s="$1"
+    s="${s//\\/\\\\}"
+    s="${s//\"/\\\"}"
+    s="${s//$'\r'/}"
+    s="${s//$'\n'/\\n}"
+    s="${s//$'\t'/\\t}"
+    printf '%s' "$s"
+}
+
+curl_cfg_escape() {
+    local s="$1"
+    s="${s//$'\r'/}"
+    s="${s//$'\n'/}"
+    s="${s//\\/\\\\}"
+    s="${s//\"/\\\"}"
+    printf '%s' "$s"
+}
+
 load_config() {
     if [[ -f "$CONFIG_FILE" ]]; then
         local tmp_cfg
-        tmp_cfg=$(mktemp 2>/dev/null || echo "/tmp/zsm_cfg_$$")
+        tmp_cfg=$(make_safe_tmp "zsm_cfg")
         tr -d '\r' < "$CONFIG_FILE" > "$tmp_cfg"
         # shellcheck disable=SC1090
         source "$tmp_cfg"
         rm -f "$tmp_cfg"
     fi
+    if [[ -n "$ZSM_MAILBOX_LOG_FILE" ]]; then
+        ZIMBRA_MAILBOX_LOG_FILE="$ZSM_MAILBOX_LOG_FILE"
+    fi
+    if [[ -n "$ZSM_AUDIT_LOG_FILE" ]]; then
+        ZIMBRA_AUDIT_LOG_FILE="$ZSM_AUDIT_LOG_FILE"
+    fi
     mkdir -p "$STATE_DIR" 2>/dev/null || true
     local log_dir
     log_dir=$(dirname "$MONITOR_LOG_FILE")
     mkdir -p "$log_dir" 2>/dev/null || true
+    if [[ "$JSON_LOG_ENABLED" == "true" && -n "$JSON_LOG_FILE" ]]; then
+        mkdir -p "$(dirname "$JSON_LOG_FILE")" 2>/dev/null || true
+    fi
 }
 
 ensure_config_file_exists() {
@@ -149,16 +300,24 @@ ensure_config_file_exists() {
     cfg_dir=$(dirname "$CONFIG_FILE")
     mkdir -p "$cfg_dir" 2>/dev/null || true
     if [[ ! -f "$CONFIG_FILE" ]]; then
-        cat <<EOF > "$CONFIG_FILE"
+        (
+            umask 027
+            cat <<EOF > "$CONFIG_FILE"
 MONITOR_ENABLED="${MONITOR_ENABLED}"
-SERVER_PUBLIC_IP="${SERVER_PUBLIC_IP}"
+SERVER_IP="${SERVER_IP}"
 ZIMBRA_LOG_FILE="${ZIMBRA_LOG_FILE}"
+ZIMBRA_MAILBOX_LOG_FILE="${ZIMBRA_MAILBOX_LOG_FILE}"
+ZIMBRA_AUDIT_LOG_FILE="${ZIMBRA_AUDIT_LOG_FILE}"
 LOG_TAIL_LINES=${LOG_TAIL_LINES}
+LOG_MAX_TAIL_LINES=${LOG_MAX_TAIL_LINES}
+AUX_LOG_TAIL_LINES=${AUX_LOG_TAIL_LINES}
 COUNT_INTERNAL_TO_INTERNAL="${COUNT_INTERNAL_TO_INTERNAL}"
 INTERNAL_DOMAINS="${INTERNAL_DOMAINS}"
-SERVER_IP="${SERVER_IP}"
+AUTO_DISCOVER_ZIMBRA_DOMAINS="${AUTO_DISCOVER_ZIMBRA_DOMAINS}"
+TRUSTED_SUBMISSION_IPS="${TRUSTED_SUBMISSION_IPS}"
 LOOKBACK_MINUTES=${LOOKBACK_MINUTES}
 ALERT_COOLDOWN_MINUTES=${ALERT_COOLDOWN_MINUTES}
+MAX_ALERTS_PER_CYCLE=${MAX_ALERTS_PER_CYCLE}
 WARN_MESSAGES_SENT=${WARN_MESSAGES_SENT}
 CRIT_MESSAGES_SENT=${CRIT_MESSAGES_SENT}
 WARN_RECIPIENTS=${WARN_RECIPIENTS}
@@ -171,6 +330,7 @@ MIN_RECIPIENTS_FOR_FAIL_RATE=${MIN_RECIPIENTS_FOR_FAIL_RATE}
 WARN_FAILED_RATE_PCT=${WARN_FAILED_RATE_PCT}
 CRIT_MIN_RECIPIENTS_FOR_FAIL_RATE=${CRIT_MIN_RECIPIENTS_FOR_FAIL_RATE}
 CRIT_FAILED_RATE_PCT=${CRIT_FAILED_RATE_PCT}
+SOURCE_IP_COUNT_MODE="${SOURCE_IP_COUNT_MODE}"
 WARN_SOURCE_IPS=${WARN_SOURCE_IPS}
 WARN_MIN_MESSAGES_FOR_IPS=${WARN_MIN_MESSAGES_FOR_IPS}
 CRIT_SOURCE_IPS=${CRIT_SOURCE_IPS}
@@ -183,8 +343,24 @@ CRIT_SPAM_SIGNALS=${CRIT_SPAM_SIGNALS}
 WARN_QUEUE_PER_USER=${WARN_QUEUE_PER_USER}
 CRIT_QUEUE_PER_USER=${CRIT_QUEUE_PER_USER}
 WARN_TOTAL_QUEUE=${WARN_TOTAL_QUEUE}
+WARN_HOURLY_MESSAGES=${WARN_HOURLY_MESSAGES}
+CRIT_HOURLY_MESSAGES=${CRIT_HOURLY_MESSAGES}
+WARN_HOURLY_RECIPIENTS=${WARN_HOURLY_RECIPIENTS}
+CRIT_HOURLY_RECIPIENTS=${CRIT_HOURLY_RECIPIENTS}
+WARN_DAILY_MESSAGES=${WARN_DAILY_MESSAGES}
+WARN_DAILY_RECIPIENTS=${WARN_DAILY_RECIPIENTS}
+WARN_AUTH_FAIL_PER_IP=${WARN_AUTH_FAIL_PER_IP}
+AUTH_FAIL_BEFORE_SUCCESS_MIN=${AUTH_FAIL_BEFORE_SUCCESS_MIN}
+AUTH_ALERT_COOLDOWN_MINUTES=${AUTH_ALERT_COOLDOWN_MINUTES}
+WARN_PICKUP_EXTERNAL_MESSAGES=${WARN_PICKUP_EXTERNAL_MESSAGES}
+RISK_SCORE_ENABLED="${RISK_SCORE_ENABLED}"
+WARN_RISK_SCORE=${WARN_RISK_SCORE}
+CRIT_RISK_SCORE=${CRIT_RISK_SCORE}
 AUTO_LOCK_ON_CRITICAL="${AUTO_LOCK_ON_CRITICAL}"
+FLUSH_CACHE_ON_LOCK="${FLUSH_CACHE_ON_LOCK}"
+LOCK_RELOCK_GRACE_SECONDS=${LOCK_RELOCK_GRACE_SECONDS}
 AUTO_HOLD_QUEUE_ON_CRITICAL="${AUTO_HOLD_QUEUE_ON_CRITICAL}"
+ZMPROV_TIMEOUT_SECONDS=${ZMPROV_TIMEOUT_SECONDS}
 TELEGRAM_ENABLED="${TELEGRAM_ENABLED}"
 TELEGRAM_BOT_TOKEN="${TELEGRAM_BOT_TOKEN}"
 TELEGRAM_CHAT_ID="${TELEGRAM_CHAT_ID}"
@@ -197,34 +373,98 @@ SMTP_PORT="${SMTP_PORT}"
 SMTP_USER="${SMTP_USER}"
 SMTP_PASS="${SMTP_PASS}"
 SMTP_TLS="${SMTP_TLS}"
+WEBHOOK_ENABLED="${WEBHOOK_ENABLED}"
+WEBHOOK_URL="${WEBHOOK_URL}"
+WEBHOOK_FORMAT="${WEBHOOK_FORMAT}"
+RBL_CHECK_ENABLED="${RBL_CHECK_ENABLED}"
+RBL_CHECK_INTERVAL_MINUTES=${RBL_CHECK_INTERVAL_MINUTES}
+RBL_CHECK_IPS="${RBL_CHECK_IPS}"
+RBL_PROVIDERS="${RBL_PROVIDERS}"
+HEALTH_CHECK_ENABLED="${HEALTH_CHECK_ENABLED}"
+LOG_STALE_MINUTES=${LOG_STALE_MINUTES}
+HEALTH_ALERT_COOLDOWN_MINUTES=${HEALTH_ALERT_COOLDOWN_MINUTES}
+DAILY_SUMMARY_ENABLED="${DAILY_SUMMARY_ENABLED}"
+DAILY_SUMMARY_HOUR="${DAILY_SUMMARY_HOUR}"
 WHITELIST_FILE="${WHITELIST_FILE}"
 STATE_DIR="${STATE_DIR}"
 MONITOR_LOG_FILE="${MONITOR_LOG_FILE}"
+JSON_LOG_ENABLED="${JSON_LOG_ENABLED}"
+JSON_LOG_FILE="${JSON_LOG_FILE}"
 EOF
+        )
     fi
 }
 
+# Injection-safe & delimiter-safe config writer (handles |, &, $, ", \, `)
 update_cfg_var() {
     local key="$1"
-    local val="$2"
+    local raw_val="$2"
     ensure_config_file_exists
-    if grep -q "^${key}=" "$CONFIG_FILE" 2>/dev/null; then
-        sed -i "s|^${key}=.*|${key}=\"${val}\"|" "$CONFIG_FILE"
-    else
-        echo "${key}=\"${val}\"" >> "$CONFIG_FILE"
-    fi
+
+    # Strip CR/LF and escape \, ", $, and ` for safe double-quoted Bash assignment
+    local esc_val="$raw_val"
+    esc_val="${esc_val//$'\r'/}"
+    esc_val="${esc_val//$'\n'/}"
+    esc_val="${esc_val//\\/\\\\}"
+    esc_val="${esc_val//\"/\\\"}"
+    esc_val="${esc_val//\$/\\\$}"
+    esc_val="${esc_val//\`/\\\`}"
+
+    local tmp_out
+    tmp_out=$(make_safe_tmp "zsm_cfgw")
+    ZSM_CFG_KEY="$key" ZSM_CFG_VAL="$esc_val" awk '
+        BEGIN {
+            k = ENVIRON["ZSM_CFG_KEY"]
+            v = ENVIRON["ZSM_CFG_VAL"]
+            updated = 0
+            prefix = k "="
+            plen = length(prefix)
+        }
+        substr($0, 1, plen) == prefix {
+            if (!updated) {
+                print k "=\"" v "\""
+                updated = 1
+            }
+            next
+        }
+        { print }
+        END {
+            if (!updated) {
+                print k "=\"" v "\""
+            }
+        }
+    ' "$CONFIG_FILE" > "$tmp_out"
+    cat "$tmp_out" > "$CONFIG_FILE"
+    rm -f "$tmp_out"
     load_config
 }
 
 update_cfg_num() {
     local key="$1"
     local val="$2"
+    [[ ! "$val" =~ ^-?[0-9]+(\.[0-9]+)?$ ]] && return 1
     ensure_config_file_exists
-    if grep -q "^${key}=" "$CONFIG_FILE" 2>/dev/null; then
-        sed -i "s|^${key}=.*|${key}=${val}|" "$CONFIG_FILE"
-    else
-        echo "${key}=${val}" >> "$CONFIG_FILE"
-    fi
+
+    local tmp_out
+    tmp_out=$(make_safe_tmp "zsm_cfgn")
+    awk -v k="$key" -v v="$val" '
+        BEGIN { updated = 0; prefix = k "="; plen = length(prefix) }
+        substr($0, 1, plen) == prefix {
+            if (!updated) {
+                print k "=" v
+                updated = 1
+            }
+            next
+        }
+        { print }
+        END {
+            if (!updated) {
+                print k "=" v
+            }
+        }
+    ' "$CONFIG_FILE" > "$tmp_out"
+    cat "$tmp_out" > "$CONFIG_FILE"
+    rm -f "$tmp_out"
     load_config
 }
 
@@ -237,15 +477,41 @@ log_msg() {
     echo "[$ts] [$level] $msg" >> "$MONITOR_LOG_FILE" 2>/dev/null || true
 }
 
+log_json_event() {
+    [[ "$JSON_LOG_ENABLED" != "true" || -z "$JSON_LOG_FILE" ]] && return 0
+    local json_line="$1"
+    printf '%s\n' "$json_line" >> "$JSON_LOG_FILE" 2>/dev/null || true
+}
+
+record_attacker_ip() {
+    local ip="$1"
+    local acct="$2"
+    local reason="$3"
+    [[ -z "$ip" || "$ip" == "webmail/local" || "$ip" == "queued/unknown" || "$ip" == "127.0.0.1" || "$ip" == "::1" ]] && return 0
+    local now_ts ts_str
+    now_ts="${ZSM_NOW_EPOCH:-$(date +%s)}"
+    ts_str=$(date -d "@$now_ts" '+%Y-%m-%d %H:%M:%S' 2>/dev/null || date '+%Y-%m-%d %H:%M:%S')
+    mkdir -p "$STATE_DIR" 2>/dev/null || true
+    printf '%s|%s|%s|%s\n' "$ts_str" "$ip" "$acct" "$reason" >> "$STATE_DIR/attacker_ips.log" 2>/dev/null || true
+}
+
+read_localconfig_key() {
+    local key_name="$1"
+    [[ ! -f "$ZSM_LOCALCONFIG_FILE" ]] && return 0
+    awk -F'[<>]' -v k="$key_name" '
+        index($0, "name=\"" k "\"") > 0 {
+            if (getline > 0 && $2 == "value") { print $3; exit }
+        }
+    ' "$ZSM_LOCALCONFIG_FILE" 2>/dev/null | head -n 1
+}
+
 get_server_hostname() {
     if [[ -n "$ZSM_HOSTNAME" ]]; then
         echo "$ZSM_HOSTNAME"
         return
     fi
     local hn=""
-    if [[ -f /opt/zimbra/conf/localconfig.xml ]]; then
-        hn=$(awk -F'[<>]' '/name="zimbra_server_hostname"/{getline; if ($2 == "value") print $3}' /opt/zimbra/conf/localconfig.xml 2>/dev/null | head -n 1)
-    fi
+    hn=$(read_localconfig_key "zimbra_server_hostname")
     if [[ -z "$hn" ]]; then
         hn=$("$ZSM_HOSTNAME_CMD" -f 2>/dev/null || "$ZSM_HOSTNAME_CMD" 2>/dev/null || echo "zimbra-server")
     fi
@@ -265,7 +531,7 @@ is_private_ipv4() {
     [[ "$ip" =~ ^172\.(1[6-9]|2[0-9]|3[0-1])\. ]]
 }
 
-# Query DNS directly (bypasses /etc/hosts) using dig, host, or nslookup
+# Read-only DNS A lookup (bypasses /etc/hosts) using dig, host, or nslookup
 dns_lookup_ipv4() {
     local domain="$1"
     local resolver="${2:-}"
@@ -310,6 +576,19 @@ dns_lookup_ipv4() {
     return 1
 }
 
+dns_lookup_txt() {
+    local domain="$1"
+    if command -v "$ZSM_DIG_CMD" >/dev/null 2>&1; then
+        "$ZSM_DIG_CMD" +short +time=2 +tries=1 TXT "$domain" 2>/dev/null | tr -d '"'
+        return 0
+    fi
+    if command -v "$ZSM_HOST_CMD" >/dev/null 2>&1; then
+        "$ZSM_HOST_CMD" -W 2 -t TXT "$domain" 2>/dev/null
+        return 0
+    fi
+    return 1
+}
+
 get_server_ip() {
     if [[ -n "$ZSM_SERVER_IP" ]]; then
         echo "$ZSM_SERVER_IP"
@@ -324,12 +603,23 @@ get_server_ip() {
         return
     fi
 
-    local srv_host cache_key
+    local srv_host cache_key now_ts
     srv_host=$(get_server_hostname)
     cache_key="${ZSM_SERVER_IP}|${SERVER_IP:-auto}|${srv_host}|${ZSM_DIG_CMD}|${ZSM_HOST_CMD}|${ZSM_NSLOOKUP_CMD}"
     if [[ -n "${_CACHED_SERVER_IP:-}" && "${_CACHED_SERVER_IP_KEY:-}" == "$cache_key" ]]; then
         echo "$_CACHED_SERVER_IP"
         return
+    fi
+
+    now_ts="${ZSM_NOW_EPOCH:-$(date +%s)}"
+    local ip_cache_file="$STATE_DIR/server_ip.cache"
+    if [[ -f "$ip_cache_file" ]]; then
+        local c_key c_ip c_ts
+        IFS='|' read -r c_key c_ip c_ts < "$ip_cache_file" 2>/dev/null || true
+        if [[ "$c_key" == "$cache_key" ]] && is_valid_ipv4 "$c_ip" && [[ "$c_ts" =~ ^[0-9]+$ ]] && (( now_ts >= c_ts && now_ts - c_ts < 86400 )); then
+            echo "$c_ip"
+            return
+        fi
     fi
 
     local ip=""
@@ -359,6 +649,11 @@ get_server_ip() {
         ip="127.0.0.1"
     fi
 
+    if is_valid_ipv4 "$ip" && [[ "$ip" != "127.0.0.1" ]]; then
+        mkdir -p "$STATE_DIR" 2>/dev/null || true
+        printf '%s|%s|%s\n' "$cache_key" "$ip" "$now_ts" > "$ip_cache_file" 2>/dev/null || true
+    fi
+
     echo "$ip"
 }
 
@@ -367,7 +662,67 @@ get_local_ips() {
     local dns_ip=""
     lip=$("$ZSM_HOSTNAME_CMD" -I 2>/dev/null || true)
     dns_ip=$(get_server_ip)
-    echo "${lip} ${dns_ip}"
+    echo "${lip} ${dns_ip} ${TRUSTED_SUBMISSION_IPS}"
+}
+
+# Read-only Multi-Domain discovery via native ldapsearch (zero JVM) + 24h cache
+discover_zimbra_domains() {
+    [[ "$AUTO_DISCOVER_ZIMBRA_DOMAINS" != "true" ]] && return 0
+
+    local now_ts="${ZSM_NOW_EPOCH:-$(date +%s)}"
+    local dom_cache="$STATE_DIR/domains.cache"
+    if [[ -f "$dom_cache" ]]; then
+        local c_ts c_doms
+        IFS='|' read -r c_ts c_doms < "$dom_cache" 2>/dev/null || true
+        if [[ "$c_ts" =~ ^[0-9]+$ && -n "$c_doms" ]] && (( now_ts >= c_ts && now_ts - c_ts < 86400 )); then
+            echo "$c_doms"
+            return 0
+        fi
+    fi
+
+    local discovered=""
+    local ldap_bin=""
+    if [[ -n "$ZSM_LDAPSEARCH_CMD" ]]; then
+        ldap_bin="$ZSM_LDAPSEARCH_CMD"
+    else
+        for p in /opt/zimbra/common/bin/ldapsearch /opt/zimbra/openldap/bin/ldapsearch /usr/bin/ldapsearch; do
+            [[ -x "$p" ]] && ldap_bin="$p" && break
+        done
+    fi
+
+    if [[ -n "$ldap_bin" ]]; then
+        if [[ -n "$ZSM_LDAPSEARCH_CMD" ]]; then
+            discovered=$(run_with_timeout 15 "$ldap_bin" -x "(objectClass=zimbraDomain)" zimbraDomainName 2>/dev/null | \
+                awk '/^zimbraDomainName:/ {print tolower($2)}' | sort -u | tr '\n' ' ')
+        elif [[ -f "$ZSM_LOCALCONFIG_FILE" ]]; then
+            local ldap_url ldap_dn ldap_pw
+            ldap_url=$(read_localconfig_key "ldap_url" | awk '{print $1}')
+            ldap_dn=$(read_localconfig_key "zimbra_ldap_userdn")
+            ldap_pw=$(read_localconfig_key "zimbra_ldap_password")
+            if [[ -n "$ldap_url" && -n "$ldap_dn" && -n "$ldap_pw" ]]; then
+                local tmp_pw
+                tmp_pw=$(make_safe_tmp "zsm_ldappw")
+                printf '%s' "$ldap_pw" > "$tmp_pw"
+                discovered=$(run_with_timeout 15 "$ldap_bin" -x -LLL -H "$ldap_url" -D "$ldap_dn" -y "$tmp_pw" \
+                    -b "" "(objectClass=zimbraDomain)" zimbraDomainName 2>/dev/null | \
+                    awk '/^zimbraDomainName:/ {print tolower($2)}' | sort -u | tr '\n' ' ')
+                rm -f "$tmp_pw"
+            fi
+        fi
+    fi
+
+    # Read-only fallback to zmprov gad (with strict 60s timeout) only if ldapsearch yielded nothing
+    if [[ -z "${discovered// /}" && -z "$ZSM_ZMPROV_CMD" && -x /opt/zimbra/bin/zmprov ]]; then
+        discovered=$(run_with_timeout 60 su - zimbra -c '/opt/zimbra/bin/zmprov gad' 2>/dev/null | \
+            awk '/^[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$/ {print tolower($1)}' | sort -u | tr '\n' ' ')
+    fi
+
+    discovered=$(echo "$discovered" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+    if [[ -n "$discovered" ]]; then
+        mkdir -p "$STATE_DIR" 2>/dev/null || true
+        printf '%s|%s\n' "$now_ts" "$discovered" > "$dom_cache" 2>/dev/null || true
+        echo "$discovered"
+    fi
 }
 
 # Fast auto-detection of Zimbra localconfig XML without spawning JVM
@@ -388,10 +743,8 @@ resolve_zimbra_settings() {
 
     local xml_dest=""
     local xml_src=""
-    if [[ -f /opt/zimbra/conf/localconfig.xml ]]; then
-        xml_dest=$(awk -F'[<>]' '/name="smtp_destination"/{getline; if ($2 == "value") print $3}' /opt/zimbra/conf/localconfig.xml 2>/dev/null | head -n 1)
-        xml_src=$(awk -F'[<>]' '/name="smtp_source"/{getline; if ($2 == "value") print $3}' /opt/zimbra/conf/localconfig.xml 2>/dev/null | head -n 1)
-    fi
+    xml_dest=$(read_localconfig_key "smtp_destination")
+    xml_src=$(read_localconfig_key "smtp_source")
 
     if [[ "$ALERT_EMAIL_TO" == "auto" || -z "$ALERT_EMAIL_TO" ]]; then
         if [[ -n "$xml_dest" ]]; then
@@ -418,6 +771,11 @@ resolve_zimbra_settings() {
         if [[ -n "$xml_dest" && "$xml_dest" == *@* ]]; then
             RESOLVED_INTERNAL_DOMAINS="$RESOLVED_INTERNAL_DOMAINS ${xml_dest#*@}"
         fi
+        local multi_doms=""
+        multi_doms=$(discover_zimbra_domains || true)
+        if [[ -n "$multi_doms" ]]; then
+            RESOLVED_INTERNAL_DOMAINS="$RESOLVED_INTERNAL_DOMAINS $multi_doms"
+        fi
     else
         RESOLVED_INTERNAL_DOMAINS="$INTERNAL_DOMAINS"
     fi
@@ -429,16 +787,31 @@ find_postqueue_bin() {
         return
     fi
     for p in /opt/zimbra/common/sbin/postqueue /opt/zimbra/postfix/sbin/postqueue /usr/sbin/postqueue; do
-        if [[ -x "$p" ]]; then
-            echo "$p"
-            return
-        fi
+        [[ -x "$p" ]] && echo "$p" && return
     done
-    if command -v postqueue >/dev/null 2>&1; then
-        command -v postqueue
+    command -v postqueue 2>/dev/null || echo ""
+}
+
+find_postsuper_bin() {
+    if [[ -n "$ZSM_POSTSUPER_CMD" ]]; then
+        echo "$ZSM_POSTSUPER_CMD"
         return
     fi
-    echo ""
+    for p in /opt/zimbra/common/sbin/postsuper /opt/zimbra/postfix/sbin/postsuper /usr/sbin/postsuper; do
+        [[ -x "$p" ]] && echo "$p" && return
+    done
+    command -v postsuper 2>/dev/null || echo ""
+}
+
+find_postconf_bin() {
+    if [[ -n "$ZSM_POSTCONF_CMD" ]]; then
+        echo "$ZSM_POSTCONF_CMD"
+        return
+    fi
+    for p in /opt/zimbra/common/sbin/postconf /opt/zimbra/postfix/sbin/postconf /usr/sbin/postconf; do
+        [[ -x "$p" ]] && echo "$p" && return
+    done
+    command -v postconf 2>/dev/null || echo ""
 }
 
 find_sendmail_bin() {
@@ -447,16 +820,9 @@ find_sendmail_bin() {
         return
     fi
     for p in /opt/zimbra/common/sbin/sendmail /opt/zimbra/postfix/sbin/sendmail /usr/sbin/sendmail; do
-        if [[ -x "$p" ]]; then
-            echo "$p"
-            return
-        fi
+        [[ -x "$p" ]] && echo "$p" && return
     done
-    if command -v sendmail >/dev/null 2>&1; then
-        command -v sendmail
-        return
-    fi
-    echo ""
+    command -v sendmail 2>/dev/null || echo ""
 }
 
 find_awk_bin() {
@@ -467,143 +833,175 @@ find_awk_bin() {
     fi
 }
 
-is_whitelisted() {
-    local email
-    email=$(echo "$1" | tr '[:upper:]' '[:lower:]')
-    [[ -z "$email" ]] && return 0
-    [[ ! -f "$WHITELIST_FILE" ]] && return 1
+# ==============================================================================
+# SINGLE-PASS WHITELIST & PER-ACCOUNT CUSTOM LIMITS LOADER
+# Format in whitelist.conf:
+#   user@domain.com                 -> Full bypass (backward-compatible)
+#   @domain.com                     -> Full domain bypass
+#   user@domain.com 500 1000        -> Custom WARN/CRIT recipient limits
+#   @domain.com 300 600             -> Custom domain WARN/CRIT recipient limits
+# ==============================================================================
+load_whitelist_cache() {
+    _WL_BYPASS_EMAIL=()
+    _WL_BYPASS_DOMAIN=()
+    _WL_LIMIT_EMAIL=()
+    _WL_LIMIT_DOMAIN=()
+    _WL_LOADED=1
+    [[ ! -f "$WHITELIST_FILE" ]] && return 0
 
-    local domain=""
-    if [[ "$email" == *@* ]]; then
-        domain="@${email#*@}"
-    fi
-
-    while IFS= read -r line || [[ -n "$line" ]]; do
-        line=$(echo "$line" | tr -d '\r' | sed 's/#.*//;s/^[[:space:]]*//;s/[[:space:]]*$//' | tr '[:upper:]' '[:lower:]')
+    local raw_line line key w_lim c_lim
+    while IFS= read -r raw_line || [[ -n "$raw_line" ]]; do
+        line="${raw_line%%#*}"
+        line="${line//$'\r'/}"
+        # Trim leading/trailing whitespace using pure Bash (zero forks)
+        line="${line#"${line%%[![:space:]]*}"}"
+        line="${line%"${line##*[![:space:]]}"}"
         [[ -z "$line" ]] && continue
-        if [[ "$line" == "$email" ]]; then
-            return 0
-        fi
-        if [[ -n "$domain" && "$line" == "$domain" ]]; then
-            return 0
+
+        # Normalize "email:500/1000" or "email 500 1000"
+        line="${line//:/ }"
+        line="${line//\// }"
+        read -r key w_lim c_lim _ <<< "$line"
+        key="${key,,}"
+        [[ -z "$key" ]] && continue
+
+        if [[ -n "$w_lim" && -n "$c_lim" && "$w_lim" =~ ^[0-9]+$ && "$c_lim" =~ ^[0-9]+$ ]]; then
+            if [[ "$key" == @* ]]; then
+                _WL_LIMIT_DOMAIN["$key"]="${w_lim}|${c_lim}"
+            else
+                _WL_LIMIT_EMAIL["$key"]="${w_lim}|${c_lim}"
+            fi
+        else
+            if [[ "$key" == @* ]]; then
+                _WL_BYPASS_DOMAIN["$key"]=1
+            else
+                _WL_BYPASS_EMAIL["$key"]=1
+            fi
         fi
     done < "$WHITELIST_FILE"
+}
 
+is_whitelisted() {
+    local email="${1,,}"
+    [[ -z "$email" ]] && return 0
+    (( _WL_LOADED == 0 )) && load_whitelist_cache
+
+    if [[ -n "${_WL_BYPASS_EMAIL[$email]:-}" ]]; then
+        return 0
+    fi
+    if [[ "$email" == *@* ]]; then
+        local domain="@${email#*@}"
+        if [[ -n "${_WL_BYPASS_DOMAIN[$domain]:-}" ]]; then
+            return 0
+        fi
+    fi
+    return 1
+}
+
+get_custom_limits() {
+    local email="${1,,}"
+    (( _WL_LOADED == 0 )) && load_whitelist_cache
+
+    if [[ -n "${_WL_LIMIT_EMAIL[$email]:-}" ]]; then
+        echo "${_WL_LIMIT_EMAIL[$email]}"
+        return 0
+    fi
+    if [[ "$email" == *@* ]]; then
+        local domain="@${email#*@}"
+        if [[ -n "${_WL_LIMIT_DOMAIN[$domain]:-}" ]]; then
+            echo "${_WL_LIMIT_DOMAIN[$domain]}"
+            return 0
+        fi
+    fi
     return 1
 }
 
 # ==============================================================================
-# ALERT COOLDOWN, UNLOCK CUTOFF & LOCKED ACCOUNT HISTORY
+# ALERT COOLDOWN, UNLOCK CUTOFF, LOCKED HISTORY & ROLLING 1H/24H BUCKETS
 # ==============================================================================
 should_send_alert() {
-    local sender
-    sender=$(echo "$1" | tr '[:upper:]' '[:lower:]')
+    local sender="${1,,}"
     local severity="$2"
+    local custom_cooldown_mins="${3:-$ALERT_COOLDOWN_MINUTES}"
     local state_file="$STATE_DIR/cooldown.db"
-    local now_ts
-    now_ts="${ZSM_NOW_EPOCH:-$(date +%s)}"
-    local cooldown_sec=$(( ALERT_COOLDOWN_MINUTES * 60 ))
+    local now_ts="${ZSM_NOW_EPOCH:-$(date +%s)}"
+    local cooldown_sec=$(( custom_cooldown_mins * 60 ))
 
     [[ ! -f "$state_file" ]] && return 0
 
     local prev_line
     prev_line=$(awk -F'|' -v s="$sender" 'tolower($1) == s || tolower($1) == ("^" s) {line=$0} END {if (line != "") print line}' "$state_file" 2>/dev/null || true)
-    if [[ -z "$prev_line" ]]; then
-        return 0
-    fi
+    [[ -z "$prev_line" ]] && return 0
 
     local prev_sev prev_ts
-    prev_sev=$(echo "$prev_line" | cut -d'|' -f2)
-    prev_ts=$(echo "$prev_line" | cut -d'|' -f3)
+    IFS='|' read -r _ prev_sev prev_ts _ <<< "$prev_line"
 
+    # Escalation from WARNING to CRITICAL always bypasses cooldown
     if [[ "$severity" == "CRITICAL" && "$prev_sev" != "CRITICAL" ]]; then
         return 0
     fi
 
-    if [[ -n "$prev_ts" ]] && (( now_ts - prev_ts < cooldown_sec )); then
+    if [[ -n "$prev_ts" && "$prev_ts" =~ ^[0-9]+$ ]] && (( now_ts >= prev_ts && now_ts - prev_ts < cooldown_sec )); then
         return 1
     fi
     return 0
 }
 
 record_alert_state() {
-    local sender
-    sender=$(echo "$1" | tr '[:upper:]' '[:lower:]')
+    local sender="${1,,}"
     local severity="$2"
     local state_file="$STATE_DIR/cooldown.db"
-    local now_ts
-    now_ts="${ZSM_NOW_EPOCH:-$(date +%s)}"
+    local now_ts="${ZSM_NOW_EPOCH:-$(date +%s)}"
 
     mkdir -p "$STATE_DIR" 2>/dev/null || true
     if [[ -f "$state_file" ]]; then
         awk -F'|' -v s="$sender" 'tolower($1) != s && tolower($1) != ("^" s)' "$state_file" > "${state_file}.tmp" 2>/dev/null || true
         mv -f "${state_file}.tmp" "$state_file"
     fi
-    echo "${sender}|${severity}|${now_ts}" >> "$state_file"
+    printf '%s|%s|%s\n' "$sender" "$severity" "$now_ts" >> "$state_file"
 }
 
 is_account_already_locked() {
-    local sender
-    sender=$(echo "$1" | tr '[:upper:]' '[:lower:]')
+    local sender="${1,,}"
     local locked_file="$STATE_DIR/locked_accounts.db"
     [[ ! -f "$locked_file" ]] && return 1
     awk -F'|' -v s="$sender" 'tolower($1) == s {found=1; exit} END {exit(found ? 0 : 1)}' "$locked_file" 2>/dev/null
 }
 
 get_locked_account_time() {
-    local sender
-    sender=$(echo "$1" | tr '[:upper:]' '[:lower:]')
+    local sender="${1,,}"
     local locked_file="$STATE_DIR/locked_accounts.db"
     [[ ! -f "$locked_file" ]] && return 0
     awk -F'|' -v s="$sender" 'tolower($1) == s {ts=$2} END {if (ts != "") print ts}' "$locked_file" 2>/dev/null || true
 }
 
-record_unlock_cutoff() {
-    local sender
-    sender=$(echo "$1" | tr '[:upper:]' '[:lower:]')
-    local cutoff_file="$STATE_DIR/unlock_cutoff.db"
-    local now_ts="${ZSM_NOW_EPOCH:-$(date +%s)}"
-    mkdir -p "$STATE_DIR" 2>/dev/null || true
-    if [[ -f "$cutoff_file" ]]; then
-        grep -v -i "^${sender}|" "$cutoff_file" > "${cutoff_file}.tmp" 2>/dev/null || true
-        mv -f "${cutoff_file}.tmp" "$cutoff_file"
-    fi
-    echo "${sender}|${now_ts}" >> "$cutoff_file"
-}
-
-was_recently_unlocked() {
-    local sender
-    sender=$(echo "$1" | tr '[:upper:]' '[:lower:]')
-    local cutoff_file="$STATE_DIR/unlock_cutoff.db"
-    [[ ! -f "$cutoff_file" ]] && return 1
-    local line
-    line=$(grep -i "^${sender}|" "$cutoff_file" 2>/dev/null | tail -n 1 || true)
-    [[ -z "$line" ]] && return 1
-    local uts now_ts
-    uts=$(echo "$line" | cut -d'|' -f2)
-    now_ts="${ZSM_NOW_EPOCH:-$(date +%s)}"
-    [[ -n "$uts" ]] && (( now_ts - uts <= 3600 ))
-}
-
-clear_alert_state() {
-    local sender
-    sender=$(echo "$1" | tr '[:upper:]' '[:lower:]')
-    local state_file="$STATE_DIR/cooldown.db"
-    if [[ -f "$state_file" ]]; then
-        awk -F'|' -v s="$sender" 'tolower($1) != s && tolower($1) != ("^" s)' "$state_file" > "${state_file}.tmp" 2>/dev/null || true
-        mv -f "${state_file}.tmp" "$state_file"
-    fi
+get_locked_account_epoch() {
+    local sender="${1,,}"
     local locked_file="$STATE_DIR/locked_accounts.db"
-    if [[ -f "$locked_file" ]]; then
-        awk -F'|' -v s="$sender" 'tolower($1) != s' "$locked_file" > "${locked_file}.tmp" 2>/dev/null || true
-        mv -f "${locked_file}.tmp" "$locked_file"
+    [[ ! -f "$locked_file" ]] && return 0
+    local entry_ep entry_str
+    entry_ep=$(awk -F'|' -v s="$sender" 'tolower($1) == s {ep=$3} END {if (ep != "") print ep}' "$locked_file" 2>/dev/null || true)
+    if [[ -n "$entry_ep" && "$entry_ep" =~ ^[0-9]+$ ]]; then
+        echo "$entry_ep"
+        return 0
     fi
-    record_unlock_cutoff "$sender"
+    # Backward compatibility with v1.2.x 2-field locked_accounts.db
+    entry_str=$(get_locked_account_time "$sender")
+    if [[ -n "$entry_str" ]]; then
+        date -d "$entry_str" '+%s' 2>/dev/null || echo "0"
+    fi
+}
+
+remove_locked_account_record() {
+    local sender="${1,,}"
+    local locked_file="$STATE_DIR/locked_accounts.db"
+    [[ ! -f "$locked_file" ]] && return 0
+    awk -F'|' -v s="$sender" 'tolower($1) != s' "$locked_file" > "${locked_file}.tmp" 2>/dev/null || true
+    mv -f "${locked_file}.tmp" "$locked_file"
 }
 
 record_locked_account() {
-    local sender
-    sender=$(echo "$1" | tr '[:upper:]' '[:lower:]')
+    local sender="${1,,}"
     local locked_file="$STATE_DIR/locked_accounts.db"
     local now_ts ts_str
     now_ts="${ZSM_NOW_EPOCH:-$(date +%s)}"
@@ -613,11 +1011,131 @@ record_locked_account() {
         awk -F'|' -v s="$sender" 'tolower($1) != s' "$locked_file" > "${locked_file}.tmp" 2>/dev/null || true
         mv -f "${locked_file}.tmp" "$locked_file"
     fi
-    echo "${sender}|${ts_str}" >> "$locked_file"
+    printf '%s|%s|%s\n' "$sender" "$ts_str" "$now_ts" >> "$locked_file"
+}
+
+record_unlock_cutoff() {
+    local sender="${1,,}"
+    local cutoff_file="$STATE_DIR/unlock_cutoff.db"
+    local now_ts="${ZSM_NOW_EPOCH:-$(date +%s)}"
+    mkdir -p "$STATE_DIR" 2>/dev/null || true
+    if [[ -f "$cutoff_file" ]]; then
+        awk -F'|' -v s="$sender" 'tolower($1) != s' "$cutoff_file" > "${cutoff_file}.tmp" 2>/dev/null || true
+        mv -f "${cutoff_file}.tmp" "$cutoff_file"
+    fi
+    printf '%s|%s\n' "$sender" "$now_ts" >> "$cutoff_file"
+}
+
+was_recently_unlocked() {
+    local sender="${1,,}"
+    local cutoff_file="$STATE_DIR/unlock_cutoff.db"
+    [[ ! -f "$cutoff_file" ]] && return 1
+    local uts now_ts
+    uts=$(awk -F'|' -v s="$sender" 'tolower($1) == s {t=$2} END {if (t != "") print t}' "$cutoff_file" 2>/dev/null || true)
+    [[ -z "$uts" || ! "$uts" =~ ^[0-9]+$ ]] && return 1
+    now_ts="${ZSM_NOW_EPOCH:-$(date +%s)}"
+    (( now_ts >= uts && now_ts - uts <= 3600 ))
+}
+
+clear_rolling_history_for_user() {
+    local sender="${1,,}"
+    local hist_file="$STATE_DIR/rolling_history.db"
+    [[ ! -f "$hist_file" ]] && return 0
+    awk -F'|' -v s="$sender" 'tolower($2) != s' "$hist_file" > "${hist_file}.tmp" 2>/dev/null || true
+    mv -f "${hist_file}.tmp" "$hist_file"
+}
+
+clear_alert_state() {
+    local sender="${1,,}"
+    local state_file="$STATE_DIR/cooldown.db"
+    if [[ -f "$state_file" ]]; then
+        awk -F'|' -v s="$sender" 'tolower($1) != s && tolower($1) != ("^" s)' "$state_file" > "${state_file}.tmp" 2>/dev/null || true
+        mv -f "${state_file}.tmp" "$state_file"
+    fi
+    remove_locked_account_record "$sender"
+    clear_rolling_history_for_user "$sender"
+    record_unlock_cutoff "$sender"
+}
+
+# Merge per-5m-submission-bucket stats into rolling_history.db using max(old, new)
+# Guarantees idempotency regardless of cron frequency (1m/2m/5m) and prunes > 24h.
+update_and_summarize_rolling_history() {
+    local bkt_file="$1"
+    local out_summary="$2"
+    local read_only="${3:-false}"
+    local hist_file="$STATE_DIR/rolling_history.db"
+    local unlock_file="$STATE_DIR/unlock_cutoff.db"
+    local now_ts="${ZSM_NOW_EPOCH:-$(date +%s)}"
+    local awk_bin
+    awk_bin=$(find_awk_bin)
+
+    : > "$out_summary"
+    mkdir -p "$STATE_DIR" 2>/dev/null || true
+    [[ ! -f "$hist_file" ]] && : > "$hist_file"
+
+    local tmp_new_hist
+    tmp_new_hist=$(make_safe_tmp "zsm_rhist")
+
+    "$awk_bin" -F'|' \
+        -v now_ts="$now_ts" \
+        -v unlock_file="$unlock_file" \
+        -v hist_out="$tmp_new_hist" '
+    BEGIN {
+        cut_24h = now_ts - 86400
+        cut_1h  = now_ts - 3600
+        if (unlock_file != "") {
+            while ((getline uline < unlock_file) > 0) {
+                split(uline, up, "|")
+                if (up[1] != "" && up[2] != "") ut[tolower(up[1])] = up[2] + 0
+            }
+            close(unlock_file)
+        }
+    }
+    NF >= 4 {
+        b = $1 + 0
+        s = tolower($2)
+        m = $3 + 0
+        r = $4 + 0
+        if (s == "" || b < cut_24h || b > now_ts + 300) next
+        if ((s in ut) && (b + 300) <= ut[s]) next
+        key = b "|" s
+        if (!(key in bm) || m > bm[key]) bm[key] = m
+        if (!(key in br) || r > br[key]) br[key] = r
+        b_seen[key] = 1
+    }
+    END {
+        for (key in b_seen) {
+            split(key, kp, "|")
+            b = kp[1] + 0
+            s = kp[2]
+            m = bm[key] + 0
+            r = br[key] + 0
+            printf "%d|%s|%d|%d\n", b, s, m, r > hist_out
+            all_u[s] = 1
+            d24_m[s] += m
+            d24_r[s] += r
+            if (b >= cut_1h - 299) {
+                h1_m[s] += m
+                h1_r[s] += r
+            }
+        }
+        close(hist_out)
+        for (s in all_u) {
+            printf "%s|%d|%d|%d|%d\n", s, h1_m[s]+0, h1_r[s]+0, d24_m[s]+0, d24_r[s]+0
+        }
+    }
+    ' "$hist_file" "$bkt_file" > "$out_summary" 2>/dev/null || true
+
+    if [[ "$read_only" != "true" && -f "$tmp_new_hist" ]]; then
+        mv -f "$tmp_new_hist" "$hist_file" 2>/dev/null || rm -f "$tmp_new_hist"
+    else
+        rm -f "$tmp_new_hist"
+    fi
 }
 
 # ==============================================================================
-# AUTO-REMEDIATION ON CRITICAL (LOCK ACCOUNT & HOLD QUEUE)
+# AUTO-REMEDIATION ON CRITICAL (SINGLE-ACCOUNT LOCK, CACHE FLUSH & QUEUE HOLD)
+# Strictly injection-safe (validated email passed via stdin, bounded by timeout)
 # ==============================================================================
 format_already_locked_msg() {
     local account="$1"
@@ -630,8 +1148,55 @@ format_already_locked_msg() {
     fi
 }
 
+zmprov_account_action() {
+    local action="$1"   # "lock", "unlock", or "flush"
+    local account="$2"
+
+    if ! is_valid_email_account "$account"; then
+        log_msg "WARN" "Refused zmprov ${action} for invalid account identifier: ${account}"
+        return 2
+    fi
+
+    if [[ -n "$ZSM_ZMPROV_CMD" ]]; then
+        case "$action" in
+            lock)   run_with_timeout "$ZMPROV_TIMEOUT_SECONDS" "$ZSM_ZMPROV_CMD" ma "$account" zimbraAccountStatus locked >/dev/null 2>&1 ;;
+            unlock) run_with_timeout "$ZMPROV_TIMEOUT_SECONDS" "$ZSM_ZMPROV_CMD" ma "$account" zimbraAccountStatus active >/dev/null 2>&1 ;;
+            flush)  run_with_timeout "$ZMPROV_TIMEOUT_SECONDS" "$ZSM_ZMPROV_CMD" fc account "$account" >/dev/null 2>&1 ;;
+        esac
+        return $?
+    fi
+
+    if [[ ! -x /opt/zimbra/bin/zmprov ]]; then
+        return 127
+    fi
+
+    # Pass validated account via stdin to eliminate all shell quote/command injection vectors
+    case "$action" in
+        lock)
+            printf '%s\n' "$account" | run_with_timeout "$ZMPROV_TIMEOUT_SECONDS" \
+                su - zimbra -c 'IFS= read -r a && exec /opt/zimbra/bin/zmprov ma "$a" zimbraAccountStatus locked' >/dev/null 2>&1
+            ;;
+        unlock)
+            printf '%s\n' "$account" | run_with_timeout "$ZMPROV_TIMEOUT_SECONDS" \
+                su - zimbra -c 'IFS= read -r a && exec /opt/zimbra/bin/zmprov ma "$a" zimbraAccountStatus active' >/dev/null 2>&1
+            ;;
+        flush)
+            printf '%s\n' "$account" | run_with_timeout "$ZMPROV_TIMEOUT_SECONDS" \
+                su - zimbra -c 'IFS= read -r a && exec /opt/zimbra/bin/zmprov fc account "$a"' >/dev/null 2>&1
+            ;;
+    esac
+}
+
+# Return codes: 0 = locked/already locked/disabled cleanly; 1 = lock attempted and FAILED (will retry next cycle)
 lock_zimbra_account() {
     local account="$1"
+    local force_relock="${2:-false}"
+
+    if ! is_valid_email_account "$account"; then
+        echo "NOT LOCKED (Invalid or non-mailbox identity - manual check required)"
+        return 0
+    fi
+
     if [[ "$AUTO_LOCK_ON_CRITICAL" != "true" ]]; then
         if is_account_already_locked "$account"; then
             format_already_locked_msg "$account"
@@ -641,71 +1206,134 @@ lock_zimbra_account() {
         return 0
     fi
 
-    if is_account_already_locked "$account"; then
+    if [[ "$force_relock" != "true" ]] && is_account_already_locked "$account"; then
         format_already_locked_msg "$account"
         return 0
     fi
 
-    log_msg "CRITICAL" "Auto-locking compromised spam account: $account"
-
-    if [[ -n "$ZSM_ZMPROV_CMD" ]]; then
-        if $ZSM_ZMPROV_CMD ma "$account" zimbraAccountStatus locked >/dev/null 2>&1; then
-            record_locked_account "$account"
-            echo "LOCKED (Auto-locked now via zmprov)"
-            return 0
-        else
-            echo "NOT LOCKED (zmprov lock failed via $ZSM_ZMPROV_CMD)"
-            return 1
-        fi
+    if [[ "$force_relock" == "true" ]]; then
+        log_msg "CRITICAL" "Re-locking account still sending after prior lock: $account"
+    else
+        log_msg "CRITICAL" "Auto-locking compromised spam account: $account"
     fi
 
-    if [[ -x /opt/zimbra/bin/zmprov ]]; then
-        if su - zimbra -c "/opt/zimbra/bin/zmprov ma '$account' zimbraAccountStatus locked" >/dev/null 2>&1; then
-            record_locked_account "$account"
-            echo "LOCKED (Auto-locked now via zmprov)"
-            return 0
-        else
-            echo "NOT LOCKED (zmprov failed - check root/zimbra permissions)"
-            return 1
+    zmprov_account_action "lock" "$account"
+    local rc=$?
+    if (( rc == 0 )); then
+        record_locked_account "$account"
+        local flush_note=""
+        if [[ "$FLUSH_CACHE_ON_LOCK" == "true" ]]; then
+            if zmprov_account_action "flush" "$account"; then
+                flush_note=" + cache flushed"
+            fi
         fi
+        if [[ "$force_relock" == "true" ]]; then
+            echo "RE-LOCKED (Still sending after prior lock - re-locked via zmprov${flush_note})"
+        else
+            echo "LOCKED (Auto-locked now via zmprov${flush_note})"
+        fi
+        return 0
+    elif (( rc == 127 )); then
+        echo "LOCK FAILED (/opt/zimbra/bin/zmprov not found)"
+        return 1
     else
-        echo "NOT LOCKED (/opt/zimbra/bin/zmprov not found)"
+        echo "LOCK FAILED (zmprov error rc=${rc} - will retry next cycle)"
         return 1
     fi
 }
 
+# Holds queued messages matching EITHER envelope sender OR correlated SASL Queue-IDs (catches spoofed From)
 hold_sender_queue() {
     local sender="$1"
-    [[ "$AUTO_HOLD_QUEUE_ON_CRITICAL" != "true" ]] && return 0
+    local qid_map_file="${2:-}"
+    local force_manual="${3:-false}"
 
-    local pq_bin
+    if [[ "$force_manual" != "true" && "$AUTO_HOLD_QUEUE_ON_CRITICAL" != "true" ]]; then
+        return 0
+    fi
+    if ! is_valid_email_account "$sender"; then
+        return 0
+    fi
+
+    local pq_bin ps_bin
     pq_bin=$(find_postqueue_bin)
-    [[ -z "$pq_bin" ]] && return 0
+    ps_bin=$(find_postsuper_bin)
+    [[ -z "$pq_bin" || -z "$ps_bin" ]] && return 0
 
-    local postsuper_bin=""
-    for p in /opt/zimbra/common/sbin/postsuper /opt/zimbra/postfix/sbin/postsuper /usr/sbin/postsuper; do
-        [[ -x "$p" ]] && postsuper_bin="$p" && break
-    done
-    [[ -z "$postsuper_bin" ]] && return 0
-
-    $pq_bin -p 2>/dev/null | awk -v target="$sender" '
-        /^[0-9A-Za-z]+[*!]?[[:space:]]+[0-9]+[[:space:]]/ {
-            qid=$1; sub(/[*!]$/, "", qid); s=tolower($7);
-            if (s == tolower(target)) print qid
+    local qids_to_hold
+    qids_to_hold=$("$pq_bin" -p 2>/dev/null | awk -v target="${sender,,}" -v qmap="$qid_map_file" '
+        BEGIN {
+            if (qmap != "") {
+                while ((getline line < qmap) > 0) {
+                    split(line, p, "|")
+                    if (tolower(p[2]) == target && p[1] != "") match_qid[p[1]] = 1
+                }
+                close(qmap)
+            }
         }
-    ' | $postsuper_bin -h - >/dev/null 2>&1 || true
-    log_msg "CRITICAL" "Placed queued messages from $sender on HOLD"
+        /^[0-9A-Za-z]+[*!]?[[:space:]]+[0-9]+[[:space:]]/ {
+            qid_raw = $1
+            if (index(qid_raw, "!") > 0) next
+            qid = qid_raw
+            sub(/[*!]$/, "", qid)
+            s = tolower($7)
+            if (s == target || (qid in match_qid)) {
+                print qid
+            }
+        }
+    ' || true)
+
+    if [[ -n "$qids_to_hold" ]]; then
+        local cnt
+        cnt=$(printf '%s\n' "$qids_to_hold" | wc -l | tr -d ' ')
+        printf '%s\n' "$qids_to_hold" | "$ps_bin" -h - >/dev/null 2>&1 || true
+        log_msg "CRITICAL" "Placed ${cnt} queued message(s) from ${sender} on HOLD"
+        echo "$cnt"
+    else
+        echo "0"
+    fi
+}
+
+release_sender_held_queue() {
+    local sender="$1"
+    if ! is_valid_email_account "$sender"; then
+        echo "0"
+        return 1
+    fi
+    local pq_bin ps_bin
+    pq_bin=$(find_postqueue_bin)
+    ps_bin=$(find_postsuper_bin)
+    [[ -z "$pq_bin" || -z "$ps_bin" ]] && echo "0" && return 1
+
+    local qids_held
+    qids_held=$("$pq_bin" -p 2>/dev/null | awk -v target="${sender,,}" '
+        /^[0-9A-Za-z]+![[:space:]]+[0-9]+[[:space:]]/ {
+            qid = $1; sub(/!$/, "", qid)
+            if (tolower($7) == target) print qid
+        }
+    ' || true)
+
+    if [[ -n "$qids_held" ]]; then
+        local cnt
+        cnt=$(printf '%s\n' "$qids_held" | wc -l | tr -d ' ')
+        printf '%s\n' "$qids_held" | "$ps_bin" -H - >/dev/null 2>&1 || true
+        log_msg "INFO" "Admin released ${cnt} held message(s) for ${sender}"
+        echo "$cnt"
+    else
+        echo "0"
+    fi
 }
 
 # ==============================================================================
-# TELEGRAM & EMAIL NOTIFICATIONS (100% ASCII-SAFE)
+# TELEGRAM, EMAIL, WEBHOOK NOTIFICATIONS & OUTBOX RETRY QUEUE
+# Credentials passed exclusively via curl stdin (--config -) - hidden from ps aux
 # ==============================================================================
 html_escape() {
     local s="$1"
     s="${s//&/&amp;}"
     s="${s//</&lt;}"
     s="${s//>/&gt;}"
-    echo "$s"
+    printf '%s' "$s"
 }
 
 send_telegram_alert() {
@@ -718,21 +1346,59 @@ send_telegram_alert() {
         return 1
     fi
 
-    local url="https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage"
-    local resp
-    resp=$($ZSM_CURL_CMD -sS -m 15 -X POST "$url" \
-        -d "chat_id=${TELEGRAM_CHAT_ID}" \
-        -d "parse_mode=HTML" \
-        -d "disable_web_page_preview=true" \
-        --data-urlencode "text=${message_html}" 2>&1)
-
-    if echo "$resp" | grep -q '"ok":true'; then
-        log_msg "INFO" "Telegram alert sent successfully to Chat ID ${TELEGRAM_CHAT_ID}"
-        return 0
-    else
-        log_msg "ERROR" "Failed to send Telegram alert: $resp"
-        return 1
+    # Respect Telegram ~20 msg/min group limit across bursts
+    if (( _TG_SENT_IN_CYCLE > 0 )) && [[ "$ZSM_TG_RATE_SLEEP" =~ ^[0-9]+$ ]] && (( ZSM_TG_RATE_SLEEP > 0 )); then
+        sleep "$ZSM_TG_RATE_SLEEP"
     fi
+
+    # Enforce Telegram 4096-char cap safely (preserve valid HTML by trimming plain lines if oversized)
+    if (( ${#message_html} > 3950 )); then
+        message_html="${message_html:0:3900}"
+        message_html="${message_html%$'\n'*}"
+        message_html="${message_html}"$'\n'"<i>... (truncated to fit Telegram 4096-char limit)</i>"
+    fi
+
+    local tmp_msg
+    tmp_msg=$(make_safe_tmp "zsm_tgmsg")
+    printf '%s' "$message_html" > "$tmp_msg"
+
+    local url_esc
+    url_esc=$(curl_cfg_escape "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage")
+
+    local resp=""
+    local attempt=1
+    while (( attempt <= 2 )); do
+        resp=$(printf 'url = "%s"\n' "$url_esc" | "$ZSM_CURL_CMD" -sS -m 15 --config - -X POST \
+            -d "chat_id=${TELEGRAM_CHAT_ID}" \
+            -d "parse_mode=HTML" \
+            -d "disable_web_page_preview=true" \
+            --data-urlencode "text@${tmp_msg}" 2>&1 || true)
+
+        if echo "$resp" | grep -q '"ok":true'; then
+            rm -f "$tmp_msg"
+            _TG_SENT_IN_CYCLE=$(( _TG_SENT_IN_CYCLE + 1 ))
+            log_msg "INFO" "Telegram alert sent successfully to Chat ID ${TELEGRAM_CHAT_ID}"
+            return 0
+        fi
+
+        # Handle Telegram HTTP 429 retry_after politely once
+        if (( attempt == 1 )) && echo "$resp" | grep -q '"retry_after"'; then
+            local wait_sec
+            wait_sec=$(echo "$resp" | sed -n 's/.*"retry_after":[[:space:]]*\([0-9][0-9]*\).*/\1/p' | head -n 1)
+            if [[ "$wait_sec" =~ ^[0-9]+$ ]] && (( wait_sec > 0 )); then
+                (( wait_sec > 15 )) && wait_sec=15
+                (( ZSM_TG_RATE_SLEEP == 0 )) && wait_sec=0
+                (( wait_sec > 0 )) && sleep "$wait_sec"
+                attempt=$(( attempt + 1 ))
+                continue
+            fi
+        fi
+        break
+    done
+
+    rm -f "$tmp_msg"
+    log_msg "ERROR" "Failed to send Telegram alert: ${resp:0:200}"
+    return 1
 }
 
 send_email_via_local_sendmail() {
@@ -757,7 +1423,7 @@ Content-Transfer-Encoding: 8bit
 ${body_text}
 EOF
 )
-    if printf "%s\n" "$email_payload" | $sm_bin -f "$RESOLVED_EMAIL_FROM" -t -i >/dev/null 2>&1; then
+    if printf "%s\n" "$email_payload" | "$sm_bin" -f "$RESOLVED_EMAIL_FROM" -t -i >/dev/null 2>&1; then
         log_msg "INFO" "Email alert sent (Local Postfix) to ${RESOLVED_EMAIL_TO}"
         return 0
     else
@@ -780,12 +1446,10 @@ send_email_via_external_smtp() {
     local smtp_url="${proto}://${SMTP_HOST}:${SMTP_PORT}"
 
     local tls_flag=""
-    if [[ "$SMTP_TLS" == "true" ]]; then
-        tls_flag="--ssl-reqd"
-    fi
+    [[ "$SMTP_TLS" == "true" ]] && tls_flag="--ssl-reqd"
 
     local tmp_mail
-    tmp_mail=$(mktemp 2>/dev/null || echo "/tmp/zsm_mail_$$")
+    tmp_mail=$(make_safe_tmp "zsm_mail")
     cat <<EOF > "$tmp_mail"
 From: Zimbra Spam Monitor <${SMTP_USER}>
 To: ${RESOLVED_EMAIL_TO}
@@ -801,15 +1465,21 @@ EOF
     local rcpt_args=()
     IFS=',' read -ra ADDR_LIST <<< "$RESOLVED_EMAIL_TO"
     for addr in "${ADDR_LIST[@]}"; do
-        addr=$(echo "$addr" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+        addr="${addr#"${addr%%[![:space:]]*}"}"
+        addr="${addr%"${addr##*[![:space:]]}"}"
         [[ -n "$addr" ]] && rcpt_args+=(--mail-rcpt "$addr")
     done
 
+    local url_esc cred_esc
+    url_esc=$(curl_cfg_escape "$smtp_url")
+    cred_esc=$(curl_cfg_escape "${SMTP_USER}:${SMTP_PASS}")
+
+    # Pass SMTP URL and credentials via stdin (--config -) so password never appears in ps aux
     # shellcheck disable=SC2086
-    if $ZSM_CURL_CMD -sS -m 20 --url "$smtp_url" $tls_flag \
+    if printf 'url = "%s"\nuser = "%s"\n' "$url_esc" "$cred_esc" | \
+        "$ZSM_CURL_CMD" -sS -m 20 --config - $tls_flag \
         --mail-from "$SMTP_USER" \
         "${rcpt_args[@]}" \
-        --user "${SMTP_USER}:${SMTP_PASS}" \
         -T "$tmp_mail" >/dev/null 2>&1; then
         rm -f "$tmp_mail"
         log_msg "INFO" "Email alert sent (External SMTP ${SMTP_HOST}) to ${RESOLVED_EMAIL_TO}"
@@ -855,16 +1525,418 @@ send_email_alert() {
     fi
 }
 
+send_webhook_alert() {
+    local payload_json="$1"
+    if [[ "$WEBHOOK_ENABLED" != "true" ]]; then
+        return 0
+    fi
+    if [[ -z "$WEBHOOK_URL" ]]; then
+        log_msg "WARN" "Webhook is enabled, but WEBHOOK_URL is empty"
+        return 1
+    fi
+
+    local tmp_wh
+    tmp_wh=$(make_safe_tmp "zsm_wh")
+    printf '%s' "$payload_json" > "$tmp_wh"
+
+    local url_esc
+    url_esc=$(curl_cfg_escape "$WEBHOOK_URL")
+
+    local resp
+    resp=$(printf 'url = "%s"\n' "$url_esc" | "$ZSM_CURL_CMD" -sS -m 15 --config - -X POST \
+        -H "Content-Type: application/json" \
+        --data-binary "@${tmp_wh}" 2>&1)
+    local rc=$?
+    rm -f "$tmp_wh"
+
+    if (( rc == 0 )); then
+        log_msg "INFO" "Webhook alert sent (${WEBHOOK_FORMAT})"
+        return 0
+    else
+        log_msg "ERROR" "Failed to send Webhook alert: ${resp:0:200}"
+        return 1
+    fi
+}
+
+build_webhook_payload() {
+    local plain_text="$1"
+    local generic_json="$2"
+    case "$WEBHOOK_FORMAT" in
+        slack)
+            printf '{"text":"%s"}' "$(json_escape "$plain_text")"
+            ;;
+        discord)
+            local short_txt="$plain_text"
+            (( ${#short_txt} > 1920 )) && short_txt="${short_txt:0:1900}..."
+            printf '{"content":"```\\n%s\\n```"}' "$(json_escape "$short_txt")"
+            ;;
+        *)
+            printf '%s' "$generic_json"
+            ;;
+    esac
+}
+
+queue_outbox_message() {
+    local dedup_id="$1"
+    local channel="$2"
+    local subject="$3"
+    local total_queue="$4"
+    local payload="$5"
+    local now_ts="${ZSM_NOW_EPOCH:-$(date +%s)}"
+    local outbox_dir="$STATE_DIR/outbox"
+    mkdir -p "$outbox_dir" 2>/dev/null || true
+
+    local safe_id
+    safe_id=$(printf '%s' "${dedup_id}_${channel}" | tr -c 'a-zA-Z0-9._-' '_')
+    local fpath="${outbox_dir}/${safe_id}.msg"
+    local created_ts="$now_ts"
+    local attempts=1
+    if [[ -f "$fpath" ]]; then
+        local old_c old_a
+        old_c=$(sed -n 's/^CREATED_TS=//p' "$fpath" | head -n 1)
+        old_a=$(sed -n 's/^ATTEMPTS=//p' "$fpath" | head -n 1)
+        [[ "$old_c" =~ ^[0-9]+$ ]] && created_ts="$old_c"
+        [[ "$old_a" =~ ^[0-9]+$ ]] && attempts="$old_a"
+    fi
+
+    (
+        umask 077
+        {
+            printf 'CHANNEL=%s\n' "$channel"
+            printf 'ATTEMPTS=%s\n' "$attempts"
+            printf 'CREATED_TS=%s\n' "$created_ts"
+            printf 'TOTAL_QUEUE=%s\n' "$total_queue"
+            printf 'SUBJECT=%s\n' "${subject//$'\n'/ }"
+            printf '%s\n' "---PAYLOAD---"
+            printf '%s' "$payload"
+        } > "$fpath"
+    )
+    log_msg "WARN" "Queued failed ${channel} alert to outbox for retry (${safe_id})"
+}
+
+flush_alert_outbox() {
+    local outbox_dir="$STATE_DIR/outbox"
+    [[ ! -d "$outbox_dir" ]] && return 0
+
+    local now_ts="${ZSM_NOW_EPOCH:-$(date +%s)}"
+    local processed=0
+    local fpath
+    for fpath in "$outbox_dir"/*.msg; do
+        [[ ! -f "$fpath" ]] && continue
+        (( processed >= 10 )) && break
+
+        local channel attempts created_ts total_q subject payload
+        channel=$(sed -n 's/^CHANNEL=//p' "$fpath" | head -n 1)
+        attempts=$(sed -n 's/^ATTEMPTS=//p' "$fpath" | head -n 1)
+        created_ts=$(sed -n 's/^CREATED_TS=//p' "$fpath" | head -n 1)
+        total_q=$(sed -n 's/^TOTAL_QUEUE=//p' "$fpath" | head -n 1)
+        subject=$(sed -n 's/^SUBJECT=//p' "$fpath" | head -n 1)
+        payload=$(awk 'found {print} /^---PAYLOAD---$/ {found=1}' "$fpath")
+
+        [[ ! "$attempts" =~ ^[0-9]+$ ]] && attempts=1
+        [[ ! "$created_ts" =~ ^[0-9]+$ ]] && created_ts="$now_ts"
+        [[ ! "$total_q" =~ ^[0-9]+$ ]] && total_q=0
+
+        # Drop expired (> 60 mins) or exhausted (>= 6 retries) outbox messages
+        if (( attempts >= 6 )) || (( now_ts > created_ts && now_ts - created_ts > 3600 )); then
+            log_msg "WARN" "Dropping expired outbox alert $(basename "$fpath") after ${attempts} attempts"
+            rm -f "$fpath"
+            continue
+        fi
+
+        local ok=1
+        case "$channel" in
+            telegram) send_telegram_alert "$payload" && ok=0 ;;
+            email)    send_email_alert "$subject" "$payload" "$total_q" && ok=0 ;;
+            webhook)  send_webhook_alert "$payload" && ok=0 ;;
+            *)        rm -f "$fpath"; continue ;;
+        esac
+
+        if (( ok == 0 )); then
+            log_msg "INFO" "Delivered queued outbox alert $(basename "$fpath") on retry #${attempts}"
+            rm -f "$fpath"
+        else
+            local next_att=$(( attempts + 1 ))
+            awk -v na="$next_att" 'NR==2 && /^ATTEMPTS=/ {print "ATTEMPTS=" na; next} {print}' "$fpath" > "${fpath}.tmp" 2>/dev/null && mv -f "${fpath}.tmp" "$fpath"
+        fi
+        processed=$(( processed + 1 ))
+    done
+}
+
+# Dispatches across all enabled channels; queues failures to outbox; returns 0 if >=1 succeeded
+dispatch_notifications() {
+    local dedup_id="$1"
+    local tg_html="$2"
+    local mail_subj="$3"
+    local mail_body="$4"
+    local total_q="$5"
+    local wh_json="${6:-}"
+
+    local any_enabled=0
+    local any_ok=0
+
+    if [[ "$TELEGRAM_ENABLED" == "true" ]]; then
+        any_enabled=1
+        if send_telegram_alert "$tg_html"; then
+            any_ok=1
+        elif [[ -n "$TELEGRAM_BOT_TOKEN" && -n "$TELEGRAM_CHAT_ID" ]]; then
+            queue_outbox_message "$dedup_id" "telegram" "$mail_subj" "$total_q" "$tg_html"
+        fi
+    fi
+
+    if [[ "$EMAIL_ENABLED" == "true" ]]; then
+        any_enabled=1
+        if send_email_alert "$mail_subj" "$mail_body" "$total_q"; then
+            any_ok=1
+        else
+            queue_outbox_message "$dedup_id" "email" "$mail_subj" "$total_q" "$mail_body"
+        fi
+    fi
+
+    if [[ "$WEBHOOK_ENABLED" == "true" && -n "$wh_json" ]]; then
+        any_enabled=1
+        if send_webhook_alert "$wh_json"; then
+            any_ok=1
+        elif [[ -n "$WEBHOOK_URL" ]]; then
+            queue_outbox_message "$dedup_id" "webhook" "$mail_subj" "$total_q" "$wh_json"
+        fi
+    fi
+
+    if (( any_enabled == 0 || any_ok == 1 )); then
+        return 0
+    fi
+    return 1
+}
+
 # ==============================================================================
-# ZIMBRA LOG (/var/log/zimbra.log) & POSTFIX QUEUE (postqueue) ANALYSIS
+# ZIMBRA LOG (/var/log/zimbra.log, mailbox.log, audit.log) & POSTFIX QUEUE ENGINE
+# Ultra-low RAM/CPU via Early Timestamp Pruning, per-second mktime() cache,
+# C-speed grep pre-filters, and logrotate (.1) continuity.
 # ==============================================================================
+parse_first_line_epoch() {
+    local sample_line="$1"
+    local now_epoch="$2"
+    local cur_year="$3"
+    local awk_bin="$4"
+    [[ -z "$sample_line" ]] && echo "0" && return 0
+
+    printf '%s\n' "$sample_line" | "$awk_bin" -v now_epoch="$now_epoch" -v cur_year="$cur_year" '
+    BEGIN {
+        split("Jan Feb Mar Apr May Jun Jul Aug Sep Oct Nov Dec", mnames, " ")
+        for (i = 1; i <= 12; i++) m_map[mnames[i]] = sprintf("%02d", i)
+    }
+    {
+        if (match($0, /^[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9][T ][0-9][0-9]:[0-9][0-9]:[0-9][0-9]/)) {
+            s = substr($0, 1, 19)
+            print mktime(substr(s,1,4) " " substr(s,6,2) " " substr(s,9,2) " " substr(s,12,2) " " substr(s,15,2) " " substr(s,18,2))
+            exit
+        }
+        if (($1 in m_map) && ($2 ~ /^[0-9]+$/) && ($3 ~ /^[0-9][0-9]:[0-9][0-9]:[0-9][0-9]$/)) {
+            split($3, hms, ":")
+            ts = mktime(cur_year " " m_map[$1] " " sprintf("%02d", $2 + 0) " " hms[1] " " hms[2] " " hms[3])
+            if (ts > now_epoch + 86400) {
+                ts = mktime((cur_year - 1) " " m_map[$1] " " sprintf("%02d", $2 + 0) " " hms[1] " " hms[2] " " hms[3])
+            }
+            print ts
+            exit
+        }
+        print 0
+    }' 2>/dev/null || echo "0"
+}
+
+find_rotated_zimbra_log() {
+    if [[ -r "${ZIMBRA_LOG_FILE}.1" ]]; then
+        echo "${ZIMBRA_LOG_FILE}.1"
+        return 0
+    fi
+    # Check dateext uncompressed rotated log (e.g. zimbra.log-20261108)
+    local latest=""
+    latest=$(ls -1t "${ZIMBRA_LOG_FILE}"-[0-9]* 2>/dev/null | grep -Ev '\.(gz|bz2|xz|zst)$' | head -n 1 || true)
+    if [[ -n "$latest" && -r "$latest" ]]; then
+        echo "$latest"
+    fi
+}
+
+stream_zimbra_log_window() {
+    local prune_cutoff="$1"
+    local now_epoch="$2"
+    local cur_year="$3"
+    local awk_bin="$4"
+
+    # Fast 1-line check (reads ~100 bytes): detects recent logrotate without double-reading file
+    local file_first_line file_first_ts
+    file_first_line=$(head -n 1 "$ZIMBRA_LOG_FILE" 2>/dev/null || true)
+    file_first_ts=$(parse_first_line_epoch "$file_first_line" "$now_epoch" "$cur_year" "$awk_bin")
+
+    if [[ "$file_first_ts" =~ ^[0-9]+$ ]] && (( file_first_ts > 0 && file_first_ts >= prune_cutoff )); then
+        local prev_log
+        prev_log=$(find_rotated_zimbra_log)
+        if [[ -n "$prev_log" ]]; then
+            tail -n "$LOG_TAIL_LINES" "$prev_log" 2>/dev/null
+        fi
+        cat "$ZIMBRA_LOG_FILE" 2>/dev/null
+        return 0
+    fi
+
+    # Only probe for spam-storm expansion (> LOG_TAIL_LINES within window) if file exceeds ~200 bytes/line * LOG_TAIL_LINES
+    local fsize=0
+    local probe_bytes=$(( LOG_TAIL_LINES * 200 ))
+    fsize=$(stat -c %s "$ZIMBRA_LOG_FILE" 2>/dev/null || wc -c < "$ZIMBRA_LOG_FILE" 2>/dev/null || echo "0")
+    if [[ "$fsize" =~ ^[0-9]+$ ]] && (( fsize > probe_bytes && LOG_MAX_TAIL_LINES > LOG_TAIL_LINES )); then
+        local first_tail_line first_ts
+        first_tail_line=$(tail -n "$LOG_TAIL_LINES" "$ZIMBRA_LOG_FILE" 2>/dev/null | head -n 1 || true)
+        first_ts=$(parse_first_line_epoch "$first_tail_line" "$now_epoch" "$cur_year" "$awk_bin")
+        if [[ "$first_ts" =~ ^[0-9]+$ ]] && (( first_ts > 0 && first_ts >= prune_cutoff )); then
+            tail -n "$LOG_MAX_TAIL_LINES" "$ZIMBRA_LOG_FILE" 2>/dev/null
+            return 0
+        fi
+    fi
+
+    tail -n "$LOG_TAIL_LINES" "$ZIMBRA_LOG_FILE" 2>/dev/null
+}
+
+# Single-server auxiliary log reader (mailbox.log for real Webmail IPs; audit.log for Brute-Force & Auth-After-Fail)
+# Pre-filtered with C-speed grep so RAM < 3MB and CPU < 0.03s even on busy servers.
+analyze_aux_zimbra_logs() {
+    local webmail_ips_out="$1"
+    local auth_events_out="$2"
+    local now_epoch="$3"
+    local local_ips="$4"
+    local awk_bin="$5"
+
+    : > "$webmail_ips_out"
+    : > "$auth_events_out"
+
+    local win_cutoff=$(( now_epoch - LOOKBACK_MINUTES * 60 ))
+
+    # 1. mailbox.log: real originating IP (oip= / ip=) for Webmail/SOAP/ActiveSync SendMsg
+    if [[ -r "$ZIMBRA_MAILBOX_LOG_FILE" ]]; then
+        tail -n "$AUX_LOG_TAIL_LINES" "$ZIMBRA_MAILBOX_LOG_FILE" 2>/dev/null | \
+            grep -F "smtp - Sending message" 2>/dev/null | \
+            "$awk_bin" -v win_cutoff="$win_cutoff" -v now_epoch="$now_epoch" -v local_ips="$local_ips" '
+            BEGIN {
+                n = split(local_ips, arr, /[[:space:],]+/)
+                for (i = 1; i <= n; i++) if (arr[i] != "") is_lip[arr[i]] = 1
+                is_lip["127.0.0.1"] = 1; is_lip["::1"] = 1
+                prev_k = ""; prev_ts = 0
+            }
+            {
+                k = substr($0, 1, 19)
+                if (k == prev_k) {
+                    ts = prev_ts
+                } else if (k ~ /^[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9] [0-9][0-9]:[0-9][0-9]:[0-9][0-9]$/) {
+                    ts = mktime(substr(k,1,4) " " substr(k,6,2) " " substr(k,9,2) " " substr(k,12,2) " " substr(k,15,2) " " substr(k,18,2))
+                    prev_k = k; prev_ts = ts
+                } else {
+                    ts = 0
+                }
+                if (ts > 0 && (ts < win_cutoff || ts > now_epoch + 300)) next
+
+                acct = ""
+                if (match($0, /name=[^;\] ]+/)) {
+                    acct = tolower(substr($0, RSTART + 5, RLENGTH - 5))
+                }
+                if (acct == "" || index(acct, "@") == 0) next
+
+                cip = ""
+                if (match($0, /oip=[0-9a-fA-F.:]+/)) {
+                    cip = substr($0, RSTART + 4, RLENGTH - 4)
+                }
+                if ((cip == "" || (cip in is_lip)) && match($0, /[;\[]ip=[0-9a-fA-F.:]+/)) {
+                    cip = substr($0, RSTART + 4, RLENGTH - 4)
+                }
+                if (cip != "" && !(cip in is_lip)) {
+                    pair = acct "|" cip
+                    if (!(pair in seen)) {
+                        seen[pair] = 1
+                        print pair
+                    }
+                }
+            }' >> "$webmail_ips_out" 2>/dev/null || true
+    fi
+
+    # 2. audit.log: failed auth brute-force & successful Auth after repeated failures (compromise signal)
+    if [[ -r "$ZIMBRA_AUDIT_LOG_FILE" ]]; then
+        tail -n "$AUX_LOG_TAIL_LINES" "$ZIMBRA_AUDIT_LOG_FILE" 2>/dev/null | \
+            grep -E "cmd=Auth|authentication failed|invalid password" 2>/dev/null | \
+            "$awk_bin" -v win_cutoff="$win_cutoff" -v now_epoch="$now_epoch" -v local_ips="$local_ips" \
+                -v fail_min="$AUTH_FAIL_BEFORE_SUCCESS_MIN" -v web_out="$webmail_ips_out" '
+            BEGIN {
+                n = split(local_ips, arr, /[[:space:],]+/)
+                for (i = 1; i <= n; i++) if (arr[i] != "") is_lip[arr[i]] = 1
+                is_lip["127.0.0.1"] = 1; is_lip["::1"] = 1
+                prev_k = ""; prev_ts = 0
+            }
+            {
+                k = substr($0, 1, 19)
+                if (k == prev_k) {
+                    ts = prev_ts
+                } else if (k ~ /^[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9] [0-9][0-9]:[0-9][0-9]:[0-9][0-9]$/) {
+                    ts = mktime(substr(k,1,4) " " substr(k,6,2) " " substr(k,9,2) " " substr(k,12,2) " " substr(k,15,2) " " substr(k,18,2))
+                    prev_k = k; prev_ts = ts
+                } else {
+                    ts = 0
+                }
+                if (ts > 0 && (ts < win_cutoff || ts > now_epoch + 300)) next
+
+                cip = ""
+                if (match($0, /oip=[0-9a-fA-F.:]+/)) {
+                    cip = substr($0, RSTART + 4, RLENGTH - 4)
+                }
+                if ((cip == "" || (cip in is_lip)) && match($0, /[;\[]ip=[0-9a-fA-F.:]+/)) {
+                    cip = substr($0, RSTART + 4, RLENGTH - 4)
+                }
+                if (cip == "" || (cip in is_lip)) next
+
+                acct = ""
+                if (match($0, /account=[^; ]+/)) {
+                    acct = tolower(substr($0, RSTART + 8, RLENGTH - 8))
+                } else if (match($0, /name=[^;\] ]+/)) {
+                    acct = tolower(substr($0, RSTART + 5, RLENGTH - 5))
+                }
+
+                is_fail = (index($0, "error=") > 0 || index($0, "authentication failed") > 0 || index($0, "invalid password") > 0)
+                if (is_fail) {
+                    fail_ip[cip]++
+                    if (acct != "") fail_pair[acct "|" cip]++
+                } else if (index($0, "cmd=Auth") > 0 && acct != "" && index(acct, "@") > 0) {
+                    # Successful auth: check if this IP had prior failures in this window
+                    fp = fail_pair[acct "|" cip] + 0
+                    fi = fail_ip[cip] + 0
+                    if (fp >= fail_min || fi >= fail_min) {
+                        fc = (fp >= fail_min ? fp : fi)
+                        if (!(acct in compromised) || fc > comp_cnt[acct]) {
+                            compromised[acct] = cip
+                            comp_cnt[acct] = fc
+                        }
+                    }
+                }
+            }
+            END {
+                for (ip in fail_ip) {
+                    printf "FAILIP|%s|%d\n", ip, fail_ip[ip]
+                }
+                for (a in compromised) {
+                    printf "AUTH_AFTER_FAIL|%s|%s|%d\n", a, compromised[a], comp_cnt[a]
+                }
+            }' > "$auth_events_out" 2>/dev/null || true
+    fi
+}
+
 analyze_zimbra_log() {
     local out_file="$1"
     local sys_sum_file="${2:-}"
+    local bkt_file="${3:-}"
+    local qid_map_file="${4:-}"
+    local aux_webmail_file="${5:-}"
+    local sasl_fail_out="${6:-}"
+    local history_scan_mins="${7:-$LOOKBACK_MINUTES}"
+
     : > "$out_file"
-    if [[ -n "$sys_sum_file" ]]; then
-        echo "0|0|0|0" > "$sys_sum_file"
-    fi
+    [[ -n "$sys_sum_file" ]] && echo "0|0|0|0" > "$sys_sum_file"
+    [[ -n "$bkt_file" ]] && : > "$bkt_file"
+    [[ -n "$qid_map_file" ]] && : > "$qid_map_file"
+    [[ -n "$sasl_fail_out" ]] && : > "$sasl_fail_out"
 
     if [[ ! -f "$ZIMBRA_LOG_FILE" ]]; then
         log_msg "WARN" "Zimbra log file not found: $ZIMBRA_LOG_FILE"
@@ -881,31 +1953,45 @@ analyze_zimbra_log() {
     local awk_bin
     awk_bin=$(find_awk_bin)
 
-    tail -n "$LOG_TAIL_LINES" "$ZIMBRA_LOG_FILE" 2>/dev/null | "$awk_bin" \
+    (( history_scan_mins < LOOKBACK_MINUTES )) && history_scan_mins="$LOOKBACK_MINUTES"
+    (( history_scan_mins > 60 )) && history_scan_mins=60
+    local prune_cutoff=$(( now_epoch - (history_scan_mins * 60) - 120 ))
+
+    stream_zimbra_log_window "$prune_cutoff" "$now_epoch" "$cur_year" "$awk_bin" | "$awk_bin" \
         -v now_epoch="$now_epoch" \
         -v cur_year="$cur_year" \
         -v win_mins="$LOOKBACK_MINUTES" \
+        -v hist_mins="$history_scan_mins" \
+        -v prune_cutoff="$prune_cutoff" \
         -v count_internal="$COUNT_INTERNAL_TO_INTERNAL" \
         -v internal_domains="$RESOLVED_INTERNAL_DOMAINS" \
         -v default_domain="$RESOLVED_DEFAULT_DOMAIN" \
+        -v alert_from_addr="${RESOLVED_EMAIL_FROM,,}" \
         -v local_ips="$local_ips" \
+        -v ip_count_mode="$SOURCE_IP_COUNT_MODE" \
         -v amavis_thresh="$AMAVIS_SPAM_SCORE_THRESHOLD" \
         -v unlock_file="$unlock_file" \
-        -v sys_file="$sys_sum_file" '
+        -v webmail_ips_file="$aux_webmail_file" \
+        -v sys_file="$sys_sum_file" \
+        -v bkt_file="$bkt_file" \
+        -v qid_map_file="$qid_map_file" \
+        -v sasl_fail_file="$sasl_fail_out" '
     BEGIN {
-        win_cutoff = now_epoch - (win_mins * 60)
+        win_cutoff  = now_epoch - (win_mins * 60)
+        hist_cutoff = now_epoch - (hist_mins * 60)
         sys_tot = 0; sys_snt = 0; sys_def = 0; sys_bnc = 0
         amavis_limit = amavis_thresh + 0
+        prev_ts_key = ""; prev_ts = 0; prev_hms = ""
 
         n_lip = split(local_ips, lip_arr, /[[:space:],]+/)
         for (i = 1; i <= n_lip; i++) {
             if (lip_arr[i] != "") is_local_ip[lip_arr[i]] = 1
         }
+        is_local_ip["127.0.0.1"] = 1
+        is_local_ip["::1"] = 1
 
         split("Jan Feb Mar Apr May Jun Jul Aug Sep Oct Nov Dec", mnames, " ")
-        for (i = 1; i <= 12; i++) {
-            m_map[mnames[i]] = sprintf("%02d", i)
-        }
+        for (i = 1; i <= 12; i++) m_map[mnames[i]] = sprintf("%02d", i)
 
         n_dom = split(tolower(internal_domains), dom_arr, /[[:space:],]+/)
         for (i = 1; i <= n_dom; i++) {
@@ -921,32 +2007,73 @@ analyze_zimbra_log() {
             }
             close(unlock_file)
         }
+
+        if (webmail_ips_file != "") {
+            while ((getline wline < webmail_ips_file) > 0) {
+                split(wline, wparts, "|")
+                if (wparts[1] != "" && wparts[2] != "") {
+                    wa = tolower(wparts[1]); wi = wparts[2]
+                    if (!(wa in aux_ip_list)) aux_ip_list[wa] = wi
+                    else if (index(" " aux_ip_list[wa] " ", " " wi " ") == 0) aux_ip_list[wa] = aux_ip_list[wa] " " wi
+                }
+            }
+            close(webmail_ips_file)
+        }
     }
 
-    function parse_epoch(line,   mo, dy, hms, y, hr, mi, sc, iso, ts) {
+    # Ultra-fast timestamp parser with per-second cache (avoids field split & mktime on 99.5% of lines)
+    function parse_epoch_fast(line,   k, y, mo, dy, hr, mi, sc, ts, p1, p2, p3, hms) {
         line_hms = ""
-        if (match(line, /^[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9]/)) {
-            iso = substr(line, 1, 19)
-            y  = substr(iso, 1, 4)
-            mo = substr(iso, 6, 2)
-            dy = substr(iso, 9, 2)
-            hr = substr(iso, 12, 2)
-            mi = substr(iso, 15, 2)
-            sc = substr(iso, 18, 2)
+        # Case 1: Standard syslog "Nov  8 14:58:40 ..." or "Nov 18 14:58:40 ..." (15 chars)
+        if (substr(line, 16, 1) == " " && substr(line, 10, 1) == ":" && substr(line, 13, 1) == ":") {
+            k = substr(line, 1, 15)
+            if (k == prev_ts_key) {
+                line_hms = prev_hms
+                return prev_ts
+            }
+            mo = m_map[substr(k, 1, 3)]
+            if (mo != "") {
+                dy = substr(k, 5, 2) + 0
+                line_hms = substr(k, 8, 8)
+                hr = substr(k, 8, 2); mi = substr(k, 11, 2); sc = substr(k, 14, 2)
+                ts = mktime(cur_year " " mo " " sprintf("%02d", dy) " " hr " " mi " " sc)
+                if (ts > now_epoch + 86400) {
+                    ts = mktime((cur_year - 1) " " mo " " sprintf("%02d", dy) " " hr " " mi " " sc)
+                }
+                prev_ts_key = k; prev_ts = ts; prev_hms = line_hms
+                return ts
+            }
+        }
+        # Case 2: ISO-8601 "2026-11-08T14:58:40..."
+        if (substr(line, 5, 1) == "-" && substr(line, 8, 1) == "-" && substr(line, 11, 1) == "T") {
+            k = substr(line, 1, 19)
+            if (k == prev_ts_key) {
+                line_hms = prev_hms
+                return prev_ts
+            }
+            y = substr(k, 1, 4); mo = substr(k, 6, 2); dy = substr(k, 9, 2)
+            hr = substr(k, 12, 2); mi = substr(k, 15, 2); sc = substr(k, 18, 2)
             line_hms = hr ":" mi ":" sc
             ts = mktime(y " " mo " " dy " " hr " " mi " " sc)
+            prev_ts_key = k; prev_ts = ts; prev_hms = line_hms
             return ts
         }
+        # Fallback for single-space syslog days (e.g. "Nov 8 14:58:40")
         if (($1 in m_map) && ($2 ~ /^[0-9]+$/) && ($3 ~ /^[0-9][0-9]:[0-9][0-9]:[0-9][0-9]$/)) {
+            k = $1 " " $2 " " $3
+            if (k == prev_ts_key) {
+                line_hms = prev_hms
+                return prev_ts
+            }
             mo = m_map[$1]
             dy = sprintf("%02d", $2 + 0)
             line_hms = $3
             split($3, hms, ":")
-            hr = hms[1]; mi = hms[2]; sc = hms[3]
-            ts = mktime(cur_year " " mo " " dy " " hr " " mi " " sc)
+            ts = mktime(cur_year " " mo " " dy " " hms[1] " " hms[2] " " hms[3])
             if (ts > now_epoch + 86400) {
-                ts = mktime((cur_year - 1) " " mo " " dy " " hr " " mi " " sc)
+                ts = mktime((cur_year - 1) " " mo " " dy " " hms[1] " " hms[2] " " hms[3])
             }
+            prev_ts_key = k; prev_ts = ts; prev_hms = line_hms
             return ts
         }
         return 0
@@ -958,7 +2085,19 @@ analyze_zimbra_log() {
         return ""
     }
 
-    function record_ip(acct, cip) {
+    function ip_subnet_key(cip,   parts, n) {
+        if (ip_count_mode == "exact") return cip
+        if (index(cip, ".") > 0) {
+            n = split(cip, parts, ".")
+            if (n == 4) return parts[1] "." parts[2] "." parts[3] ".0/24"
+        } else if (index(cip, ":") > 0) {
+            n = split(cip, parts, ":")
+            if (n >= 4) return parts[1] ":" parts[2] ":" parts[3] ":" parts[4] "::/64"
+        }
+        return cip
+    }
+
+    function record_ip(acct, cip,   net) {
         if (cip == "" || cip == "127.0.0.1" || cip == "::1" || cip == "localhost" || cip == "webmail/local") {
             if (!(acct in has_any_ip)) {
                 has_any_ip[acct] = 1
@@ -968,28 +2107,55 @@ analyze_zimbra_log() {
         }
         if (!((acct "|" cip) in seen_ip)) {
             seen_ip[acct "|" cip] = 1
-            win_ip_cnt[acct]++
+            win_real_ip_cnt[acct]++
             has_any_ip[acct] = 1
             if (sender_ips[acct] == "" || sender_ips[acct] == "webmail/local") {
                 sender_ips[acct] = cip
-            } else if (win_ip_cnt[acct] <= 5) {
+            } else if (win_real_ip_cnt[acct] <= 5) {
                 sender_ips[acct] = sender_ips[acct] ", " cip
             }
         }
+        net = ip_subnet_key(cip)
+        if (!((acct "|" net) in seen_net)) {
+            seen_net[acct "|" net] = 1
+            win_net_cnt[acct]++
+        }
+    }
+
+    function is_system_pickup_sender(addr,   d) {
+        if (addr == "" || addr == "<>" || addr == "mailer-daemon") return 1
+        if (alert_from_addr != "" && addr == alert_from_addr) return 1
+        if (addr ~ /^(root|zimbra|postmaster|daemon|nobody|cron|logwatch|noreply-monitor)@/) return 1
+        d = extract_domain(addr)
+        if (d == "" || d == "localhost" || d ~ /^localhost\./ || d ~ /\.localdomain$/) return 1
+        return 0
     }
 
     {
+        # EARLY PRUNING: Skip lines outside [prune_cutoff, now_epoch + 300] BEFORE regex or array allocation!
+        ts = parse_epoch_fast($0)
+        if (ts > 0 && (ts < prune_cutoff || ts > now_epoch + 300)) next
+
         has_postfix = (index($0, "postfix/") > 0)
         has_amavis  = (index($0, "amavis[") > 0)
         if (!has_postfix && !has_amavis) next
 
-        ts = parse_epoch($0)
+        # 0. Postfix SASL authentication failure (Brute-force tracking)
+        if (has_postfix && index($0, "authentication failed") > 0 && index($0, "SASL ") > 0) {
+            if (ts >= win_cutoff && match($0, /\[[0-9a-fA-F.:]+\]/)) {
+                fip = substr($0, RSTART + 1, RLENGTH - 2)
+                if (!(fip in is_local_ip)) sasl_fail_ip[fip]++
+            }
+            next
+        }
 
-        # 1. Amavis Content Filter Verdict (SPAM / SPAMMY / INFECTED / High Hits)
+        # 1. Amavis Content Filter Verdict (SPAM / SPAMMY / INFECTED / BANNED / High Hits)
         if (has_amavis) {
             is_amavis_bad = 0
-            if (index($0, "Blocked SPAM") > 0 || index($0, "Passed SPAMMY") > 0 ||
-                index($0, "Blocked INFECTED") > 0 || index($0, "Passed INFECTED") > 0) {
+            if (index($0, "Blocked SPAM") > 0 || index($0, "Passed SPAM ") > 0 ||
+                index($0, "Passed SPAMMY") > 0 || index($0, "Blocked INFECTED") > 0 ||
+                index($0, "Passed INFECTED") > 0 || index($0, "Blocked BANNED") > 0 ||
+                index($0, "Passed BANNED") > 0) {
                 is_amavis_bad = 1
             } else if (match($0, /Hits: -?[0-9]+(\.[0-9]+)?/)) {
                 hits_val = substr($0, RSTART + 6, RLENGTH - 6) + 0
@@ -1014,6 +2180,7 @@ analyze_zimbra_log() {
                         q_amavis_blocked_acct[am_key] = asender
                         q_amavis_blocked_ts[am_key] = ts
                         q_amavis_blocked_hms[am_key] = line_hms
+                        if (aqid != "" && (aqid in q_sasl)) q_amavis_blocked_sasl[am_key] = 1
                         if (aqid != "" && (aqid in q_ip)) {
                             q_amavis_blocked_ip[am_key] = q_ip[aqid]
                         } else if (match($0, /\[[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+\]/)) {
@@ -1055,7 +2222,7 @@ analyze_zimbra_log() {
             next
         }
 
-        # 3. Local Zimbra Webmail / Mynetworks Submission (non-Amavis smtpd)
+        # 3. Local Zimbra Webmail / Trusted Submission (non-SASL smtpd)
         if (index($0, "postfix/smtpd[") > 0 && index($0, ": client=") > 0) {
             qid = ""
             if (match($0, /: [0-9A-Za-z]+: client=/)) {
@@ -1068,8 +2235,28 @@ analyze_zimbra_log() {
                     cip = substr(cip, RSTART + 1, RLENGTH - 2)
                 }
             }
-            if (qid != "" && (cip == "127.0.0.1" || cip == "::1" || (cip in is_local_ip))) {
+            if (qid != "" && (cip in is_local_ip)) {
                 q_local_client[qid] = 1
+                if (!(qid in q_root)) q_root[qid] = qid
+                if (!(qid in q_birth_ts)) q_birth_ts[qid] = ts
+                if (!(qid in q_birth_hms) && line_hms != "") q_birth_hms[qid] = line_hms
+                if (!(qid in q_ip)) q_ip[qid] = "webmail/local"
+            }
+            next
+        }
+
+        # 3b. Local Postfix Pickup (local sendmail / PHP webshell detection)
+        if (index($0, "postfix/pickup[") > 0 && index($0, "uid=") > 0) {
+            qid = ""
+            if (match($0, /: [0-9A-Za-z]+: uid=/)) {
+                qid = substr($0, RSTART + 2, RLENGTH - 8)
+            }
+            puid = ""
+            if (match($0, /uid=[0-9]+/)) {
+                puid = substr($0, RSTART + 4, RLENGTH - 4)
+            }
+            if (qid != "" && puid != "") {
+                q_pickup_uid[qid] = puid
                 if (!(qid in q_root)) q_root[qid] = qid
                 if (!(qid in q_birth_ts)) q_birth_ts[qid] = ts
                 if (!(qid in q_birth_hms) && line_hms != "") q_birth_hms[qid] = line_hms
@@ -1105,8 +2292,9 @@ analyze_zimbra_log() {
             }
             if (qid == "") next
 
-            # Handle internal Amavis / DKIM filter hop (127.0.0.1:10024/10026/10032)
-            if (index($0, "127.0.0.1]:100") > 0 || index($0, "localhost]:100") > 0) {
+            # Handle internal Amavis / DKIM filter hop (127.0.0.1:100xx, localhost:100xx, [::1]:100xx)
+            is_amavis_hop = (index($0, "127.0.0.1]:100") > 0 || index($0, "localhost]:100") > 0 || index($0, "::1]:100") > 0)
+            if (is_amavis_hop) {
                 if (match($0, /queued as [0-9A-Za-z]+/)) {
                     qid2 = substr($0, RSTART + 10, RLENGTH - 10)
                     q_root[qid2] = (qid in q_root ? q_root[qid] : qid)
@@ -1114,6 +2302,7 @@ analyze_zimbra_log() {
                     if (qid in q_from) q_from[qid2] = q_from[qid]
                     if (qid in q_ip) q_ip[qid2] = q_ip[qid]
                     if (qid in q_local_client) q_local_client[qid2] = q_local_client[qid]
+                    if (qid in q_pickup_uid) q_pickup_uid[qid2] = q_pickup_uid[qid]
                     if (qid in q_birth_ts) q_birth_ts[qid2] = q_birth_ts[qid]
                     if (qid in q_birth_hms) q_birth_hms[qid2] = q_birth_hms[qid]
                     if (qid in q_amavis_spam) q_amavis_spam[qid2] = q_amavis_spam[qid]
@@ -1126,6 +2315,7 @@ analyze_zimbra_log() {
 
             sasl_user = (qid in q_sasl ? q_sasl[qid] : "")
             env_from  = (qid in q_from ? q_from[qid] : "")
+            root_qid  = (qid in q_root ? q_root[qid] : qid)
 
             rcpt = ""
             if (match($0, /to=<[^>]+>/)) {
@@ -1135,8 +2325,10 @@ analyze_zimbra_log() {
 
             acct = ""
             is_spoof = 0
+            ev_origin = ""
             if (sasl_user != "") {
                 acct = sasl_user
+                ev_origin = "sasl"
                 if (env_from != "" && env_from != "<>" && env_from != sasl_user) {
                     fdom = extract_domain(env_from)
                     if (fdom != "" && !(fdom in int_dom)) {
@@ -1146,44 +2338,44 @@ analyze_zimbra_log() {
             } else if (env_from != "" && env_from != "<>") {
                 fdom = extract_domain(env_from)
                 if (fdom in int_dom) {
-                    if ((qid in q_local_client) || !(rdom in int_dom)) {
-                        acct = env_from
+                    if ((qid in q_local_client) || (qid in q_pickup_uid) || !(rdom in int_dom)) {
+                        if (!((qid in q_pickup_uid) && is_system_pickup_sender(env_from))) {
+                            acct = env_from
+                            ev_origin = (qid in q_pickup_uid ? "pickup" : "webmail")
+                        }
                     }
+                } else if ((qid in q_pickup_uid) && !(rdom in int_dom) && !is_system_pickup_sender(env_from)) {
+                    # Local script / webshell sending outbound mail with spoofed external From
+                    acct = "local-pickup-uid:" q_pickup_uid[qid]
+                    ev_origin = "pickup"
                 }
             }
             if (acct == "") next
 
-            if (count_internal != "true" && rdom != "" && (rdom in int_dom) && sasl_user == "") {
-                next
-            }
-            if (count_internal != "true" && rdom != "" && (rdom in int_dom) && !is_spoof) {
-                # Internal-to-internal normal mail skipped when COUNT_INTERNAL_TO_INTERNAL=false
+            # Skip benign internal-to-internal mail when COUNT_INTERNAL_TO_INTERNAL=false,
+            # BUT NEVER skip internal malware/phishing flagged by Amavis or Sender Spoofing!
+            is_amavis_flagged = ((qid in q_amavis_spam) || (root_qid in q_amavis_spam))
+            if (count_internal != "true" && rdom != "" && (rdom in int_dom) && !is_spoof && !is_amavis_flagged) {
                 next
             }
 
             st = "other"
-            if (index($0, "127.0.0.1]:100") > 0 && index($0, "discarded") > 0) {
+            if (is_amavis_hop && index($0, "discarded") > 0) {
                 st = "bounced"
             } else if (match($0, /status=[a-z]+/)) {
                 st = substr($0, RSTART + 7, RLENGTH - 7)
+                if (st == "expired") st = "bounced"
             }
 
             counted_qids[qid] = 1
-            root_qid = (qid in q_root ? q_root[qid] : qid)
             counted_qids[root_qid] = 1
 
-            # System cumulative outbound totals up to current alert time
-            sys_tot++
-            if (st == "sent") sys_snt++
-            else if (st == "deferred") sys_def++
-            else if (st == "bounced") sys_bnc++
-
-            # True message submission time (prevents old Postfix queue retries from triggering new alerts)
+            # True message submission time (prevents old Postfix deferred retries from triggering new alerts)
             delay_sec = 0
             if (match($0, /delay=[0-9]+(\.[0-9]+)?/)) {
                 delay_sec = int(substr($0, RSTART + 6, RLENGTH - 6) + 0)
             }
-            if ((qid in q_birth_ts) && q_birth_ts[qid] > 0 && delay_sec <= (win_mins * 60)) {
+            if ((qid in q_birth_ts) && q_birth_ts[qid] > 0 && delay_sec <= (hist_mins * 60)) {
                 submit_ts = q_birth_ts[qid]
             } else if (delay_sec > 0 && ts > 0) {
                 submit_ts = ts - delay_sec
@@ -1193,10 +2385,39 @@ analyze_zimbra_log() {
                 submit_ts = ts
             }
 
-            if (submit_ts < win_cutoff) next
+            if (submit_ts < hist_cutoff) next
             if ((acct in unlock_ts) && submit_ts <= unlock_ts[acct]) next
 
+            # Track QID -> account map for spoof-aware queue hold
+            if (qid_map_file != "") {
+                qid_owner[qid] = acct
+                qid_owner[root_qid] = acct
+            }
+
+            # 5-minute submission-time bucket for idempotent 1h/24h rolling history
+            bkt = int(submit_ts / 300) * 300
+            bkt_key = bkt "|" acct
+            b_mkey = bkt "|" acct "|" root_qid
+            if (!(b_mkey in b_seen_msg)) {
+                b_seen_msg[b_mkey] = 1
+                b_msgs[bkt_key]++
+                all_bkts[bkt_key] = 1
+            }
+            b_rkey = bkt "|" acct "|" root_qid "|" rcpt
+            if (!(b_rkey in b_seen_rcpt)) {
+                b_seen_rcpt[b_rkey] = 1
+                b_rcpts[bkt_key]++
+                all_bkts[bkt_key] = 1
+            }
+
+            # Short-window (LOOKBACK_MINUTES) detailed evaluation
+            if (submit_ts < win_cutoff) next
+
             all_senders[acct] = 1
+            if (submit_ts > win_last_submit_ts[acct]) win_last_submit_ts[acct] = submit_ts
+            if (ev_origin == "sasl") has_sasl[acct] = 1
+            else if (ev_origin == "pickup") has_pickup[acct] = 1
+            else has_webmail[acct] = 1
 
             msg_key = acct "|" root_qid
             if (!(msg_key in seen_msg)) {
@@ -1204,10 +2425,25 @@ analyze_zimbra_log() {
                 win_msgs[acct]++
             }
 
-            win_rcpts[acct]++
-            if (st == "sent") win_sent[acct]++
-            else if (st == "deferred") win_def[acct]++
-            else if (st == "bounced") win_bnc[acct]++
+            # Deduplicate retries per (acct, root_qid, rcpt), keeping final delivery state
+            dr_key = acct "|" root_qid "|" rcpt
+            if (!(dr_key in dr_status)) {
+                dr_status[dr_key] = st
+                win_rcpts[acct]++
+                sys_tot++
+                if (st == "sent") { win_sent[acct]++; sys_snt++ }
+                else if (st == "deferred") { win_def[acct]++; sys_def++ }
+                else if (st == "bounced") { win_bnc[acct]++; sys_bnc++ }
+            } else if (dr_status[dr_key] != st) {
+                old_st = dr_status[dr_key]
+                if (old_st == "sent") { win_sent[acct]--; sys_snt-- }
+                else if (old_st == "deferred") { win_def[acct]--; sys_def-- }
+                else if (old_st == "bounced") { win_bnc[acct]--; sys_bnc-- }
+                dr_status[dr_key] = st
+                if (st == "sent") { win_sent[acct]++; sys_snt++ }
+                else if (st == "deferred") { win_def[acct]++; sys_def++ }
+                else if (st == "bounced") { win_bnc[acct]++; sys_bnc++ }
+            }
 
             if (rcpt != "" && !((acct "|" rcpt) in seen_rcpt)) {
                 seen_rcpt[acct "|" rcpt] = 1
@@ -1220,10 +2456,13 @@ analyze_zimbra_log() {
 
             record_ip(acct, (qid in q_ip ? q_ip[qid] : ""))
 
-            if (is_spoof) {
+            # Count Spoof & Amavis ONCE per unique message (root_qid), NOT per CC/BCC recipient!
+            if (is_spoof && !(msg_key in seen_spoof_msg)) {
+                seen_spoof_msg[msg_key] = 1
                 win_spoof[acct]++
             }
-            if (qid in q_amavis_spam) {
+            if (is_amavis_flagged && !(msg_key in seen_amavis_msg)) {
+                seen_amavis_msg[msg_key] = 1
                 win_amavis[acct]++
             }
 
@@ -1234,7 +2473,10 @@ analyze_zimbra_log() {
                     index(low_line, "barracuda") > 0 || index(low_line, "sorbs") > 0 ||
                     index(low_line, "spamcop") > 0 || index(low_line, "blacklisted") > 0 ||
                     index(low_line, "blocked using") > 0 || index(low_line, "rejected as spam") > 0) {
-                    win_rbl[acct]++
+                    if (!(dr_key in seen_rbl_dr)) {
+                        seen_rbl_dr[dr_key] = 1
+                        win_rbl[acct]++
+                    }
                 }
             }
 
@@ -1247,15 +2489,26 @@ analyze_zimbra_log() {
     }
 
     END {
-        # Include any Amavis Blocked SPAM/INFECTED events that had no postfix/smtp line
+        # Include any Amavis Blocked SPAM/INFECTED/BANNED events that had no postfix/smtp line
         for (k in q_amavis_blocked_acct) {
             if (k in counted_qids) continue
             acct = q_amavis_blocked_acct[k]
             bts  = q_amavis_blocked_ts[k]
-            sys_tot++; sys_bnc++
-            if (bts < win_cutoff) continue
+            if (bts < hist_cutoff) continue
             if ((acct in unlock_ts) && bts <= unlock_ts[acct]) continue
+
+            bkt = int(bts / 300) * 300
+            bkt_key = bkt "|" acct
+            b_msgs[bkt_key]++
+            b_rcpts[bkt_key]++
+            all_bkts[bkt_key] = 1
+
+            if (bts < win_cutoff) continue
+            sys_tot++; sys_bnc++
             all_senders[acct] = 1
+            if (bts > win_last_submit_ts[acct]) win_last_submit_ts[acct] = bts
+            if (k in q_amavis_blocked_sasl) has_sasl[acct] = 1
+            else has_webmail[acct] = 1
             win_msgs[acct]++
             win_rcpts[acct]++
             win_bnc[acct]++
@@ -1267,34 +2520,70 @@ analyze_zimbra_log() {
             }
         }
 
+        # Enrich Webmail/SOAP accounts with real client IPs from mailbox.log
+        for (s in all_senders) {
+            if ((s in has_webmail) && (s in aux_ip_list)) {
+                n_aux = split(aux_ip_list[s], aips, " ")
+                for (i = 1; i <= n_aux; i++) {
+                    if (aips[i] != "") record_ip(s, aips[i])
+                }
+            }
+        }
+
         if (sys_file != "") {
             printf "%d|%d|%d|%d\n", sys_tot, sys_snt, sys_def, sys_bnc > sys_file
         }
+        if (bkt_file != "") {
+            for (bk in all_bkts) {
+                split(bk, bp, "|")
+                printf "%d|%s|%d|%d\n", bp[1], bp[2], b_msgs[bk]+0, b_rcpts[bk]+0 > bkt_file
+            }
+        }
+        if (qid_map_file != "") {
+            for (q in qid_owner) {
+                printf "%s|%s\n", q, qid_owner[q] > qid_map_file
+            }
+        }
+        if (sasl_fail_file != "") {
+            for (ip in sasl_fail_ip) {
+                printf "FAILIP|%s|%d\n", ip, sasl_fail_ip[ip] > sasl_fail_file
+            }
+        }
 
         for (s in all_senders) {
-            m_cnt  = win_msgs[s] + 0
-            r_cnt  = win_rcpts[s] + 0
-            ur_cnt = win_uniq_rcpts[s] + 0
-            ud_cnt = win_uniq_doms[s] + 0
-            s_cnt  = win_sent[s] + 0
-            d_cnt  = win_def[s] + 0
-            b_cnt  = win_bnc[s] + 0
-            i_cnt  = win_ip_cnt[s] + 0
-            sp_cnt = win_spoof[s] + 0
-            am_cnt = win_amavis[s] + 0
-            rb_cnt = win_rbl[s] + 0
+            m_cnt   = win_msgs[s] + 0
+            r_cnt   = win_rcpts[s] + 0
+            ur_cnt  = win_uniq_rcpts[s] + 0
+            ud_cnt  = win_uniq_doms[s] + 0
+            s_cnt   = win_sent[s] + 0
+            d_cnt   = win_def[s] + 0
+            b_cnt   = win_bnc[s] + 0
+            i_cnt   = win_net_cnt[s] + 0
+            ri_cnt  = win_real_ip_cnt[s] + 0
+            sp_cnt  = win_spoof[s] + 0
+            am_cnt  = win_amavis[s] + 0
+            rb_cnt  = win_rbl[s] + 0
+            lst_ts  = win_last_submit_ts[s] + 0
+
+            if ((s in has_sasl) && (s in has_webmail)) orig = "SASL + Webmail/SOAP"
+            else if (s in has_sasl) orig = "SASL (external client)"
+            else if (s in has_pickup) orig = "Local pickup"
+            else if (s in aux_ip_list) orig = "Webmail/SOAP"
+            else orig = "Webmail/SOAP (local)"
+
             ips = (sender_ips[s] != "" ? sender_ips[s] : "webmail/local")
-            if (i_cnt > 5) {
-                ips = ips " (+" (i_cnt - 5) " more)"
+            if (ri_cnt > 5) {
+                ips = ips " (+" (ri_cnt - 5) " more)"
             }
             tspan = (s in win_first_hms ? win_first_hms[s] " -> " win_last_hms[s] : "-")
-            printf "%s|%d|%d|%d|%d|%d|%d|%d|%d|%d|%d|%d|%s|%s\n",
-                s, m_cnt, r_cnt, ur_cnt, ud_cnt, s_cnt, d_cnt, b_cnt, i_cnt, sp_cnt, am_cnt, rb_cnt, ips, tspan
+            printf "%s|%d|%d|%d|%d|%d|%d|%d|%d|%d|%d|%d|%d|%s|%d|%s|%s\n",
+                s, m_cnt, r_cnt, ur_cnt, ud_cnt, s_cnt, d_cnt, b_cnt, i_cnt, ri_cnt, sp_cnt, am_cnt, rb_cnt, orig, lst_ts, ips, tspan
         }
     }
     ' | sort -t'|' -k3,3nr -k2,2nr > "$out_file"
 }
 
+# Inspect Postfix queue: separates Active+Deferred (triggers threshold) from Held ("!") messages
 analyze_postfix_queue() {
     local out_file="$1"
     local summary_file="$2"
@@ -1303,14 +2592,12 @@ analyze_postfix_queue() {
 
     local pq_bin
     pq_bin=$(find_postqueue_bin)
-    if [[ -z "$pq_bin" ]]; then
-        return 0
-    fi
+    [[ -z "$pq_bin" ]] && return 0
 
-    $pq_bin -p 2>/dev/null | awk '
+    "$pq_bin" -p 2>/dev/null | awk -v sum_out="$summary_file" '
     BEGIN {
         total_q = 0; active_q = 0; hold_q = 0; def_q = 0
-        cur_sender = ""; cur_reason = ""
+        cur_sender = ""
     }
     /^[0-9A-Za-z]+[*!]?[[:space:]]+[0-9]+[[:space:]]/ {
         qid_raw = $1
@@ -1318,12 +2605,15 @@ analyze_postfix_queue() {
         if (sender == "" || sender ~ /^from=/) next
 
         total_q++
+        is_hold = 0
         if (index(qid_raw, "*") > 0) active_q++
-        else if (index(qid_raw, "!") > 0) hold_q++
+        else if (index(qid_raw, "!") > 0) { hold_q++; is_hold = 1 }
         else def_q++
 
         if (sender != "mailer-daemon" && sender != "<>") {
-            q_user[sender]++
+            q_seen[sender] = 1
+            if (is_hold) q_hold[sender]++
+            else q_live[sender]++
             cur_sender = sender
         } else {
             cur_sender = ""
@@ -1341,13 +2631,13 @@ analyze_postfix_queue() {
         }
     }
     END {
-        printf "%d|%d|%d|%d\n", total_q, active_q, def_q, hold_q > "'"$summary_file"'"
-        for (u in q_user) {
+        printf "%d|%d|%d|%d\n", total_q, active_q, def_q, hold_q > sum_out
+        for (u in q_seen) {
             reason = (u in q_reason ? q_reason[u] : "Queued for delivery")
-            printf "%s|%d|%s\n", u, q_user[u], reason
+            printf "%s|%d|%d|%s\n", u, q_live[u]+0, q_hold[u]+0, reason
         }
     }
-    ' | sort -t'|' -k2,2nr > "$out_file"
+    ' | sort -t'|' -k2,2nr -k3,3nr > "$out_file"
 }
 
 append_reason() {
@@ -1361,34 +2651,549 @@ append_reason() {
 }
 
 # ==============================================================================
+# MONITOR HEALTH CHECK, SELF-RBL BLACKLIST MONITOR & READ-ONLY SECURITY AUDIT
+# Strictly READ-ONLY against Zimbra/Postfix/DNS/OS.
+# ==============================================================================
+check_monitor_health() {
+    [[ "$HEALTH_CHECK_ENABLED" != "true" ]] && return 0
+
+    local srv_host srv_ip now_ts now_str issue=""
+    srv_host=$(get_server_hostname)
+    srv_ip=$(get_server_ip)
+    now_ts="${ZSM_NOW_EPOCH:-$(date +%s)}"
+    now_str=$(date -d "@$now_ts" '+%Y-%m-%d %H:%M:%S' 2>/dev/null || date '+%Y-%m-%d %H:%M:%S')
+
+    if [[ ! -f "$ZIMBRA_LOG_FILE" ]]; then
+        issue="Zimbra log file not found: ${ZIMBRA_LOG_FILE}"
+    elif [[ ! -r "$ZIMBRA_LOG_FILE" ]]; then
+        issue="Zimbra log file is not readable: ${ZIMBRA_LOG_FILE}"
+    elif [[ -z "$ZSM_NOW_EPOCH" || "${ZSM_FORCE_HEALTH_CHECK:-false}" == "true" ]]; then
+        local mtime=0
+        mtime=$(stat -c %Y "$ZIMBRA_LOG_FILE" 2>/dev/null || date -r "$ZIMBRA_LOG_FILE" +%s 2>/dev/null || echo "0")
+        if [[ "$mtime" =~ ^[0-9]+$ ]] && (( mtime > 0 && now_ts > mtime )); then
+            local age_mins=$(( (now_ts - mtime) / 60 ))
+            if (( age_mins >= LOG_STALE_MINUTES )); then
+                issue="Zimbra log (${ZIMBRA_LOG_FILE}) has not been updated for ${age_mins} minutes (limit: ${LOG_STALE_MINUTES}m). Check rsyslog/syslogd."
+            fi
+        fi
+    fi
+
+    [[ -z "$issue" ]] && return 0
+    log_msg "WARN" "MONITOR HEALTH: ${issue}"
+
+    if should_send_alert "__MONITOR_HEALTH__" "WARNING" "$HEALTH_ALERT_COOLDOWN_MINUTES"; then
+        local tg_msg mail_body wh_json
+        tg_msg=$(cat <<EOF
+<b>[ZIMBRA MONITOR HEALTH WARNING]</b>
+<code>==============================</code>
+<b>Server     :</b> <code>$(html_escape "$srv_host")</code> (${srv_ip})
+<b>Alert Time :</b> ${now_str}
+<b>Issue      :</b> $(html_escape "$issue")
+<code>==============================</code>
+EOF
+)
+        mail_body=$(cat <<EOF
+============================================================
+         ZIMBRA MONITOR HEALTH WARNING
+============================================================
+Server     : ${srv_host} (${srv_ip})
+Alert Time : ${now_str}
+Issue      : ${issue}
+============================================================
+EOF
+)
+        local gjson
+        gjson=$(printf '{"version":"%s","event":"monitor_health","severity":"WARNING","server":"%s","server_ip":"%s","alert_time":"%s","issue":"%s"}' \
+            "$VERSION" "$(json_escape "$srv_host")" "$(json_escape "$srv_ip")" "$(json_escape "$now_str")" "$(json_escape "$issue")")
+        wh_json=$(build_webhook_payload "$mail_body" "$gjson")
+        log_json_event "$gjson"
+        if dispatch_notifications "health_warn" "$tg_msg" "[Zimbra Monitor Health] ${srv_host}" "$mail_body" 0 "$wh_json"; then
+            record_alert_state "__MONITOR_HEALTH__" "WARNING"
+        fi
+    fi
+}
+
+# Read-only DNSBL reputation check using system resolver.
+# Treats 127.255.255.x (Spamhaus public resolver block) as QUERY_ERROR, never false blacklist.
+run_rbl_check() {
+    local mode="${1:-manual}" # "manual" (--check-rbl) or "auto" (periodic inside --run)
+    load_config
+    resolve_zimbra_settings
+
+    local now_ts="${ZSM_NOW_EPOCH:-$(date +%s)}"
+    local last_file="$STATE_DIR/rbl_last_check.ts"
+    local state_file="$STATE_DIR/rbl_state.db"
+
+    if [[ "$mode" == "auto" ]]; then
+        [[ "$RBL_CHECK_ENABLED" != "true" ]] && return 0
+        local interval_sec=$(( RBL_CHECK_INTERVAL_MINUTES * 60 ))
+        if [[ -f "$last_file" ]]; then
+            local last_ts
+            last_ts=$(cat "$last_file" 2>/dev/null || echo "0")
+            if [[ "$last_ts" =~ ^[0-9]+$ ]] && (( now_ts >= last_ts && now_ts - last_ts < interval_sec )); then
+                return 0
+            fi
+        fi
+        printf '%s\n' "$now_ts" > "$last_file" 2>/dev/null || true
+    fi
+
+    local srv_host srv_ip check_ips now_str
+    srv_host=$(get_server_hostname)
+    srv_ip=$(get_server_ip)
+    now_str=$(date -d "@$now_ts" '+%Y-%m-%d %H:%M:%S' 2>/dev/null || date '+%Y-%m-%d %H:%M:%S')
+    check_ips="${RBL_CHECK_IPS:-$srv_ip}"
+
+    if [[ "$mode" == "manual" ]]; then
+        echo "=============================================================================="
+        echo " ZIMBRA SPAM MONITOR v${VERSION} - SELF-RBL REPUTATION CHECK (READ-ONLY DNS)"
+        echo "=============================================================================="
+        echo " Server : ${srv_host} | Check Time: ${now_str}"
+        echo "------------------------------------------------------------------------------"
+    fi
+
+    local ip rbl any_listed=0
+    for ip in $check_ips; do
+        if ! is_valid_ipv4 "$ip" || is_private_ipv4 "$ip"; then
+            [[ "$mode" == "manual" ]] && echo " [SKIP] ${ip} is not a public IPv4 address."
+            continue
+        fi
+        local o1 o2 o3 o4 rev
+        IFS='.' read -r o1 o2 o3 o4 <<< "$ip"
+        rev="${o4}.${o3}.${o2}.${o1}"
+
+        local listed_list="" err_list=""
+        for rbl in $RBL_PROVIDERS; do
+            local ans=""
+            ans=$(dns_lookup_ipv4 "${rev}.${rbl}" || true)
+            if [[ -z "$ans" ]]; then
+                [[ "$mode" == "manual" ]] && printf " [CLEAN]       %-16s on %s\n" "$ip" "$rbl"
+            elif [[ "$ans" =~ ^127\.255\. ]]; then
+                err_list="${err_list:+${err_list}, }${rbl}(${ans})"
+                [[ "$mode" == "manual" ]] && printf " [QUERY_ERROR] %-16s on %-26s -> %s (resolver blocked, NOT listed)\n" "$ip" "$rbl" "$ans"
+                log_msg "WARN" "RBL query error for ${ip} on ${rbl}: ${ans} (public DNS resolver blocked)"
+            elif [[ "$ans" =~ ^127\.0\.0\.([2-9]|1[0-9]|20)$ ]]; then
+                listed_list="${listed_list:+${listed_list}, }${rbl}"
+                any_listed=1
+                [[ "$mode" == "manual" ]] && printf " [LISTED!]     %-16s on %-26s -> %s\n" "$ip" "$rbl" "$ans"
+            else
+                [[ "$mode" == "manual" ]] && printf " [INFO]        %-16s on %-26s -> %s (ignored code)\n" "$ip" "$rbl" "$ans"
+            fi
+        done
+
+        # Compare against previous state to alert ONLY on state transitions (new listing or delisted)
+        local prev_listed=""
+        if [[ -f "$state_file" ]]; then
+            prev_listed=$(awk -F'|' -v t="$ip" '$1 == t {v=$2} END {print v}' "$state_file" 2>/dev/null || true)
+        fi
+        if [[ "$listed_list" != "$prev_listed" ]]; then
+            mkdir -p "$STATE_DIR" 2>/dev/null || true
+            if [[ -f "$state_file" ]]; then
+                awk -F'|' -v t="$ip" '$1 != t' "$state_file" > "${state_file}.tmp" 2>/dev/null || true
+                mv -f "${state_file}.tmp" "$state_file"
+            fi
+            printf '%s|%s\n' "$ip" "$listed_list" >> "$state_file"
+
+            if [[ "$mode" == "auto" ]]; then
+                local rbl_sev rbl_title rbl_detail
+                if [[ -n "$listed_list" ]]; then
+                    rbl_sev="CRITICAL"
+                    rbl_title="SERVER IP BLACKLISTED (RBL)"
+                    rbl_detail="IP ${ip} is LISTED on: ${listed_list}"
+                    log_msg "CRITICAL" "Self-RBL: ${rbl_detail}"
+                else
+                    rbl_sev="RECOVERY"
+                    rbl_title="SERVER IP DELISTED (CLEAN)"
+                    rbl_detail="IP ${ip} is now CLEAN on all checked RBLs (previously: ${prev_listed})"
+                    log_msg "INFO" "Self-RBL: ${rbl_detail}"
+                fi
+                local tg_msg mail_body gjson wh_json
+                tg_msg=$(cat <<EOF
+<b>[ZIMBRA RBL ${rbl_sev}] ${rbl_title}</b>
+<code>==============================</code>
+<b>Server     :</b> <code>$(html_escape "$srv_host")</code> (${ip})
+<b>Check Time :</b> ${now_str}
+<b>Status     :</b> $(html_escape "$rbl_detail")
+<code>==============================</code>
+EOF
+)
+                mail_body=$(cat <<EOF
+============================================================
+         ZIMBRA RBL ${rbl_sev} - ${rbl_title}
+============================================================
+Server     : ${srv_host} (${ip})
+Check Time : ${now_str}
+Status     : ${rbl_detail}
+============================================================
+EOF
+)
+                gjson=$(printf '{"version":"%s","event":"self_rbl","severity":"%s","server":"%s","server_ip":"%s","alert_time":"%s","listed":"%s","previous":"%s"}' \
+                    "$VERSION" "$rbl_sev" "$(json_escape "$srv_host")" "$(json_escape "$ip")" "$(json_escape "$now_str")" "$(json_escape "$listed_list")" "$(json_escape "$prev_listed")")
+                wh_json=$(build_webhook_payload "$mail_body" "$gjson")
+                log_json_event "$gjson"
+                dispatch_notifications "rbl_${ip}" "$tg_msg" "[Zimbra RBL ${rbl_sev}] ${ip} on ${srv_host}" "$mail_body" 0 "$wh_json" || true
+            fi
+        fi
+    done
+
+    if [[ "$mode" == "manual" ]]; then
+        echo "=============================================================================="
+        return "$any_listed"
+    fi
+    return 0
+}
+
+# Strictly READ-ONLY Anti-Spam Security Posture Audit (NEVER executes or prints server mutation commands)
+run_security_audit() {
+    load_config
+    resolve_zimbra_settings
+    local srv_host srv_ip dom score=0 max_score=100
+    srv_host=$(get_server_hostname)
+    srv_ip=$(get_server_ip)
+    dom="$RESOLVED_DEFAULT_DOMAIN"
+
+    echo "=============================================================================="
+    echo " ZIMBRA ANTI-SPAM POSTURE AUDIT v${VERSION} (100% READ-ONLY DIAGNOSTIC)"
+    echo "=============================================================================="
+    echo " Server : ${srv_host} (${srv_ip}) | Primary Domain: ${dom}"
+    echo "------------------------------------------------------------------------------"
+
+    # 1. DNS SPF Record (+15)
+    local spf_txt=""
+    spf_txt=$(dns_lookup_txt "$dom" | grep -i "v=spf1" | head -n 1 || true)
+    if [[ -n "$spf_txt" ]]; then
+        score=$(( score + 15 ))
+        echo " [PASS +15] SPF DNS record found for ${dom}"
+    else
+        echo " [WARN  +0] SPF DNS record not detected for ${dom}."
+        echo "            Advice: Publish an SPF TXT record authorizing your outbound mail IP."
+    fi
+
+    # 2. DNS DMARC Record (+15)
+    local dmarc_txt=""
+    dmarc_txt=$(dns_lookup_txt "_dmarc.${dom}" | grep -i "v=DMARC1" | head -n 1 || true)
+    if [[ -n "$dmarc_txt" ]]; then
+        score=$(( score + 15 ))
+        echo " [PASS +15] DMARC DNS record found for _dmarc.${dom}"
+    else
+        echo " [WARN  +0] DMARC DNS record not detected for _dmarc.${dom}."
+        echo "            Advice: Publish a DMARC TXT policy to reduce domain spoofing."
+    fi
+
+    # 3. Postfix Read-Only Posture (postconf -h ONLY, never mutates)
+    local pc_bin
+    pc_bin=$(find_postconf_bin)
+    if [[ -n "$pc_bin" ]]; then
+        local slm rus rl
+        slm=$("$pc_bin" -h smtpd_sender_login_maps 2>/dev/null || true)
+        rus=$("$pc_bin" -h smtpd_reject_unlisted_sender 2>/dev/null || true)
+        rl=$("$pc_bin" -h smtpd_client_message_rate_limit 2>/dev/null || true)
+
+        if [[ -n "$slm" ]]; then
+            score=$(( score + 15 ))
+            echo " [PASS +15] Postfix sender-login enforcement active (${slm})"
+        else
+            echo " [WARN  +0] Postfix smtpd_sender_login_maps is empty."
+            echo "            Advice: Consider enabling authenticated sender-to-From mapping in Zimbra Admin."
+        fi
+
+        if [[ "$rus" == "yes" ]]; then
+            score=$(( score + 10 ))
+            echo " [PASS +10] Postfix rejects unlisted senders (smtpd_reject_unlisted_sender=yes)"
+        else
+            echo " [WARN  +0] Postfix smtpd_reject_unlisted_sender is '${rus:-no}'."
+            echo "            Advice: Enable unlisted sender rejection to block forged internal addresses."
+        fi
+
+        if [[ -n "$rl" && "$rl" != "0" ]]; then
+            score=$(( score + 10 ))
+            echo " [PASS +10] Postfix message rate limit configured (${rl})"
+        else
+            echo " [INFO  +0] Postfix per-client message rate limit is unlimited (0)."
+            echo "            Advice: For proactive rate limiting, consider enabling Zimbra cbpolicyd."
+        fi
+    else
+        echo " [INFO  +0] Postfix postconf binary not found (skipped MTA read-only checks)."
+    fi
+
+    # 4. Monitor Self-Hardening Checks (+35 total)
+    if [[ "$AUTO_LOCK_ON_CRITICAL" == "true" ]]; then
+        score=$(( score + 10 ))
+        echo " [PASS +10] Monitor Auto-Lock on CRITICAL is ENABLED"
+    else
+        echo " [WARN  +0] Monitor Auto-Lock on CRITICAL is DISABLED (alert only)."
+    fi
+
+    if [[ "$FLUSH_CACHE_ON_LOCK" == "true" ]]; then
+        score=$(( score + 5 ))
+        echo " [PASS  +5] Per-account auth cache flush on lock is ENABLED"
+    else
+        echo " [INFO  +0] Per-account auth cache flush on lock is DISABLED."
+    fi
+
+    if [[ "$TELEGRAM_ENABLED" == "true" && -n "$TELEGRAM_BOT_TOKEN" && -n "$TELEGRAM_CHAT_ID" ]] || [[ "$EMAIL_ENABLED" == "true" ]]; then
+        score=$(( score + 10 ))
+        echo " [PASS +10] Alert delivery channels configured (TG: ${TELEGRAM_ENABLED} | Mail: ${EMAIL_ENABLED} | Webhook: ${WEBHOOK_ENABLED})"
+    else
+        echo " [WARN  +0] No alert channel is fully configured."
+    fi
+
+    if [[ -r "$ZIMBRA_MAILBOX_LOG_FILE" && -r "$ZIMBRA_AUDIT_LOG_FILE" ]]; then
+        score=$(( score + 10 ))
+        echo " [PASS +10] Single-server mailbox.log & audit.log readable (real Webmail IP & brute-force active)"
+    else
+        echo " [INFO  +0] mailbox.log or audit.log not found on this host (running in MTA-log-only mode)."
+    fi
+
+    echo "------------------------------------------------------------------------------"
+    echo " OVERALL ANTI-SPAM POSTURE SCORE: ${score} / ${max_score}"
+    echo " Note: This audit is 100% read-only and made ZERO changes to Zimbra or the OS."
+    echo "=============================================================================="
+}
+
+# Consolidated Brute-Force Summary (Top 10 IPs in 1 alert, cooldown 60m - never floods Telegram, never locks victims)
+process_brute_force_alerts() {
+    local aux_auth_file="$1"
+    local sasl_fail_file="$2"
+    local srv_host="$3"
+    local srv_ip="$4"
+    local now_str="$5"
+
+    local tmp_bf
+    tmp_bf=$(make_safe_tmp "zsm_bf")
+    awk -F'|' -v thresh="$WARN_AUTH_FAIL_PER_IP" '
+        $1 == "FAILIP" && $2 != "" { cnt[$2] += ($3 + 0) }
+        END {
+            for (ip in cnt) {
+                if (cnt[ip] >= thresh) printf "%s|%d\n", ip, cnt[ip]
+            }
+        }
+    ' "$aux_auth_file" "$sasl_fail_file" 2>/dev/null | sort -t'|' -k2,2nr > "$tmp_bf"
+
+    if [[ ! -s "$tmp_bf" ]]; then
+        rm -f "$tmp_bf"
+        return 0
+    fi
+
+    local total_ips total_fails=0 top_lines="" top_html="" shown=0
+    total_ips=$(wc -l < "$tmp_bf" | tr -d ' ')
+    local bip bcnt
+    while IFS='|' read -r bip bcnt; do
+        [[ -z "$bip" ]] && continue
+        total_fails=$(( total_fails + bcnt ))
+        record_attacker_ip "$bip" "auth-bruteforce" "Failed logins (${bcnt} in ${LOOKBACK_MINUTES}m)"
+        if (( shown < 10 )); then
+            top_lines="${top_lines}  - ${bip}: ${bcnt} failed logins"$'\n'
+            top_html="${top_html}  <code>$(html_escape "$bip")</code>: <b>${bcnt}</b> fails"$'\n'
+            shown=$(( shown + 1 ))
+        fi
+    done < "$tmp_bf"
+    rm -f "$tmp_bf"
+
+    if should_send_alert "__BRUTE_FORCE_SUMMARY__" "WARNING" "$AUTH_ALERT_COOLDOWN_MINUTES"; then
+        log_msg "WARNING" "Auth brute-force detected: ${total_ips} attacking IP(s), ${total_fails} failed logins in ${LOOKBACK_MINUTES}m"
+        local tg_msg mail_body gjson wh_json
+        tg_msg=$(cat <<EOF
+<b>[ZIMBRA AUTH BRUTE-FORCE WARNING]</b>
+<code>==============================</code>
+<b>Server       :</b> <code>$(html_escape "$srv_host")</code> (${srv_ip})
+<b>Alert Time   :</b> ${now_str}
+<b>Window       :</b> Last ${LOOKBACK_MINUTES} mins
+<b>Attacking IPs:</b> <b>${total_ips}</b> IP(s) | Total Fails: <b>${total_fails}</b>
+<b>Action Taken :</b> Alert only (victim accounts NOT locked to prevent DoS)
+
+<b>TOP ATTACKING IPs (threshold &gt;= ${WARN_AUTH_FAIL_PER_IP})</b>
+${top_html}<code>==============================</code>
+EOF
+)
+        mail_body=$(cat <<EOF
+============================================================
+         ZIMBRA AUTH BRUTE-FORCE WARNING
+============================================================
+Server        : ${srv_host} (${srv_ip})
+Alert Time    : ${now_str}
+Window        : Last ${LOOKBACK_MINUTES} mins
+Attacking IPs : ${total_ips} IP(s) | Total Fails: ${total_fails}
+Action Taken  : Alert only (victim accounts NOT locked to prevent DoS)
+Logged To     : ${STATE_DIR}/attacker_ips.log
+
+TOP ATTACKING IPs (threshold >= ${WARN_AUTH_FAIL_PER_IP}):
+${top_lines}============================================================
+EOF
+)
+        gjson=$(printf '{"version":"%s","event":"brute_force","severity":"WARNING","server":"%s","server_ip":"%s","alert_time":"%s","attacking_ips":%d,"total_fails":%d}' \
+            "$VERSION" "$(json_escape "$srv_host")" "$(json_escape "$srv_ip")" "$(json_escape "$now_str")" "$total_ips" "$total_fails")
+        wh_json=$(build_webhook_payload "$mail_body" "$gjson")
+        log_json_event "$gjson"
+        if dispatch_notifications "brute_force" "$tg_msg" "[Zimbra Auth Brute-Force] ${total_ips} IP(s) / ${total_fails} fails on ${srv_host}" "$mail_body" 0 "$wh_json"; then
+            record_alert_state "__BRUTE_FORCE_SUMMARY__" "WARNING"
+        fi
+    fi
+}
+
+maybe_send_daily_summary() {
+    [[ "$DAILY_SUMMARY_ENABLED" != "true" ]] && return 0
+    local roll_sum_file="$1"
+    local srv_host="$2"
+    local srv_ip="$3"
+    local total_queue="$4"
+    local now_ts="${ZSM_NOW_EPOCH:-$(date +%s)}"
+    local cur_hour cur_day
+    cur_hour=$(date -d "@$now_ts" '+%H' 2>/dev/null || date '+%H')
+    cur_day=$(date -d "@$now_ts" '+%Y-%m-%d' 2>/dev/null || date '+%Y-%m-%d')
+
+    [[ "$cur_hour" != "$DAILY_SUMMARY_HOUR" ]] && return 0
+    local marker="$STATE_DIR/daily_summary.last"
+    if [[ -f "$marker" ]] && [[ "$(cat "$marker" 2>/dev/null)" == "$cur_day" ]]; then
+        return 0
+    fi
+
+    local locked_cnt=0
+    [[ -f "$STATE_DIR/locked_accounts.db" ]] && locked_cnt=$(grep -c '[^[:space:]]' "$STATE_DIR/locked_accounts.db" 2>/dev/null || echo "0")
+    local top_24h
+    top_24h=$(sort -t'|' -k4,4nr "$roll_sum_file" 2>/dev/null | head -n 5 | awk -F'|' '{printf "  - %s: %d msgs / %d rcpts (24h)\n", $1, $4, $5}')
+    [[ -z "$top_24h" ]] && top_24h="  (No outbound traffic recorded in last 24h)"
+
+    local tg_msg mail_body
+    tg_msg=$(cat <<EOF
+<b>[ZIMBRA SPAM MONITOR - DAILY DIGEST]</b>
+<code>==============================</code>
+<b>Server       :</b> <code>$(html_escape "$srv_host")</code> (${srv_ip})
+<b>Date         :</b> ${cur_day}
+<b>Locked Accts :</b> <b>${locked_cnt}</b>
+<b>System Queue :</b> <b>${total_queue}</b> emails
+<b>Top 24h Senders:</b>
+<code>$(html_escape "$top_24h")</code>
+<code>==============================</code>
+EOF
+)
+    mail_body=$(cat <<EOF
+============================================================
+         ZIMBRA SPAM MONITOR - DAILY DIGEST (${cur_day})
+============================================================
+Server          : ${srv_host} (${srv_ip})
+Locked Accounts : ${locked_cnt}
+System Queue    : ${total_queue} emails
+
+Top 24h Outbound Senders:
+${top_24h}
+============================================================
+EOF
+)
+    if dispatch_notifications "daily_${cur_day}" "$tg_msg" "[Zimbra Monitor Digest] ${cur_day} on ${srv_host}" "$mail_body" "$total_queue" ""; then
+        printf '%s\n' "$cur_day" > "$marker" 2>/dev/null || true
+    fi
+}
+
+# ==============================================================================
 # MAIN CHECK CYCLE (--run)
 # ==============================================================================
+_RUN_CLEANUP_FILES=()
+_RUN_LOCK_DIR=""
+
+_cleanup_run_cycle() {
+    local f
+    for f in "${_RUN_CLEANUP_FILES[@]}"; do
+        [[ -n "$f" ]] && rm -f "$f" 2>/dev/null || true
+    done
+    if [[ -n "$_RUN_LOCK_DIR" && -d "$_RUN_LOCK_DIR" ]]; then
+        rm -rf "$_RUN_LOCK_DIR" 2>/dev/null || true
+    fi
+}
+
 run_monitor_cycle() {
+    lower_priority_self
     load_config
     if [[ "$MONITOR_ENABLED" != "true" ]]; then
         return 0
     fi
 
+    mkdir -p "$STATE_DIR" 2>/dev/null || true
+    _TG_SENT_IN_CYCLE=0
+    _RUN_CLEANUP_FILES=()
+    _RUN_LOCK_DIR=""
+
+    # Atomic non-blocking process lock: flock on Linux, POSIX mkdir fallback elsewhere
     local lock_file="$STATE_DIR/monitor.lock"
-    if [[ -f "$lock_file" ]]; then
-        local old_pid
-        old_pid=$(cat "$lock_file" 2>/dev/null || echo "")
-        if [[ -n "$old_pid" ]] && kill -0 "$old_pid" 2>/dev/null; then
-            log_msg "WARN" "Previous scan (PID $old_pid) is still running; skipping cycle."
+    if command -v flock >/dev/null 2>&1; then
+        exec 9>"$lock_file"
+        if ! flock -n 9; then
+            log_msg "WARN" "Previous scan is still running (flock); skipping cycle."
             return 0
         fi
+    else
+        local lock_dir="$STATE_DIR/monitor.lock.d"
+        if ! mkdir "$lock_dir" 2>/dev/null; then
+            local old_pid=""
+            old_pid=$(cat "$lock_dir/pid" 2>/dev/null || echo "")
+            if [[ -n "$old_pid" ]] && kill -0 "$old_pid" 2>/dev/null; then
+                log_msg "WARN" "Previous scan (PID $old_pid) is still running; skipping cycle."
+                return 0
+            fi
+            rm -rf "$lock_dir" 2>/dev/null || true
+            if ! mkdir "$lock_dir" 2>/dev/null; then
+                return 0
+            fi
+        fi
+        printf '%s\n' "$$" > "$lock_dir/pid" 2>/dev/null || true
+        _RUN_LOCK_DIR="$lock_dir"
     fi
-    echo $$ > "$lock_file"
+    trap '_cleanup_run_cycle' EXIT INT TERM
 
-    local tmp_log_stats tmp_sys_sum tmp_q_stats tmp_q_sum tmp_merged
-    tmp_log_stats=$(mktemp 2>/dev/null || echo "/tmp/zsm_log_$$")
-    tmp_sys_sum=$(mktemp 2>/dev/null || echo "/tmp/zsm_syssum_$$")
-    tmp_q_stats=$(mktemp 2>/dev/null || echo "/tmp/zsm_q_$$")
-    tmp_q_sum=$(mktemp 2>/dev/null || echo "/tmp/zsm_qsum_$$")
-    tmp_merged=$(mktemp 2>/dev/null || echo "/tmp/zsm_merged_$$")
+    resolve_zimbra_settings
+    load_whitelist_cache
 
-    analyze_zimbra_log "$tmp_log_stats" "$tmp_sys_sum"
+    # 1. Retry any previously failed alerts stored in outbox before scanning
+    flush_alert_outbox
+
+    # 2. Check monitor log health (alerts if zimbra.log missing or stale)
+    check_monitor_health
+
+    local now_epoch="${ZSM_NOW_EPOCH:-$(date +%s)}"
+    local srv_host srv_ip now_str now_date
+    srv_host=$(get_server_hostname)
+    srv_ip=$(get_server_ip)
+    now_str=$(date -d "@$now_epoch" '+%Y-%m-%d %H:%M:%S' 2>/dev/null || date '+%Y-%m-%d %H:%M:%S')
+    now_date=$(date -d "@$now_epoch" '+%Y-%m-%d' 2>/dev/null || date '+%Y-%m-%d')
+
+    # Compute history_scan_mins so changing cron schedule never leaves blind gaps in 1h/24h history
+    local history_scan_mins="$LOOKBACK_MINUTES"
+    local last_run_file="$STATE_DIR/last_run.ts"
+    if [[ -f "$last_run_file" ]]; then
+        local last_run_ts
+        last_run_ts=$(cat "$last_run_file" 2>/dev/null || echo "0")
+        if [[ "$last_run_ts" =~ ^[0-9]+$ ]] && (( now_epoch > last_run_ts )); then
+            local gap_mins=$(( (now_epoch - last_run_ts + 59) / 60 ))
+            if (( gap_mins > history_scan_mins && gap_mins <= 60 )); then
+                history_scan_mins="$gap_mins"
+            fi
+        fi
+    fi
+
+    local tmp_log_stats tmp_sys_sum tmp_bkt_stats tmp_qid_map tmp_sasl_fail
+    local tmp_aux_web tmp_aux_auth tmp_q_stats tmp_q_sum tmp_roll_sum tmp_merged
+    tmp_log_stats=$(make_safe_tmp "zsm_log")
+    tmp_sys_sum=$(make_safe_tmp "zsm_syssum")
+    tmp_bkt_stats=$(make_safe_tmp "zsm_bkt")
+    tmp_qid_map=$(make_safe_tmp "zsm_qmap")
+    tmp_sasl_fail=$(make_safe_tmp "zsm_sfail")
+    tmp_aux_web=$(make_safe_tmp "zsm_auxw")
+    tmp_aux_auth=$(make_safe_tmp "zsm_auxa")
+    tmp_q_stats=$(make_safe_tmp "zsm_q")
+    tmp_q_sum=$(make_safe_tmp "zsm_qsum")
+    tmp_roll_sum=$(make_safe_tmp "zsm_rsum")
+    tmp_merged=$(make_safe_tmp "zsm_merged")
+    _RUN_CLEANUP_FILES=("$tmp_log_stats" "$tmp_sys_sum" "$tmp_bkt_stats" "$tmp_qid_map" "$tmp_sasl_fail" \
+                        "$tmp_aux_web" "$tmp_aux_auth" "$tmp_q_stats" "$tmp_q_sum" "$tmp_roll_sum" "$tmp_merged")
+
+    local local_ips awk_bin
+    local_ips=$(get_local_ips)
+    awk_bin=$(find_awk_bin)
+
+    # 3. Run single-server aux log reader + main zimbra.log engine + Postfix queue + rolling 1h/24h
+    analyze_aux_zimbra_logs "$tmp_aux_web" "$tmp_aux_auth" "$now_epoch" "$local_ips" "$awk_bin"
+    analyze_zimbra_log "$tmp_log_stats" "$tmp_sys_sum" "$tmp_bkt_stats" "$tmp_qid_map" "$tmp_aux_web" "$tmp_sasl_fail" "$history_scan_mins"
     analyze_postfix_queue "$tmp_q_stats" "$tmp_q_sum"
+    update_and_summarize_rolling_history "$tmp_bkt_stats" "$tmp_roll_sum" "false"
 
     local sys_summary sys_tot sys_snt sys_def sys_bnc
     sys_summary=$(cat "$tmp_sys_sum" 2>/dev/null || echo "0|0|0|0")
@@ -1398,50 +3203,93 @@ run_monitor_cycle() {
     q_summary=$(cat "$tmp_q_sum" 2>/dev/null || echo "0|0|0|0")
     IFS='|' read -r total_queue active_queue def_queue hold_queue <<< "$q_summary"
 
-    awk -F'|' -v q_file="$tmp_q_stats" '
-    FILENAME != q_file {
-        s = $1
-        if (s == "") next
+    # Merge 5m log metrics + queue live/held + 1h/24h rolling totals + auth-after-fail signals
+    "$awk_bin" -F'|' \
+        -v f_log="$tmp_log_stats" \
+        -v f_q="$tmp_q_stats" \
+        -v f_roll="$tmp_roll_sum" \
+        -v f_auth="$tmp_aux_auth" '
+    FILENAME == f_log {
+        s = $1; if (s == "") next
         users[s] = 1
-        m[s] = $2; r[s] = $3; ur[s] = $4; ud[s] = $5
-        snt[s] = $6; def[s] = $7; bnc[s] = $8
-        ipc[s] = $9; spf[s] = $10; amv[s] = $11; rbl[s] = $12
-        ips[s] = $13; tsp[s] = $14
+        m[s]=$2; r[s]=$3; ur[s]=$4; ud[s]=$5
+        snt[s]=$6; def[s]=$7; bnc[s]=$8
+        ipc[s]=$9; ripc[s]=$10; spf[s]=$11; amv[s]=$12; rbl[s]=$13
+        orig[s]=$14; lst[s]=$15; ips[s]=$16; tsp[s]=$17
         next
     }
-    FILENAME == q_file {
-        s = $1
-        if (s == "") next
+    FILENAME == f_q {
+        s = $1; if (s == "") next
         users[s] = 1
-        qc[s] = $2
+        qlive[s] = $2 + 0
+        qhold[s] = $3 + 0
+        next
+    }
+    FILENAME == f_roll {
+        s = $1; if (s == "") next
+        h1m[s] = $2 + 0; h1r[s] = $3 + 0
+        d24m[s] = $4 + 0; d24r[s] = $5 + 0
+        # Only pull user into evaluation if 1h/24h volume is non-trivial (saves loop work)
+        if (h1m[s] > 0 || d24m[s] > 0) users[s] = 1
+        next
+    }
+    FILENAME == f_auth && $1 == "AUTH_AFTER_FAIL" {
+        s = tolower($2); if (s == "") next
+        users[s] = 1
+        aaf_ip[s] = $3
+        aaf_cnt[s] = $4 + 0
+        next
     }
     END {
         for (u in users) {
-            printf "%s|%d|%d|%d|%d|%d|%d|%d|%d|%d|%d|%d|%d|%s|%s\n",
+            printf "%s|%d|%d|%d|%d|%d|%d|%d|%d|%d|%d|%d|%d|%d|%d|%d|%d|%d|%d|%s|%d|%s|%d|%s|%s\n",
                 u,
                 m[u]+0, r[u]+0, ur[u]+0, ud[u]+0,
                 snt[u]+0, def[u]+0, bnc[u]+0,
-                ipc[u]+0, spf[u]+0, amv[u]+0, rbl[u]+0,
-                qc[u]+0,
+                ipc[u]+0, ripc[u]+0, spf[u]+0, amv[u]+0, rbl[u]+0,
+                qlive[u]+0, qhold[u]+0,
+                h1m[u]+0, h1r[u]+0, d24m[u]+0, d24r[u]+0,
+                (orig[u] != "" ? orig[u] : "Queued/Unknown"),
+                lst[u]+0,
+                (aaf_ip[u] != "" ? aaf_ip[u] : ""),
+                aaf_cnt[u]+0,
                 (ips[u] != "" ? ips[u] : "queued/unknown"),
                 (tsp[u] != "" ? tsp[u] : "-")
         }
     }
-    ' "$tmp_log_stats" "$tmp_q_stats" | sort -t'|' -k3,3nr -k13,13nr > "$tmp_merged"
+    ' "$tmp_log_stats" "$tmp_q_stats" "$tmp_roll_sum" "$tmp_aux_auth" \
+        | sort -t'|' -k3,3nr -k14,14nr -k16,16nr > "$tmp_merged"
 
-    local srv_host srv_ip now_epoch now_str now_date
-    srv_host=$(get_server_hostname)
-    srv_ip=$(get_server_ip)
-    now_epoch="${ZSM_NOW_EPOCH:-$(date +%s)}"
-    now_str=$(date -d "@$now_epoch" '+%Y-%m-%d %H:%M:%S' 2>/dev/null || date '+%Y-%m-%d %H:%M:%S')
-    now_date=$(date -d "@$now_epoch" '+%Y-%m-%d' 2>/dev/null || date '+%Y-%m-%d')
     local alerts_triggered=0
+    local detail_alerts_sent=0
+    local overflow_count=0
+    local overflow_lines=""
+    local overflow_html=""
 
-    while IFS='|' read -r sender msgs rcpts uniq_rcpts uniq_doms snt def bnc ip_cnt spoof_cnt amavis_cnt rbl_cnt q_cnt s_ips s_tspan; do
+    while IFS='|' read -r sender msgs rcpts uniq_rcpts uniq_doms snt def bnc ip_cnt real_ip_cnt spoof_cnt amavis_cnt rbl_cnt q_cnt q_hold h1_msgs h1_rcpts d24_msgs d24_rcpts s_origin last_sub_ts aaf_ip aaf_cnt s_ips s_tspan; do
         [[ -z "$sender" ]] && continue
 
+        # Skip fully whitelisted accounts/domains
         if is_whitelisted "$sender"; then
             continue
+        fi
+
+        # Resolve effective thresholds (per-account custom limit if configured in whitelist.conf)
+        local eff_warn_rcpts="$WARN_RECIPIENTS"
+        local eff_crit_rcpts="$CRIT_RECIPIENTS"
+        local eff_warn_msgs="$WARN_MESSAGES_SENT"
+        local eff_crit_msgs="$CRIT_MESSAGES_SENT"
+        local eff_warn_uniq="$WARN_UNIQUE_RECIPIENTS"
+        local eff_crit_uniq="$CRIT_UNIQUE_RECIPIENTS"
+        local custom_lim=""
+        if custom_lim=$(get_custom_limits "$sender"); then
+            IFS='|' read -r eff_warn_rcpts eff_crit_rcpts <<< "$custom_lim"
+            # For custom per-account limits (email WARN CRIT), honor the exact WARN/CRIT volume
+            # across msgs, recipients, and unique recipients so 1-rcpt bulk senders work intuitively.
+            eff_warn_msgs="$eff_warn_rcpts"
+            eff_crit_msgs="$eff_crit_rcpts"
+            eff_warn_uniq="$eff_warn_rcpts"
+            eff_crit_uniq="$eff_crit_rcpts"
         fi
 
         local failed_cnt=$(( def + bnc ))
@@ -1454,114 +3302,259 @@ run_monitor_cycle() {
 
         local severity="NORMAL"
         local reasons=""
+        local has_non_spam_crit=0
 
-        # 1. Messages Sent
-        if (( msgs >= CRIT_MESSAGES_SENT )); then
-            severity="CRITICAL"
-            reasons=$(append_reason "$reasons" "Msgs (${msgs}>=${CRIT_MESSAGES_SENT})")
-        elif (( msgs >= WARN_MESSAGES_SENT )); then
-            [[ "$severity" == "NORMAL" ]] && severity="WARNING"
-            reasons=$(append_reason "$reasons" "Msgs (${msgs}>=${WARN_MESSAGES_SENT})")
-        fi
-
-        # 2. Total Recipients (CRITICAL requires CRIT_MIN_MESSAGES_FOR_BULK to protect single CC/BCC announcements)
-        if (( rcpts >= CRIT_RECIPIENTS && msgs >= CRIT_MIN_MESSAGES_FOR_BULK )); then
-            severity="CRITICAL"
-            reasons=$(append_reason "$reasons" "Rcpts (${rcpts}>=${CRIT_RECIPIENTS})")
-        elif (( rcpts >= WARN_RECIPIENTS )); then
-            [[ "$severity" == "NORMAL" ]] && severity="WARNING"
-            reasons=$(append_reason "$reasons" "Rcpts (${rcpts}>=${WARN_RECIPIENTS})")
-        fi
-
-        # 3. Unique Recipients across External Domains
-        if (( uniq_doms >= MIN_EXTERNAL_DOMAINS_FOR_UNIQUE )); then
-            if (( uniq_rcpts >= CRIT_UNIQUE_RECIPIENTS && msgs >= CRIT_MIN_MESSAGES_FOR_BULK )); then
+        # Special handling for local-pickup-uid:* (local script / webshell sending with external From)
+        if [[ "$sender" == local-pickup-uid:* ]]; then
+            if (( msgs >= WARN_PICKUP_EXTERNAL_MESSAGES )); then
                 severity="CRITICAL"
-                reasons=$(append_reason "$reasons" "Unique Rcpts (${uniq_rcpts}>=${CRIT_UNIQUE_RECIPIENTS})")
-            elif (( uniq_rcpts >= WARN_UNIQUE_RECIPIENTS )); then
+                reasons="Local Pickup External From (${msgs}>=${WARN_PICKUP_EXTERNAL_MESSAGES})"
+                has_non_spam_crit=1
+            fi
+        else
+            # 1. Messages Sent (5m)
+            if (( msgs >= eff_crit_msgs )); then
+                severity="CRITICAL"; has_non_spam_crit=1
+                reasons=$(append_reason "$reasons" "Msgs (${msgs}>=${eff_crit_msgs})")
+            elif (( msgs >= eff_warn_msgs )); then
                 [[ "$severity" == "NORMAL" ]] && severity="WARNING"
-                reasons=$(append_reason "$reasons" "Unique Rcpts (${uniq_rcpts}>=${WARN_UNIQUE_RECIPIENTS})")
+                reasons=$(append_reason "$reasons" "Msgs (${msgs}>=${eff_warn_msgs})")
             fi
-        fi
 
-        # 4. Failed Rate ((Deferred + Bounced) / Recipients %)
-        if (( rcpts >= CRIT_MIN_RECIPIENTS_FOR_FAIL_RATE && fail_pct_x10 >= CRIT_FAILED_RATE_PCT * 10 )); then
-            severity="CRITICAL"
-            reasons=$(append_reason "$reasons" "Failed Rate (${fail_pct_str}%>=${CRIT_FAILED_RATE_PCT}%)")
-        elif (( rcpts >= MIN_RECIPIENTS_FOR_FAIL_RATE && fail_pct_x10 >= WARN_FAILED_RATE_PCT * 10 )); then
-            [[ "$severity" == "NORMAL" ]] && severity="WARNING"
-            reasons=$(append_reason "$reasons" "Failed Rate (${fail_pct_str}%>=${WARN_FAILED_RATE_PCT}%)")
-        fi
-
-        # 5. Distinct Source IPs (Distributed Botnet)
-        if (( ip_cnt >= CRIT_SOURCE_IPS && msgs >= CRIT_MIN_MESSAGES_FOR_IPS )); then
-            severity="CRITICAL"
-            reasons=$(append_reason "$reasons" "Source IPs (${ip_cnt}>=${CRIT_SOURCE_IPS})")
-        elif (( ip_cnt >= WARN_SOURCE_IPS && msgs >= WARN_MIN_MESSAGES_FOR_IPS )); then
-            [[ "$severity" == "NORMAL" ]] && severity="WARNING"
-            reasons=$(append_reason "$reasons" "Source IPs (${ip_cnt}>=${WARN_SOURCE_IPS})")
-        fi
-
-        # 6. External Sender Spoofing (sasl_username != From)
-        if (( spoof_cnt >= CRIT_SPOOF_COUNT )); then
-            severity="CRITICAL"
-            reasons=$(append_reason "$reasons" "Spoof From (${spoof_cnt}>=${CRIT_SPOOF_COUNT})")
-        elif (( spoof_cnt >= WARN_SPOOF_COUNT )); then
-            [[ "$severity" == "NORMAL" ]] && severity="WARNING"
-            reasons=$(append_reason "$reasons" "Spoof From (${spoof_cnt}>=${WARN_SPOOF_COUNT})")
-        fi
-
-        # 7. Amavis SPAM/INFECTED & Remote RBL/Spam Rejections
-        local spam_sig=$(( amavis_cnt + rbl_cnt ))
-        if (( spam_sig >= CRIT_SPAM_SIGNALS )); then
-            severity="CRITICAL"
-            if (( amavis_cnt > 0 )); then
-                reasons=$(append_reason "$reasons" "Amavis SPAM (${amavis_cnt})")
-            fi
-            if (( rbl_cnt > 0 )); then
-                reasons=$(append_reason "$reasons" "RBL/Spam Reject (${rbl_cnt})")
-            fi
-        elif (( spam_sig >= WARN_SPAM_SIGNALS )); then
-            [[ "$severity" == "NORMAL" ]] && severity="WARNING"
-            if (( amavis_cnt > 0 )); then
-                reasons=$(append_reason "$reasons" "Amavis SPAM (${amavis_cnt})")
-            fi
-            if (( rbl_cnt > 0 )); then
-                reasons=$(append_reason "$reasons" "RBL/Spam Reject (${rbl_cnt})")
-            fi
-        fi
-
-        # 8. Account Postfix Queue (Do not re-lock a freshly unlocked account if msgs == 0)
-        if (( q_cnt >= CRIT_QUEUE_PER_USER )); then
-            if (( msgs == 0 )) && was_recently_unlocked "$sender"; then
+            # 2. Total Recipients (5m, requires CRIT_MIN_MESSAGES_FOR_BULK to protect single CC/BCC)
+            if (( rcpts >= eff_crit_rcpts && msgs >= CRIT_MIN_MESSAGES_FOR_BULK )); then
+                severity="CRITICAL"; has_non_spam_crit=1
+                reasons=$(append_reason "$reasons" "Rcpts (${rcpts}>=${eff_crit_rcpts})")
+            elif (( rcpts >= eff_warn_rcpts )); then
                 [[ "$severity" == "NORMAL" ]] && severity="WARNING"
-                reasons=$(append_reason "$reasons" "Leftover Queue (${q_cnt}>=${CRIT_QUEUE_PER_USER})")
-            else
-                severity="CRITICAL"
-                reasons=$(append_reason "$reasons" "Account Queue (${q_cnt}>=${CRIT_QUEUE_PER_USER})")
+                reasons=$(append_reason "$reasons" "Rcpts (${rcpts}>=${eff_warn_rcpts})")
             fi
-        elif (( q_cnt >= WARN_QUEUE_PER_USER )); then
-            [[ "$severity" == "NORMAL" ]] && severity="WARNING"
-            reasons=$(append_reason "$reasons" "Account Queue (${q_cnt}>=${WARN_QUEUE_PER_USER})")
+
+            # 3. Unique Recipients across External Domains (5m)
+            if (( uniq_doms >= MIN_EXTERNAL_DOMAINS_FOR_UNIQUE )); then
+                if (( uniq_rcpts >= eff_crit_uniq && msgs >= CRIT_MIN_MESSAGES_FOR_BULK )); then
+                    severity="CRITICAL"; has_non_spam_crit=1
+                    reasons=$(append_reason "$reasons" "Unique Rcpts (${uniq_rcpts}>=${eff_crit_uniq})")
+                elif (( uniq_rcpts >= eff_warn_uniq )); then
+                    [[ "$severity" == "NORMAL" ]] && severity="WARNING"
+                    reasons=$(append_reason "$reasons" "Unique Rcpts (${uniq_rcpts}>=${eff_warn_uniq})")
+                fi
+            fi
+
+            # 4. Failed Rate ((Deferred + Bounced + Expired) / Recipients %)
+            if (( rcpts >= CRIT_MIN_RECIPIENTS_FOR_FAIL_RATE && fail_pct_x10 >= CRIT_FAILED_RATE_PCT * 10 )); then
+                severity="CRITICAL"; has_non_spam_crit=1
+                reasons=$(append_reason "$reasons" "Failed Rate (${fail_pct_str}%>=${CRIT_FAILED_RATE_PCT}%)")
+            elif (( rcpts >= MIN_RECIPIENTS_FOR_FAIL_RATE && fail_pct_x10 >= WARN_FAILED_RATE_PCT * 10 )); then
+                [[ "$severity" == "NORMAL" ]] && severity="WARNING"
+                reasons=$(append_reason "$reasons" "Failed Rate (${fail_pct_str}%>=${WARN_FAILED_RATE_PCT}%)")
+            fi
+
+            # 5. Distinct Source /24 Subnets (Botnet detection, mobile-4G-safe)
+            if (( ip_cnt >= CRIT_SOURCE_IPS && msgs >= CRIT_MIN_MESSAGES_FOR_IPS )); then
+                severity="CRITICAL"; has_non_spam_crit=1
+                reasons=$(append_reason "$reasons" "Source IPs (${ip_cnt}>=${CRIT_SOURCE_IPS})")
+            elif (( ip_cnt >= WARN_SOURCE_IPS && msgs >= WARN_MIN_MESSAGES_FOR_IPS )); then
+                [[ "$severity" == "NORMAL" ]] && severity="WARNING"
+                reasons=$(append_reason "$reasons" "Source IPs (${ip_cnt}>=${WARN_SOURCE_IPS})")
+            fi
+
+            # 6. External Sender Spoofing (per unique message)
+            if (( spoof_cnt >= CRIT_SPOOF_COUNT )); then
+                severity="CRITICAL"; has_non_spam_crit=1
+                reasons=$(append_reason "$reasons" "Spoof From (${spoof_cnt}>=${CRIT_SPOOF_COUNT})")
+            elif (( spoof_cnt >= WARN_SPOOF_COUNT )); then
+                [[ "$severity" == "NORMAL" ]] && severity="WARNING"
+                reasons=$(append_reason "$reasons" "Spoof From (${spoof_cnt}>=${WARN_SPOOF_COUNT})")
+            fi
+
+            # 7. Amavis SPAM/INFECTED/BANNED & Remote RBL Rejections
+            # Auto-forward safeguard: non-SASL local/webmail origin with ONLY Amavis/RBL stays WARNING
+            local spam_sig=$(( amavis_cnt + rbl_cnt ))
+            local is_sasl_origin=0
+            [[ "$s_origin" == *SASL* ]] && is_sasl_origin=1
+            if (( spam_sig >= CRIT_SPAM_SIGNALS )); then
+                if (( is_sasl_origin == 1 || has_non_spam_crit == 1 || spoof_cnt >= WARN_SPOOF_COUNT )); then
+                    severity="CRITICAL"
+                else
+                    [[ "$severity" == "NORMAL" ]] && severity="WARNING"
+                    reasons=$(append_reason "$reasons" "Local/Forward Safeguard")
+                fi
+                (( amavis_cnt > 0 )) && reasons=$(append_reason "$reasons" "Amavis SPAM (${amavis_cnt})")
+                (( rbl_cnt > 0 )) && reasons=$(append_reason "$reasons" "RBL/Spam Reject (${rbl_cnt})")
+            elif (( spam_sig >= WARN_SPAM_SIGNALS )); then
+                [[ "$severity" == "NORMAL" ]] && severity="WARNING"
+                (( amavis_cnt > 0 )) && reasons=$(append_reason "$reasons" "Amavis SPAM (${amavis_cnt})")
+                (( rbl_cnt > 0 )) && reasons=$(append_reason "$reasons" "RBL/Spam Reject (${rbl_cnt})")
+            fi
+
+            # 8. Account Postfix Queue (Active + Deferred ONLY; already-HELD messages excluded!)
+            if (( q_cnt >= CRIT_QUEUE_PER_USER )); then
+                if (( msgs == 0 )) && was_recently_unlocked "$sender"; then
+                    [[ "$severity" == "NORMAL" ]] && severity="WARNING"
+                    reasons=$(append_reason "$reasons" "Leftover Queue (${q_cnt}>=${CRIT_QUEUE_PER_USER})")
+                else
+                    severity="CRITICAL"; has_non_spam_crit=1
+                    reasons=$(append_reason "$reasons" "Account Queue (${q_cnt}>=${CRIT_QUEUE_PER_USER})")
+                fi
+            elif (( q_cnt >= WARN_QUEUE_PER_USER )); then
+                [[ "$severity" == "NORMAL" ]] && severity="WARNING"
+                reasons=$(append_reason "$reasons" "Account Queue (${q_cnt}>=${WARN_QUEUE_PER_USER})")
+            fi
+
+            # 9. Multi-Window Low-and-Slow Detection (1h CRIT/WARN + 24h WARN-only)
+            local eff_h1_warn_m="$WARN_HOURLY_MESSAGES"
+            local eff_h1_crit_m="$CRIT_HOURLY_MESSAGES"
+            local eff_h1_warn_r="$WARN_HOURLY_RECIPIENTS"
+            local eff_h1_crit_r="$CRIT_HOURLY_RECIPIENTS"
+            if [[ -n "$custom_lim" ]]; then
+                eff_h1_warn_r=$(( eff_warn_rcpts * 5 ))
+                eff_h1_crit_r=$(( eff_crit_rcpts * 5 ))
+                eff_h1_warn_m=$(( eff_warn_msgs * 5 ))
+                eff_h1_crit_m=$(( eff_crit_msgs * 5 ))
+            fi
+
+            if (( h1_msgs >= eff_h1_crit_m )); then
+                severity="CRITICAL"; has_non_spam_crit=1
+                reasons=$(append_reason "$reasons" "1h Msgs (${h1_msgs}>=${eff_h1_crit_m})")
+            elif (( h1_msgs >= eff_h1_warn_m )); then
+                [[ "$severity" == "NORMAL" ]] && severity="WARNING"
+                reasons=$(append_reason "$reasons" "1h Msgs (${h1_msgs}>=${eff_h1_warn_m})")
+            fi
+
+            if (( h1_rcpts >= eff_h1_crit_r && h1_msgs >= CRIT_MIN_MESSAGES_FOR_BULK )); then
+                severity="CRITICAL"; has_non_spam_crit=1
+                reasons=$(append_reason "$reasons" "1h Rcpts (${h1_rcpts}>=${eff_h1_crit_r})")
+            elif (( h1_rcpts >= eff_h1_warn_r )); then
+                [[ "$severity" == "NORMAL" ]] && severity="WARNING"
+                reasons=$(append_reason "$reasons" "1h Rcpts (${h1_rcpts}>=${eff_h1_warn_r})")
+            fi
+
+            if (( d24_msgs >= WARN_DAILY_MESSAGES )); then
+                [[ "$severity" == "NORMAL" ]] && severity="WARNING"
+                reasons=$(append_reason "$reasons" "24h Msgs (${d24_msgs}>=${WARN_DAILY_MESSAGES})")
+            elif (( d24_rcpts >= WARN_DAILY_RECIPIENTS )); then
+                [[ "$severity" == "NORMAL" ]] && severity="WARNING"
+                reasons=$(append_reason "$reasons" "24h Rcpts (${d24_rcpts}>=${WARN_DAILY_RECIPIENTS})")
+            fi
+
+            # 10. Auth-After-Fail Compromise Early Warning (never auto-locks by itself)
+            if [[ -n "$aaf_ip" ]] && (( aaf_cnt >= AUTH_FAIL_BEFORE_SUCCESS_MIN )); then
+                [[ "$severity" == "NORMAL" ]] && severity="WARNING"
+                reasons=$(append_reason "$reasons" "Login After ${aaf_cnt} Fails (${aaf_ip})")
+                if [[ "$s_ips" == "webmail/local" || "$s_ips" == "queued/unknown" ]]; then
+                    s_ips="$aaf_ip"
+                fi
+            fi
+
+            # 11. Transparent Composite Risk Score (0-100) for multi-weak-signal evasion
+            local risk_score=0 risk_sigs=0 risk_qual_sigs=0 r_pct=0
+            if [[ "$RISK_SCORE_ENABLED" == "true" ]]; then
+                if (( eff_warn_msgs > 0 && msgs > 0 )); then
+                    r_pct=$(( (msgs * 100) / eff_warn_msgs ))
+                    (( r_pct > 100 )) && r_pct=100
+                    if (( r_pct >= 50 )); then risk_score=$(( risk_score + (15 * r_pct) / 100 )); risk_sigs=$(( risk_sigs + 1 )); fi
+                fi
+                if (( eff_warn_rcpts > 0 && rcpts > 0 )); then
+                    r_pct=$(( (rcpts * 100) / eff_warn_rcpts ))
+                    (( r_pct > 100 )) && r_pct=100
+                    if (( r_pct >= 50 )); then risk_score=$(( risk_score + (15 * r_pct) / 100 )); risk_sigs=$(( risk_sigs + 1 )); fi
+                fi
+                if (( eff_warn_uniq > 0 && uniq_doms >= MIN_EXTERNAL_DOMAINS_FOR_UNIQUE && uniq_rcpts > 0 )); then
+                    r_pct=$(( (uniq_rcpts * 100) / eff_warn_uniq ))
+                    (( r_pct > 100 )) && r_pct=100
+                    if (( r_pct >= 50 )); then risk_score=$(( risk_score + (15 * r_pct) / 100 )); risk_sigs=$(( risk_sigs + 1 )); fi
+                fi
+                if (( WARN_QUEUE_PER_USER > 0 && q_cnt > 0 )); then
+                    r_pct=$(( (q_cnt * 100) / WARN_QUEUE_PER_USER ))
+                    (( r_pct > 100 )) && r_pct=100
+                    if (( r_pct >= 50 )); then risk_score=$(( risk_score + (15 * r_pct) / 100 )); risk_sigs=$(( risk_sigs + 1 )); fi
+                fi
+                if (( WARN_FAILED_RATE_PCT > 0 && rcpts >= MIN_RECIPIENTS_FOR_FAIL_RATE && fail_pct_x10 > 0 )); then
+                    r_pct=$(( (fail_pct_x10 * 10) / WARN_FAILED_RATE_PCT ))
+                    (( r_pct > 100 )) && r_pct=100
+                    if (( r_pct >= 50 )); then risk_score=$(( risk_score + (20 * r_pct) / 100 )); risk_sigs=$(( risk_sigs + 1 )); risk_qual_sigs=$(( risk_qual_sigs + 1 )); fi
+                fi
+                if (( WARN_SOURCE_IPS > 0 && msgs >= WARN_MIN_MESSAGES_FOR_IPS && ip_cnt > 0 )); then
+                    r_pct=$(( (ip_cnt * 100) / WARN_SOURCE_IPS ))
+                    (( r_pct > 100 )) && r_pct=100
+                    if (( r_pct >= 50 )); then risk_score=$(( risk_score + (20 * r_pct) / 100 )); risk_sigs=$(( risk_sigs + 1 )); risk_qual_sigs=$(( risk_qual_sigs + 1 )); fi
+                fi
+                if (( WARN_SPOOF_COUNT > 0 && spoof_cnt > 0 )); then
+                    r_pct=$(( (spoof_cnt * 100) / WARN_SPOOF_COUNT ))
+                    (( r_pct > 100 )) && r_pct=100
+                    if (( r_pct >= 50 )); then risk_score=$(( risk_score + (25 * r_pct) / 100 )); risk_sigs=$(( risk_sigs + 1 )); risk_qual_sigs=$(( risk_qual_sigs + 1 )); fi
+                fi
+                if (( WARN_SPAM_SIGNALS > 0 && spam_sig > 0 )); then
+                    r_pct=$(( (spam_sig * 100) / WARN_SPAM_SIGNALS ))
+                    (( r_pct > 100 )) && r_pct=100
+                    if (( r_pct >= 50 )); then risk_score=$(( risk_score + (25 * r_pct) / 100 )); risk_sigs=$(( risk_sigs + 1 )); risk_qual_sigs=$(( risk_qual_sigs + 1 )); fi
+                fi
+                if [[ -n "$aaf_ip" ]] && (( aaf_cnt >= AUTH_FAIL_BEFORE_SUCCESS_MIN )); then
+                    risk_score=$(( risk_score + 20 )); risk_sigs=$(( risk_sigs + 1 )); risk_qual_sigs=$(( risk_qual_sigs + 1 ))
+                fi
+                (( risk_score > 100 )) && risk_score=100
+
+                if (( risk_score >= CRIT_RISK_SCORE && risk_sigs >= 3 && risk_qual_sigs >= 1 )); then
+                    if [[ "$severity" != "CRITICAL" ]]; then
+                        severity="CRITICAL"
+                        reasons=$(append_reason "$reasons" "Risk Score (${risk_score}/100 >= ${CRIT_RISK_SCORE})")
+                    fi
+                elif (( risk_score >= WARN_RISK_SCORE && risk_sigs >= 2 )); then
+                    if [[ "$severity" == "NORMAL" ]]; then
+                        severity="WARNING"
+                        reasons=$(append_reason "$reasons" "Risk Score (${risk_score}/100 >= ${WARN_RISK_SCORE})")
+                    fi
+                fi
+            fi
+        fi
+
+        # Desync self-healing for accounts manually unlocked outside zimbra-spam-monitor (e.g. Zimbra Web UI)
+        local need_force_relock="false"
+        if is_account_already_locked "$sender" && (( msgs > 0 && last_sub_ts > 0 )); then
+            local lock_ep
+            lock_ep=$(get_locked_account_epoch "$sender")
+            if [[ "$lock_ep" =~ ^[0-9]+$ ]] && (( lock_ep > 0 && last_sub_ts > lock_ep + LOCK_RELOCK_GRACE_SECONDS )); then
+                if [[ "$severity" == "CRITICAL" ]]; then
+                    need_force_relock="true"
+                else
+                    # Account was clearly unlocked externally and is sending normal mail: clear stale lock record
+                    remove_locked_account_record "$sender"
+                    log_msg "INFO" "Cleared stale lock record for ${sender} (unlocked externally, sending normal traffic)"
+                fi
+            fi
         fi
 
         [[ "$severity" == "NORMAL" ]] && continue
 
-        if ! should_send_alert "$sender" "$severity"; then
-            log_msg "INFO" "Cooldown active; skipping duplicate alert for $sender [$severity]"
-            continue
-        fi
-
+        # DECOUPLED REMEDIATION (runs BEFORE cooldown check so failed locks & holds retry every cycle!)
         local action_taken="NOT LOCKED (Active - Alert Only)"
+        local lock_rc=0
+        local held_now=0
         if [[ "$severity" == "CRITICAL" ]]; then
-            action_taken=$(lock_zimbra_account "$sender") || true
-            hold_sender_queue "$sender"
+            action_taken=$(lock_zimbra_account "$sender" "$need_force_relock") || lock_rc=$?
+            held_now=$(hold_sender_queue "$sender" "$tmp_qid_map" "false")
+            if [[ "$held_now" =~ ^[0-9]+$ ]] && (( held_now > 0 )); then
+                action_taken="${action_taken} | Held ${held_now} queued"
+            fi
+            # Record attacker IPs passively to attacker_ips.log (zero OS firewall mutation)
+            if [[ "$s_ips" != "webmail/local" && "$s_ips" != "queued/unknown" ]]; then
+                local ip_tok
+                for ip_tok in $(printf '%s' "$s_ips" | sed 's/ (+.*//' | tr ',' ' '); do
+                    record_attacker_ip "$ip_tok" "$sender" "CRITICAL: ${reasons:0:80}"
+                done
+            fi
         elif is_account_already_locked "$sender"; then
             action_taken=$(format_already_locked_msg "$sender")
         fi
 
-        record_alert_state "$sender" "$severity"
         alerts_triggered=$(( alerts_triggered + 1 ))
+
+        # Notification Cooldown check (bypassed on RE-LOCKED persistent session / re-compromise)
+        if [[ "$need_force_relock" != "true" ]] && ! should_send_alert "$sender" "$severity"; then
+            log_msg "INFO" "Cooldown active; skipping duplicate alert for $sender [$severity] (state: $action_taken)"
+            continue
+        fi
 
         local spam_time_str="$now_str"
         if [[ -n "$s_tspan" && "$s_tspan" != "-" ]]; then
@@ -1569,13 +3562,47 @@ run_monitor_cycle() {
         fi
 
         local ip_display="$s_ips"
-        if (( ip_cnt > 1 )); then
+        if (( real_ip_cnt > 1 && ip_cnt != real_ip_cnt )); then
+            ip_display="${s_ips} (${real_ip_cnt} IPs / ${ip_cnt} /24 nets)"
+        elif (( ip_cnt > 1 )); then
             ip_display="${s_ips} (${ip_cnt} IPs)"
         elif (( ip_cnt == 1 )); then
             ip_display="${s_ips} (1 IP)"
         fi
 
-        log_msg "$severity" "Spam detected: user=$sender | reason=[$reasons] | msgs=$msgs | rcpts=$rcpts ($uniq_rcpts uniq) | fail=${fail_pct_str}% | queue=$q_cnt | action=$action_taken"
+        local reasons_disp="$reasons"
+        (( ${#reasons_disp} > 400 )) && reasons_disp="${reasons_disp:0:397}..."
+
+        log_msg "$severity" "Spam detected: user=$sender | origin=$s_origin | score=${risk_score:-0}/100 | reason=[$reasons_disp] | msgs=$msgs (1h=$h1_msgs) | rcpts=$rcpts ($uniq_rcpts uniq) | fail=${fail_pct_str}% | queue=$q_cnt (hold=$q_hold) | action=$action_taken"
+
+        local gjson
+        gjson=$(printf '{"version":"%s","event":"spam_alert","severity":"%s","server":"%s","server_ip":"%s","alert_time":"%s","spam_time":"%s","sender":"%s","origin":"%s","account_state":"%s","risk_score":%d,"source_ips":"%s","reasons":"%s","metrics":{"msgs_5m":%d,"rcpts_5m":%d,"uniq_rcpts_5m":%d,"uniq_doms_5m":%d,"sent_5m":%d,"deferred_5m":%d,"bounced_5m":%d,"failed_pct":"%s","msgs_1h":%d,"rcpts_1h":%d,"msgs_24h":%d,"amavis":%d,"spoof":%d,"rbl":%d,"queue_live":%d,"queue_hold":%d}}' \
+            "$VERSION" "$severity" "$(json_escape "$srv_host")" "$(json_escape "$srv_ip")" \
+            "$(json_escape "$now_str")" "$(json_escape "$spam_time_str")" "$(json_escape "$sender")" \
+            "$(json_escape "$s_origin")" "$(json_escape "$action_taken")" "${risk_score:-0}" \
+            "$(json_escape "$ip_display")" "$(json_escape "$reasons_disp")" \
+            "$msgs" "$rcpts" "$uniq_rcpts" "$uniq_doms" "$snt" "$def" "$bnc" "$fail_pct_str" \
+            "$h1_msgs" "$h1_rcpts" "$d24_msgs" "$amavis_cnt" "$spoof_cnt" "$rbl_cnt" "$q_cnt" "$q_hold")
+        log_json_event "$gjson"
+
+        # Batch overflow alerts if > MAX_ALERTS_PER_CYCLE to prevent Telegram 429 floods
+        if (( detail_alerts_sent >= MAX_ALERTS_PER_CYCLE )); then
+            overflow_count=$(( overflow_count + 1 ))
+            overflow_lines="${overflow_lines}  - [${severity}] ${sender} (${msgs} msgs / ${rcpts} rcpts | Q:${q_cnt} | ${action_taken})"$'\n'
+            overflow_html="${overflow_html}  - <b>[${severity}]</b> <code>$(html_escape "$sender")</code> (${msgs}m/${rcpts}r | ${action_taken:0:24})"$'\n'
+            record_alert_state "$sender" "$severity"
+            continue
+        fi
+
+        local next_steps_txt="" next_steps_html=""
+        if [[ "$severity" == "CRITICAL" ]]; then
+            local extra_note=""
+            if [[ "$need_force_relock" == "true" ]]; then
+                extra_note=" (Note: persistent SMTP session or external unlock detected; consider Hold Queue)"
+            fi
+            next_steps_txt=$'\n'"Next Steps    : 1) Reset password  2) Check mail filters/forwarding  3) Check active sessions${extra_note}"
+            next_steps_html=$'\n'"<b>Next Steps   :</b> Reset password, check mail filters/forwarding &amp; sessions$(html_escape "$extra_note")"
+        fi
 
         local tg_msg
         tg_msg=$(cat <<EOF
@@ -1585,23 +3612,25 @@ run_monitor_cycle() {
 <b>Alert Time   :</b> ${now_str}
 <b>Spam Time    :</b> $(html_escape "$spam_time_str")
 <b>Spam Account :</b> <code>$(html_escape "$sender")</code>
+<b>Origin       :</b> $(html_escape "$s_origin")
 <b>Account State:</b> <b>$(html_escape "$action_taken")</b>
 <b>Source IPs   :</b> <code>$(html_escape "$ip_display")</code>
-<b>Reason       :</b> $(html_escape "$reasons")
+<b>Risk Score   :</b> <b>${risk_score:-0}/100</b>
+<b>Reason       :</b> $(html_escape "$reasons_disp")${next_steps_html}
 
-<b>[1] ACCOUNT SPAM METRICS (${LOOKBACK_MINUTES}m)</b>
-<b>Messages Sent:</b> <b>${msgs}</b> msgs
-<b>Recipients   :</b> <b>${rcpts}</b> total (Unique: ${uniq_rcpts} | Domains: ${uniq_doms})
+<b>[1] ACCOUNT SPAM METRICS (${LOOKBACK_MINUTES}m | 1h | 24h)</b>
+<b>Messages Sent:</b> <b>${msgs}</b> msgs (1h: ${h1_msgs} | 24h: ${d24_msgs})
+<b>Recipients   :</b> <b>${rcpts}</b> total (Unique: ${uniq_rcpts} | Domains: ${uniq_doms} | 1h: ${h1_rcpts})
 <b>Failed Rate  :</b> <b>${fail_pct_str}%</b> (${failed_cnt}/${rcpts} failed)
   <code>Sent: ${snt} | Deferred: ${def} | Bounced: ${bnc}</code>
 <b>Spam Signals :</b> <code>Amavis SPAM: ${amavis_cnt} | Spoof From: ${spoof_cnt} | RBL: ${rbl_cnt}</code>
 
 <b>[2] REMAINING MAIL QUEUE</b>
-<b>Account Queue:</b> <b>${q_cnt}</b> emails
+<b>Account Queue:</b> <b>${q_cnt}</b> emails (Hold: ${q_hold})
 <b>System Queue :</b> <b>${total_queue}</b> emails
   <code>Active: ${active_queue} | Deferred: ${def_queue} | Hold: ${hold_queue}</code>
 
-<b>[3] SYSTEM TOTAL TRAFFIC</b>
+<b>[3] SYSTEM OUTBOUND (LAST ${LOOKBACK_MINUTES}M)</b>
 <b>Total Traffic:</b> <b>${sys_tot}</b> emails
   <code>Sent: ${sys_snt} | Deferred: ${sys_def} | Bounced: ${sys_bnc}</code>
 <code>==============================</code>
@@ -1618,15 +3647,17 @@ Server        : ${srv_host} (${srv_ip})
 Alert Time    : ${now_str}
 Spam Time     : ${spam_time_str}
 Spam Account  : ${sender}
+Origin        : ${s_origin}
 Account State : ${action_taken}
 Source IPs    : ${ip_display}
-Reason        : ${reasons}
+Risk Score    : ${risk_score:-0}/100
+Reason        : ${reasons_disp}${next_steps_txt}
 
 ------------------------------------------------------------
 [1] ACCOUNT SPAM METRICS (LAST ${LOOKBACK_MINUTES} MINS)
 ------------------------------------------------------------
-Messages Sent : ${msgs} msgs
-Recipients    : ${rcpts} total (Unique: ${uniq_rcpts} | Domains: ${uniq_doms})
+Messages Sent : ${msgs} msgs (1h: ${h1_msgs} | 24h: ${d24_msgs})
+Recipients    : ${rcpts} total (Unique: ${uniq_rcpts} | Domains: ${uniq_doms} | 1h: ${h1_rcpts})
 Failed Rate   : ${fail_pct_str}% (${failed_cnt}/${rcpts} failed)
                 Sent: ${snt} | Deferred: ${def} | Bounced: ${bnc}
 Spam Signals  : Amavis SPAM: ${amavis_cnt} | Spoof From: ${spoof_cnt} | RBL: ${rbl_cnt}
@@ -1634,28 +3665,61 @@ Spam Signals  : Amavis SPAM: ${amavis_cnt} | Spoof From: ${spoof_cnt} | RBL: ${r
 ------------------------------------------------------------
 [2] REMAINING MAIL QUEUE
 ------------------------------------------------------------
-Account Queue : ${q_cnt} emails
+Account Queue : ${q_cnt} emails (Hold: ${q_hold})
 System Queue  : ${total_queue} emails
                 Active: ${active_queue} | Deferred: ${def_queue} | Hold: ${hold_queue}
 
 ------------------------------------------------------------
-[3] SYSTEM TOTAL TRAFFIC
+[3] SYSTEM OUTBOUND (LAST ${LOOKBACK_MINUTES} MINS)
 ------------------------------------------------------------
 Total Traffic : ${sys_tot} emails
                 Sent: ${sys_snt} | Deferred: ${sys_def} | Bounced: ${sys_bnc}
 ============================================================
 EOF
 )
+        local wh_json
+        wh_json=$(build_webhook_payload "$mail_body" "$gjson")
 
-        send_telegram_alert "$tg_msg"
-        send_email_alert "$mail_subj" "$mail_body" "$total_queue"
+        # Record cooldown after dispatching (failed channels are queued in outbox for retry)
+        dispatch_notifications "alert_${sender}_${severity}" "$tg_msg" "$mail_subj" "$mail_body" "$total_queue" "$wh_json" || true
+        record_alert_state "$sender" "$severity"
+        detail_alerts_sent=$(( detail_alerts_sent + 1 ))
 
     done < "$tmp_merged"
 
+    # Send 1 consolidated overflow summary if more than MAX_ALERTS_PER_CYCLE accounts triggered
+    if (( overflow_count > 0 )); then
+        local ov_tg ov_mail
+        ov_tg=$(cat <<EOF
+<b>[ZIMBRA SPAM OVERFLOW SUMMARY]</b>
+<code>==============================</code>
+<b>Server   :</b> <code>$(html_escape "$srv_host")</code> (${srv_ip})
+<b>Time     :</b> ${now_str}
+<b>Extra    :</b> <b>${overflow_count}</b> additional account(s) triggered (capped at ${MAX_ALERTS_PER_CYCLE} detailed alerts/cycle)
+${overflow_html}<code>==============================</code>
+EOF
+)
+        ov_mail=$(cat <<EOF
+============================================================
+         ZIMBRA SPAM OVERFLOW SUMMARY (+${overflow_count} accounts)
+============================================================
+Server : ${srv_host} (${srv_ip})
+Time   : ${now_str}
+
+Additional accounts triggered (detailed alerts capped at ${MAX_ALERTS_PER_CYCLE}/cycle):
+${overflow_lines}============================================================
+EOF
+)
+        dispatch_notifications "overflow_${now_epoch}" "$ov_tg" "[Zimbra Spam Summary] +${overflow_count} more account(s) on ${srv_host}" "$ov_mail" "$total_queue" "" || true
+    fi
+
+    # 4. Consolidated Brute-Force Summary (from audit.log + zimbra.log SASL fails)
+    process_brute_force_alerts "$tmp_aux_auth" "$tmp_sasl_fail" "$srv_host" "$srv_ip" "$now_str"
+
+    # 5. System-Wide Queue Warning (only when no per-account spam alert already fired)
     if (( total_queue >= WARN_TOTAL_QUEUE )) && (( alerts_triggered == 0 )); then
         if should_send_alert "__SYSTEM_TOTAL_QUEUE__" "WARNING"; then
-            record_alert_state "__SYSTEM_TOTAL_QUEUE__" "WARNING"
-            local q_tg_msg
+            local q_tg_msg q_mail_body q_gjson q_wh_json
             q_tg_msg=$(cat <<EOF
 <b>[ZIMBRA QUEUE WARNING]</b>
 <code>==============================</code>
@@ -1666,13 +3730,12 @@ EOF
 <b>System Queue :</b> <b>${total_queue}</b> emails (Limit: ${WARN_TOTAL_QUEUE})
   <code>Active: ${active_queue} | Deferred: ${def_queue} | Hold: ${hold_queue}</code>
 
-<b>[2] SYSTEM TOTAL TRAFFIC</b>
+<b>[2] SYSTEM OUTBOUND (LAST ${LOOKBACK_MINUTES}M)</b>
 <b>Total Traffic:</b> <b>${sys_tot}</b> emails
   <code>Sent: ${sys_snt} | Deferred: ${sys_def} | Bounced: ${sys_bnc}</code>
 <code>==============================</code>
 EOF
 )
-            local q_mail_body
             q_mail_body=$(cat <<EOF
 ============================================================
          ZIMBRA QUEUE WARNING
@@ -1687,21 +3750,29 @@ System Queue  : ${total_queue} emails (Limit: ${WARN_TOTAL_QUEUE})
                 Active: ${active_queue} | Deferred: ${def_queue} | Hold: ${hold_queue}
 
 ------------------------------------------------------------
-[2] SYSTEM TOTAL TRAFFIC
+[2] SYSTEM OUTBOUND (LAST ${LOOKBACK_MINUTES} MINS)
 ------------------------------------------------------------
 Total Traffic : ${sys_tot} emails
                 Sent: ${sys_snt} | Deferred: ${sys_def} | Bounced: ${sys_bnc}
 ============================================================
 EOF
 )
-            send_telegram_alert "$q_tg_msg"
-            send_email_alert "[Zimbra Queue Warning] ${total_queue} queued emails on ${srv_host}" \
-                "$q_mail_body" \
-                "$total_queue"
+            q_gjson=$(printf '{"version":"%s","event":"queue_warning","severity":"WARNING","server":"%s","server_ip":"%s","alert_time":"%s","total_queue":%d,"active":%d,"deferred":%d,"hold":%d}' \
+                "$VERSION" "$(json_escape "$srv_host")" "$(json_escape "$srv_ip")" "$(json_escape "$now_str")" "$total_queue" "$active_queue" "$def_queue" "$hold_queue")
+            q_wh_json=$(build_webhook_payload "$q_mail_body" "$q_gjson")
+            log_json_event "$q_gjson"
+            dispatch_notifications "sys_queue" "$q_tg_msg" "[Zimbra Queue Warning] ${total_queue} queued emails on ${srv_host}" "$q_mail_body" "$total_queue" "$q_wh_json" || true
+            record_alert_state "__SYSTEM_TOTAL_QUEUE__" "WARNING"
         fi
     fi
 
-    rm -f "$tmp_log_stats" "$tmp_sys_sum" "$tmp_q_stats" "$tmp_q_sum" "$tmp_merged" "$lock_file"
+    # 6. Post-scan checks (run AFTER remediation so DNS latency never delays account locking)
+    run_rbl_check "auto"
+    maybe_send_daily_summary "$tmp_roll_sum" "$srv_host" "$srv_ip" "$total_queue"
+
+    printf '%s\n' "$now_epoch" > "$last_run_file" 2>/dev/null || true
+    _cleanup_run_cycle
+    trap - EXIT INT TERM
 }
 
 # ==============================================================================
@@ -1711,14 +3782,25 @@ show_status() {
     load_config
     resolve_zimbra_settings
 
-    local tmp_log_stats tmp_sys_sum tmp_q_stats tmp_q_sum
-    tmp_log_stats=$(mktemp 2>/dev/null || echo "/tmp/zsm_st_log_$$")
-    tmp_sys_sum=$(mktemp 2>/dev/null || echo "/tmp/zsm_st_sys_$$")
-    tmp_q_stats=$(mktemp 2>/dev/null || echo "/tmp/zsm_st_q_$$")
-    tmp_q_sum=$(mktemp 2>/dev/null || echo "/tmp/zsm_st_qsum_$$")
+    local now_epoch="${ZSM_NOW_EPOCH:-$(date +%s)}"
+    local local_ips awk_bin
+    local_ips=$(get_local_ips)
+    awk_bin=$(find_awk_bin)
 
-    analyze_zimbra_log "$tmp_log_stats" "$tmp_sys_sum"
+    local tmp_log_stats tmp_sys_sum tmp_bkt_stats tmp_aux_web tmp_aux_auth tmp_q_stats tmp_q_sum tmp_roll_sum
+    tmp_log_stats=$(make_safe_tmp "zsm_st_log")
+    tmp_sys_sum=$(make_safe_tmp "zsm_st_sys")
+    tmp_bkt_stats=$(make_safe_tmp "zsm_st_bkt")
+    tmp_aux_web=$(make_safe_tmp "zsm_st_aw")
+    tmp_aux_auth=$(make_safe_tmp "zsm_st_aa")
+    tmp_q_stats=$(make_safe_tmp "zsm_st_q")
+    tmp_q_sum=$(make_safe_tmp "zsm_st_qsum")
+    tmp_roll_sum=$(make_safe_tmp "zsm_st_roll")
+
+    analyze_aux_zimbra_logs "$tmp_aux_web" "$tmp_aux_auth" "$now_epoch" "$local_ips" "$awk_bin"
+    analyze_zimbra_log "$tmp_log_stats" "$tmp_sys_sum" "$tmp_bkt_stats" "" "$tmp_aux_web" "" "$LOOKBACK_MINUTES"
     analyze_postfix_queue "$tmp_q_stats" "$tmp_q_sum"
+    update_and_summarize_rolling_history "$tmp_bkt_stats" "$tmp_roll_sum" "true"
 
     local sys_summary sys_tot sys_snt sys_def sys_bnc
     sys_summary=$(cat "$tmp_sys_sum" 2>/dev/null || echo "0|0|0|0")
@@ -1728,19 +3810,24 @@ show_status() {
     q_summary=$(cat "$tmp_q_sum" 2>/dev/null || echo "0|0|0|0")
     IFS='|' read -r total_queue active_queue def_queue hold_queue <<< "$q_summary"
 
+    local outbox_cnt=0
+    if [[ -d "$STATE_DIR/outbox" ]]; then
+        outbox_cnt=$(find "$STATE_DIR/outbox" -maxdepth 1 -name '*.msg' 2>/dev/null | wc -l | tr -d ' ')
+    fi
+
     echo "=============================================================================="
     echo " ZIMBRA SPAM MONITOR v${VERSION} - LIVE SYSTEM STATUS (LAST ${LOOKBACK_MINUTES} MINS)"
     echo "=============================================================================="
     echo " Zimbra Server   : $(get_server_hostname) ($(get_server_ip))"
-    echo " Monitor Status  : ${MONITOR_ENABLED} | Check Range: ${LOOKBACK_MINUTES}m | Cooldown: ${ALERT_COOLDOWN_MINUTES}m | Auto-Lock: ${AUTO_LOCK_ON_CRITICAL}"
-    echo " Alert Email To  : ${RESOLVED_EMAIL_TO} (Mode: ${EMAIL_DELIVERY_MODE})"
-    echo " System Traffic  : ${sys_tot} emails (Sent: ${sys_snt} | Deferred: ${sys_def} | Bounced: ${sys_bnc})"
+    echo " Monitor Status  : ${MONITOR_ENABLED} | Range: ${LOOKBACK_MINUTES}m | Cooldown: ${ALERT_COOLDOWN_MINUTES}m | Auto-Lock: ${AUTO_LOCK_ON_CRITICAL}"
+    echo " Alert Channels  : TG=${TELEGRAM_ENABLED} | Mail=${EMAIL_ENABLED} (${RESOLVED_EMAIL_TO}) | Webhook=${WEBHOOK_ENABLED} | Outbox=${outbox_cnt}"
+    echo " System Outbound : ${sys_tot} emails (Sent: ${sys_snt} | Deferred: ${sys_def} | Bounced: ${sys_bnc})"
     echo " Postfix Queue   : ${total_queue} emails (Active: ${active_queue} | Deferred: ${def_queue} | Hold: ${hold_queue})"
     echo "------------------------------------------------------------------------------"
     printf " %-26s | %-5s | %-13s | %-6s | %-3s | %-10s\n" "SENDER (${LOOKBACK_MINUTES}m)" "MSGS" "RCPTS (UNIQ)" "FAIL%" "IPs" "SPAM/SPOOF"
     echo "------------------------------------------------------------------------------"
     if [[ -s "$tmp_log_stats" ]]; then
-        head -n 15 "$tmp_log_stats" | while IFS='|' read -r s m r ur ud snt def bnc ipc spf amv rbl ips tsp; do
+        head -n 15 "$tmp_log_stats" | while IFS='|' read -r s m r ur ud snt def bnc ipc ripc spf amv rbl orig lst ips tsp; do
             local fl=$(( def + bnc ))
             local fp_x10=0
             if (( r > 0 )); then
@@ -1755,18 +3842,19 @@ show_status() {
         echo " (No outbound email traffic in the last ${LOOKBACK_MINUTES} minutes)"
     fi
     echo "------------------------------------------------------------------------------"
-    printf " %-34s | %-10s | %-28s\n" "SENDERS IN POSTFIX QUEUE" "QUEUED" "STATUS / REASON"
+    printf " %-32s | %-12s | %-28s\n" "SENDERS IN POSTFIX QUEUE" "LIVE (HOLD)" "STATUS / REASON"
     echo "------------------------------------------------------------------------------"
     if [[ -s "$tmp_q_stats" ]]; then
-        head -n 10 "$tmp_q_stats" | while IFS='|' read -r u qc qr; do
-            printf " %-34s | %-10s | %-28s\n" "$u" "$qc" "$qr"
+        head -n 10 "$tmp_q_stats" | while IFS='|' read -r u ql qh qr; do
+            local qcol="${ql} (${qh})"
+            printf " %-32s | %-12s | %-28s\n" "$u" "$qcol" "$qr"
         done
     else
         echo " (Mail queue is clean)"
     fi
     echo "=============================================================================="
 
-    rm -f "$tmp_log_stats" "$tmp_sys_sum" "$tmp_q_stats" "$tmp_q_sum"
+    rm -f "$tmp_log_stats" "$tmp_sys_sum" "$tmp_bkt_stats" "$tmp_aux_web" "$tmp_aux_auth" "$tmp_q_stats" "$tmp_q_sum" "$tmp_roll_sum"
 }
 
 run_test_alert() {
@@ -1778,10 +3866,10 @@ run_test_alert() {
     now_str=$(date '+%Y-%m-%d %H:%M:%S')
 
     local tmp_log_stats tmp_sys_sum tmp_q_stats tmp_q_sum
-    tmp_log_stats=$(mktemp 2>/dev/null || echo "/tmp/zsm_tst_log_$$")
-    tmp_sys_sum=$(mktemp 2>/dev/null || echo "/tmp/zsm_tst_sys_$$")
-    tmp_q_stats=$(mktemp 2>/dev/null || echo "/tmp/zsm_tst_q_$$")
-    tmp_q_sum=$(mktemp 2>/dev/null || echo "/tmp/zsm_tst_qsum_$$")
+    tmp_log_stats=$(make_safe_tmp "zsm_tst_log")
+    tmp_sys_sum=$(make_safe_tmp "zsm_tst_sys")
+    tmp_q_stats=$(make_safe_tmp "zsm_tst_q")
+    tmp_q_sum=$(make_safe_tmp "zsm_tst_qsum")
 
     analyze_zimbra_log "$tmp_log_stats" "$tmp_sys_sum"
     analyze_postfix_queue "$tmp_q_stats" "$tmp_q_sum"
@@ -1801,16 +3889,17 @@ run_test_alert() {
     echo " - Check Interval   : ${LOOKBACK_MINUTES} mins (Cooldown: ${ALERT_COOLDOWN_MINUTES} mins)"
     echo " - Telegram Enabled : ${TELEGRAM_ENABLED} (Chat ID: ${TELEGRAM_CHAT_ID:-Not set})"
     echo " - Email Enabled    : ${EMAIL_ENABLED} (Recipient: ${RESOLVED_EMAIL_TO})"
+    echo " - Webhook Enabled  : ${WEBHOOK_ENABLED} (Format: ${WEBHOOK_FORMAT})"
 
     local test_tg_msg
     test_tg_msg=$(cat <<EOF
-<b>[ZIMBRA SPAM MONITOR - TEST]</b>
+<b>[ZIMBRA SPAM MONITOR v${VERSION} - TEST]</b>
 <code>==============================</code>
 <b>Server       :</b> <code>$(html_escape "$srv_host")</code> (${srv_ip})
 <b>Alert Time   :</b> ${now_str}
 <b>Check Range  :</b> Last ${LOOKBACK_MINUTES} mins (Repeat: ${ALERT_COOLDOWN_MINUTES}m)
 
-<b>[1] SYSTEM TOTAL TRAFFIC</b>
+<b>[1] SYSTEM OUTBOUND (LAST ${LOOKBACK_MINUTES}M)</b>
 <b>Total Traffic:</b> <b>${sys_tot}</b> emails
   <code>Sent: ${sys_snt} | Deferred: ${sys_def} | Bounced: ${sys_bnc}</code>
 
@@ -1831,19 +3920,17 @@ EOF
         fi
     fi
 
-    local mail_rc=0
-    if [[ "$EMAIL_ENABLED" == "true" ]]; then
-        local test_mail_body
-        test_mail_body=$(cat <<EOF
+    local test_mail_body
+    test_mail_body=$(cat <<EOF
 ============================================================
-         ZIMBRA SPAM MONITOR - TEST NOTIFICATION
+         ZIMBRA SPAM MONITOR v${VERSION} - TEST NOTIFICATION
 ============================================================
 Server        : ${srv_host} (${srv_ip})
 Alert Time    : ${now_str}
 Check Range   : Last ${LOOKBACK_MINUTES} mins (Repeat: ${ALERT_COOLDOWN_MINUTES}m)
 
 ------------------------------------------------------------
-[1] SYSTEM TOTAL TRAFFIC
+[1] SYSTEM OUTBOUND (LAST ${LOOKBACK_MINUTES} MINS)
 ------------------------------------------------------------
 Total Traffic : ${sys_tot} emails
                 Sent: ${sys_snt} | Deferred: ${sys_def} | Bounced: ${sys_bnc}
@@ -1856,6 +3943,9 @@ System Queue  : ${total_queue} emails
 ============================================================
 EOF
 )
+
+    local mail_rc=0
+    if [[ "$EMAIL_ENABLED" == "true" ]]; then
         if send_email_alert "[Zimbra Spam Monitor] Test Notification from ${srv_host}" "$test_mail_body" 0; then
             echo " [OK] Test Email sent successfully to ${RESOLVED_EMAIL_TO}!"
         else
@@ -1864,7 +3954,21 @@ EOF
         fi
     fi
 
-    return $(( tg_rc + mail_rc ))
+    local wh_rc=0
+    if [[ "$WEBHOOK_ENABLED" == "true" ]]; then
+        local gjson wh_payload
+        gjson=$(printf '{"version":"%s","event":"test","severity":"INFO","server":"%s","server_ip":"%s","alert_time":"%s"}' \
+            "$VERSION" "$(json_escape "$srv_host")" "$(json_escape "$srv_ip")" "$(json_escape "$now_str")")
+        wh_payload=$(build_webhook_payload "$test_mail_body" "$gjson")
+        if send_webhook_alert "$wh_payload"; then
+            echo " [OK] Test Webhook sent successfully (${WEBHOOK_FORMAT})!"
+        else
+            echo " [ERROR] Failed to send Webhook alert. Check WEBHOOK_URL."
+            wh_rc=1
+        fi
+    fi
+
+    return $(( tg_rc + mail_rc + wh_rc ))
 }
 
 unlock_account() {
@@ -1873,19 +3977,27 @@ unlock_account() {
         echo "Usage: zimbra-spam-monitor --unlock <email@domain.com>"
         return 1
     fi
-    load_config
-    echo "Unlocking Zimbra account ${target}..."
-    if [[ -n "$ZSM_ZMPROV_CMD" ]]; then
-        $ZSM_ZMPROV_CMD ma "$target" zimbraAccountStatus active
-    elif [[ -x /opt/zimbra/bin/zmprov ]]; then
-        su - zimbra -c "/opt/zimbra/bin/zmprov ma '$target' zimbraAccountStatus active"
-    else
-        echo "Error: /opt/zimbra/bin/zmprov not found on this server."
+    if ! is_valid_email_account "$target"; then
+        echo "Error: Invalid email address format: ${target}"
         return 1
     fi
+    load_config
+    echo "Unlocking Zimbra account ${target}..."
+    zmprov_account_action "unlock" "$target"
+    local rc=$?
+    if (( rc == 127 )); then
+        echo "Error: /opt/zimbra/bin/zmprov not found on this server."
+        return 1
+    elif (( rc != 0 )); then
+        echo "Error: Failed to unlock ${target} via zmprov (rc=${rc})."
+        return 1
+    fi
+    if [[ "$FLUSH_CACHE_ON_LOCK" == "true" ]]; then
+        zmprov_account_action "flush" "$target" || true
+    fi
     clear_alert_state "$target"
-    log_msg "INFO" "Admin unlocked account $target, cleared cooldown, and recorded unlock cutoff timestamp"
-    echo "[OK] Account ${target} is now 'active'. Alert cooldown cleared and prior log history ignored."
+    log_msg "INFO" "Admin unlocked account $target, cleared cooldown & rolling history, and recorded unlock cutoff timestamp"
+    echo "[OK] Account ${target} is now 'active'. Alert cooldown, 1h/24h history cleared, and prior logs ignored."
 }
 
 # ==============================================================================
@@ -2045,7 +4157,7 @@ ui_msg_box() {
 
     if [[ -n "$tui_bin" ]]; then
         "$tui_bin" --title "$title" --backtitle "Zimbra Outbound Spam Monitor v${VERSION}" \
-            --msgbox "$text" 18 76
+            --msgbox "$text" 20 78
         return
     fi
 
@@ -2059,14 +4171,17 @@ ui_msg_box() {
 }
 
 # ------------------------------------------------------------------------------
-# SUBMENU [2.1]: TELEGRAM SETTINGS (COMPACT)
+# SUBMENU [2.1]: TELEGRAM SETTINGS
 # ------------------------------------------------------------------------------
 submenu_telegram() {
     while true; do
         load_config
         local st_label="ON"
         [[ "$TELEGRAM_ENABLED" != "true" ]] && st_label="OFF"
-        local tok_mask="${TELEGRAM_BOT_TOKEN:-<Not set>}"
+        local tok_mask="<Not set>"
+        if [[ -n "$TELEGRAM_BOT_TOKEN" ]]; then
+            tok_mask="${TELEGRAM_BOT_TOKEN:0:6}...***"
+        fi
         local cid_mask="${TELEGRAM_CHAT_ID:-<Not set>}"
 
         local choice
@@ -2095,15 +4210,13 @@ submenu_telegram() {
                 new_cid=$(ui_input_box "TELEGRAM CHAT ID" "Enter User or Group Chat ID (e.g. -100123456789):" "$TELEGRAM_CHAT_ID")
                 update_cfg_var "TELEGRAM_CHAT_ID" "$new_cid"
                 ;;
-            0|"")
-                break
-                ;;
+            0|"") break ;;
         esac
     done
 }
 
 # ------------------------------------------------------------------------------
-# SUBMENU [2.2]: EMAIL & SMTP SETTINGS (COMPACT - ONE-CLICK MODE CYCLE)
+# SUBMENU [2.2]: EMAIL & SMTP SETTINGS
 # ------------------------------------------------------------------------------
 submenu_email() {
     while true; do
@@ -2156,15 +4269,57 @@ submenu_email() {
                     update_cfg_var "SMTP_PASS" "$spass"
                 fi
                 ;;
-            0|"")
-                break
-                ;;
+            0|"") break ;;
         esac
     done
 }
 
 # ------------------------------------------------------------------------------
-# SUBMENU [2]: ALERTS & TEST (TELEGRAM + EMAIL + TEST)
+# SUBMENU [2.3]: WEBHOOK SETTINGS (SLACK / DISCORD / GENERIC JSON)
+# ------------------------------------------------------------------------------
+submenu_webhook() {
+    while true; do
+        load_config
+        local st_label="ON"
+        [[ "$WEBHOOK_ENABLED" != "true" ]] && st_label="OFF"
+        local url_mask="<Not set>"
+        [[ -n "$WEBHOOK_URL" ]] && url_mask="${WEBHOOK_URL:0:28}..."
+
+        local choice
+        choice=$(ui_select_menu "WEBHOOK SETTINGS" \
+            "Send alerts to Slack, Discord, or custom JSON endpoint:" \
+            "1" "Webhook Alerts : ${st_label} (Select to Toggle)" \
+            "2" "Webhook Format : ${WEBHOOK_FORMAT} (Select to Cycle: generic/slack/discord)" \
+            "3" "Webhook URL    : ${url_mask}" \
+            "0" "Back")
+
+        case "$choice" in
+            1)
+                if [[ "$WEBHOOK_ENABLED" == "true" ]]; then
+                    update_cfg_var "WEBHOOK_ENABLED" "false"
+                else
+                    update_cfg_var "WEBHOOK_ENABLED" "true"
+                fi
+                ;;
+            2)
+                case "$WEBHOOK_FORMAT" in
+                    generic) update_cfg_var "WEBHOOK_FORMAT" "slack" ;;
+                    slack)   update_cfg_var "WEBHOOK_FORMAT" "discord" ;;
+                    *)       update_cfg_var "WEBHOOK_FORMAT" "generic" ;;
+                esac
+                ;;
+            3)
+                local new_url
+                new_url=$(ui_input_box "WEBHOOK URL" "Enter Webhook HTTPS URL:" "$WEBHOOK_URL")
+                update_cfg_var "WEBHOOK_URL" "$new_url"
+                ;;
+            0|"") break ;;
+        esac
+    done
+}
+
+# ------------------------------------------------------------------------------
+# SUBMENU [2]: ALERTS & TEST
 # ------------------------------------------------------------------------------
 submenu_notifications() {
     while true; do
@@ -2178,12 +4333,16 @@ submenu_notifications() {
         local mail_badge="ON -> ${RESOLVED_EMAIL_TO}"
         [[ "$EMAIL_ENABLED" != "true" ]] && mail_badge="OFF"
 
+        local wh_badge="OFF"
+        [[ "$WEBHOOK_ENABLED" == "true" ]] && wh_badge="ON (${WEBHOOK_FORMAT})"
+
         local choice
         choice=$(ui_select_menu "ALERTS & TEST" \
-            "Configure Telegram, Email/SMTP, or send a test message:" \
+            "Configure Telegram, Email/SMTP, Webhook, or send a test alert:" \
             "1" "Telegram Settings   [${tg_badge}]" \
             "2" "Email/SMTP Settings [${mail_badge}]" \
             "3" "Send Test Alert Now" \
+            "4" "Webhook Settings    [${wh_badge}]" \
             "0" "Back")
 
         case "$choice" in
@@ -2194,13 +4353,14 @@ submenu_notifications() {
                 test_out=$(run_test_alert 2>&1 || true)
                 ui_msg_box "TEST ALERT RESULT" "$test_out"
                 ;;
+            4) submenu_webhook ;;
             0|"") break ;;
         esac
     done
 }
 
 # ------------------------------------------------------------------------------
-# SUBMENU [3]: STREAMLINED SPAM LIMITS & SCHEDULE (FLAT, ZERO SUBMENU MAZE)
+# SUBMENU [3]: STREAMLINED SPAM LIMITS & SCHEDULE
 # ------------------------------------------------------------------------------
 apply_email_volume_limits() {
     local w_rcpt="$1"
@@ -2230,7 +4390,7 @@ submenu_thresholds() {
 
         local choice
         choice=$(ui_select_menu "SPAM LIMITS & CHECK SCHEDULE" \
-            "Check Range: Last ${LOOKBACK_MINUTES}m | Cron: ${cur_cron} | Repeat Alert: ${ALERT_COOLDOWN_MINUTES}m" \
+            "Range: ${LOOKBACK_MINUTES}m | 1h Limit: ${WARN_HOURLY_MESSAGES}/${CRIT_HOURLY_MESSAGES} | Cron: ${cur_cron} | Repeat: ${ALERT_COOLDOWN_MINUTES}m" \
             "1" "Quick Preset       (Strict 50/100 | Normal 100/200 | Large 200/400)" \
             "2" "Check Schedule     : ${cur_cron} (Log Range: ${LOOKBACK_MINUTES}m)" \
             "3" "Repeat Cooldown    : ${ALERT_COOLDOWN_MINUTES} mins" \
@@ -2254,18 +4414,24 @@ submenu_thresholds() {
                         apply_email_volume_limits 50 100
                         update_cfg_num "WARN_QUEUE_PER_USER" 25
                         update_cfg_num "CRIT_QUEUE_PER_USER" 60
+                        update_cfg_num "WARN_HOURLY_MESSAGES" 150
+                        update_cfg_num "CRIT_HOURLY_MESSAGES" 300
                         ui_msg_box "PRESET APPLIED" "Applied STRICT profile (Warn >= 50 | Lock >= 100 emails in ${LOOKBACK_MINUTES}m)."
                         ;;
                     2)
                         apply_email_volume_limits 100 200
                         update_cfg_num "WARN_QUEUE_PER_USER" 40
                         update_cfg_num "CRIT_QUEUE_PER_USER" 100
+                        update_cfg_num "WARN_HOURLY_MESSAGES" 300
+                        update_cfg_num "CRIT_HOURLY_MESSAGES" 600
                         ui_msg_box "PRESET APPLIED" "Applied NORMAL profile (Warn >= 100 | Lock >= 200 emails in ${LOOKBACK_MINUTES}m)."
                         ;;
                     3)
                         apply_email_volume_limits 200 400
                         update_cfg_num "WARN_QUEUE_PER_USER" 80
                         update_cfg_num "CRIT_QUEUE_PER_USER" 200
+                        update_cfg_num "WARN_HOURLY_MESSAGES" 600
+                        update_cfg_num "CRIT_HOURLY_MESSAGES" 1200
                         ui_msg_box "PRESET APPLIED" "Applied HIGH-VOLUME profile (Warn >= 200 | Lock >= 400 emails in ${LOOKBACK_MINUTES}m)."
                         ;;
                 esac
@@ -2315,31 +4481,32 @@ submenu_thresholds() {
                 cr_val=$(ui_input_box "CRITICAL QUEUE LIMIT" "Queued emails for 1 user to trigger CRITICAL:" "$CRIT_QUEUE_PER_USER")
                 [[ "$cr_val" =~ ^[0-9]+$ ]] && update_cfg_num "CRIT_QUEUE_PER_USER" "$cr_val"
                 ;;
-            0|"")
-                break
-                ;;
+            0|"") break ;;
         esac
     done
 }
 
 # ------------------------------------------------------------------------------
-# SUBMENU [4]: UNLOCK & AUTO-LOCK (COMPACT)
+# SUBMENU [4]: UNLOCK, AUTO-LOCK & TARGETED QUEUE CONTROL
 # ------------------------------------------------------------------------------
 submenu_lock_control() {
     while true; do
         load_config
         local lock_label="ON"
         [[ "$AUTO_LOCK_ON_CRITICAL" != "true" ]] && lock_label="OFF (Alert Only)"
-
         local hold_label="OFF"
         [[ "$AUTO_HOLD_QUEUE_ON_CRITICAL" == "true" ]] && hold_label="ON"
+        local flush_label="ON"
+        [[ "$FLUSH_CACHE_ON_LOCK" != "true" ]] && flush_label="OFF"
 
         local choice
         choice=$(ui_select_menu "UNLOCK & AUTO-LOCK" \
-            "Unlock accounts or toggle automatic remediation:" \
-            "1" "Unlock Account        (Select locked user or type email)" \
-            "2" "Auto-Lock on CRITICAL : ${lock_label} (Select to Toggle)" \
-            "3" "Hold Queue on Lock    : ${hold_label} (Select to Toggle)" \
+            "Unlock accounts or configure single-account remediation:" \
+            "1" "Unlock Account          (Select locked user or type email)" \
+            "2" "Auto-Lock on CRITICAL   : ${lock_label} (Select to Toggle)" \
+            "3" "Hold Queue on Lock      : ${hold_label} (Select to Toggle)" \
+            "4" "Flush Cache on Lock     : ${flush_label} (Select to Toggle)" \
+            "5" "Hold / Release Queue    (Targeted single-sender queue action)" \
             "0" "Back")
 
         case "$choice" in
@@ -2349,7 +4516,7 @@ submenu_lock_control() {
                     local menu_args=()
                     local idx=1
                     local acc_map=()
-                    while IFS='|' read -r acc ltime; do
+                    while IFS='|' read -r acc ltime _; do
                         [[ -z "$acc" ]] && continue
                         menu_args+=("$idx" "${acc} (Locked: ${ltime})")
                         acc_map[$idx]="$acc"
@@ -2400,16 +4567,66 @@ submenu_lock_control() {
                     update_cfg_var "AUTO_HOLD_QUEUE_ON_CRITICAL" "true"
                 fi
                 ;;
-            0|"")
-                break
+            4)
+                if [[ "$FLUSH_CACHE_ON_LOCK" == "true" ]]; then
+                    update_cfg_var "FLUSH_CACHE_ON_LOCK" "false"
+                else
+                    update_cfg_var "FLUSH_CACHE_ON_LOCK" "true"
+                fi
                 ;;
+            5)
+                local q_act
+                q_act=$(ui_select_menu "TARGETED QUEUE ACTION" \
+                    "Hold or release queued messages for 1 specific sender:" \
+                    "1" "Hold all queued mail for a sender (postsuper -h)" \
+                    "2" "Release held mail for a sender    (postsuper -H)" \
+                    "0" "Back")
+                if [[ "$q_act" == "1" ]]; then
+                    local q_sender
+                    q_sender=$(ui_input_box "HOLD SENDER QUEUE" "Enter sender email to place on HOLD:" "")
+                    if [[ -n "$q_sender" ]]; then
+                        local h_cnt
+                        h_cnt=$(hold_sender_queue "$q_sender" "" "true")
+                        ui_msg_box "QUEUE HOLD RESULT" "Placed ${h_cnt:-0} queued email(s) from ${q_sender} on HOLD."
+                    fi
+                elif [[ "$q_act" == "2" ]]; then
+                    local q_sender
+                    q_sender=$(ui_input_box "RELEASE HELD QUEUE" "Enter sender email to RELEASE from HOLD:" "")
+                    if [[ -n "$q_sender" ]]; then
+                        local r_cnt
+                        r_cnt=$(release_sender_held_queue "$q_sender")
+                        ui_msg_box "QUEUE RELEASE RESULT" "Released ${r_cnt:-0} held email(s) for ${q_sender}."
+                    fi
+                fi
+                ;;
+            0|"") break ;;
         esac
     done
 }
 
 # ------------------------------------------------------------------------------
-# SUBMENU [5]: WHITELIST (COMPACT)
+# SUBMENU [5]: WHITELIST & PER-ACCOUNT CUSTOM LIMITS
 # ------------------------------------------------------------------------------
+remove_whitelist_exact() {
+    local target_del="$1"
+    [[ ! -f "$WHITELIST_FILE" || -z "$target_del" ]] && return 0
+    local tmp_wl
+    tmp_wl=$(make_safe_tmp "zsm_wl")
+    awk -v tgt="${target_del,,}" '
+        {
+            raw = $0
+            sub(/\r$/, "", raw)
+            clean = raw
+            sub(/#.*/, "", clean)
+            gsub(/^[[:space:]]+|[[:space:]]+$/, "", clean)
+            if (tolower(clean) == tgt) next
+            print $0
+        }
+    ' "$WHITELIST_FILE" > "$tmp_wl"
+    mv -f "$tmp_wl" "$WHITELIST_FILE"
+    _WL_LOADED=0
+}
+
 submenu_whitelist() {
     while true; do
         load_config
@@ -2420,11 +4637,12 @@ submenu_whitelist() {
         count_wl=$(grep -v '^[[:space:]]*#' "$WHITELIST_FILE" 2>/dev/null | grep -c '[^[:space:]]' || true)
 
         local choice
-        choice=$(ui_select_menu "WHITELIST (${count_wl} ENTRIES)" \
-            "Trusted senders & domains bypass spam checks:" \
-            "1" "View Whitelist" \
-            "2" "Add Email or @domain.com" \
-            "3" "Remove from Whitelist" \
+        choice=$(ui_select_menu "WHITELIST & CUSTOM LIMITS (${count_wl} ENTRIES)" \
+            "Full bypass (email / @domain) OR custom limit (email WARN CRIT):" \
+            "1" "View Entries" \
+            "2" "Add Full Bypass  (email or @domain.com)" \
+            "3" "Remove Entry     (Exact match)" \
+            "4" "Add Custom Limit (e.g. marketing@dom.com 500 1000)" \
             "0" "Back")
 
         case "$choice" in
@@ -2432,13 +4650,14 @@ submenu_whitelist() {
                 local list_txt
                 list_txt=$(grep -v '^[[:space:]]*#' "$WHITELIST_FILE" 2>/dev/null | sed '/^[[:space:]]*$/d' || true)
                 [[ -z "$list_txt" ]] && list_txt="(Whitelist is empty)"
-                ui_msg_box "WHITELIST ENTRIES" "$list_txt"
+                ui_msg_box "WHITELIST & CUSTOM LIMIT ENTRIES" "$list_txt"
                 ;;
             2)
                 local new_wl
                 new_wl=$(ui_input_box "ADD TO WHITELIST" "Enter email (marketing@domain.com) or domain (@domain.com):" "")
                 if [[ -n "$new_wl" ]]; then
                     echo "$new_wl" >> "$WHITELIST_FILE"
+                    _WL_LOADED=0
                     ui_msg_box "WHITELIST UPDATED" "Added '${new_wl}' to whitelist."
                 fi
                 ;;
@@ -2461,25 +4680,35 @@ submenu_whitelist() {
                     wl_items+=("0" "Back")
                     local del_idx
                     del_idx=$(ui_select_menu "REMOVE WHITELIST ENTRY" \
-                        "Select entry to remove:" \
+                        "Select entry to remove (exact match):" \
                         "${wl_items[@]}")
                     if [[ -n "$del_idx" && "$del_idx" != "0" && -n "${wl_map[$del_idx]:-}" ]]; then
                         local target_del="${wl_map[$del_idx]}"
-                        grep -v -F "$target_del" "$WHITELIST_FILE" > "${WHITELIST_FILE}.tmp" 2>/dev/null || true
-                        mv -f "${WHITELIST_FILE}.tmp" "$WHITELIST_FILE"
+                        remove_whitelist_exact "$target_del"
                         ui_msg_box "REMOVED" "Removed '${target_del}' from whitelist."
                     fi
                 fi
                 ;;
-            0|"")
-                break
+            4)
+                local cl_acc cl_warn cl_crit
+                cl_acc=$(ui_input_box "CUSTOM LIMIT ACCOUNT" "Enter email (e.g. marketing@domain.com) or @domain.com:" "")
+                if [[ -n "$cl_acc" ]]; then
+                    cl_warn=$(ui_input_box "CUSTOM WARN LIMIT (${LOOKBACK_MINUTES}m)" "Warning recipient limit for ${cl_acc}:" "500")
+                    cl_crit=$(ui_input_box "CUSTOM CRIT LIMIT (${LOOKBACK_MINUTES}m)" "Critical lock recipient limit for ${cl_acc}:" "1000")
+                    if [[ "$cl_warn" =~ ^[0-9]+$ && "$cl_crit" =~ ^[0-9]+$ ]]; then
+                        echo "${cl_acc} ${cl_warn} ${cl_crit}" >> "$WHITELIST_FILE"
+                        _WL_LOADED=0
+                        ui_msg_box "CUSTOM LIMIT ADDED" "Added '${cl_acc} ${cl_warn} ${cl_crit}' to ${WHITELIST_FILE}."
+                    fi
+                fi
                 ;;
+            0|"") break ;;
         esac
     done
 }
 
 # ------------------------------------------------------------------------------
-# SUBMENU [6]: LOGS & SERVICE ON/OFF
+# SUBMENU [6]: LOGS, SERVICE ON/OFF, SELF-RBL & READ-ONLY AUDIT
 # ------------------------------------------------------------------------------
 submenu_logs_and_service() {
     while true; do
@@ -2488,10 +4717,12 @@ submenu_logs_and_service() {
         [[ "$MONITOR_ENABLED" != "true" ]] && svc_label="PAUSED (Disabled)"
 
         local choice
-        choice=$(ui_select_menu "LOGS & SERVICE STATUS" \
+        choice=$(ui_select_menu "LOGS, SERVICE, RBL & AUDIT" \
             "Log file: ${MONITOR_LOG_FILE}" \
             "1" "View Last 25 Monitor Log Lines" \
-            "2" "Service Status : ${svc_label} (Select to Toggle)" \
+            "2" "Service Status       : ${svc_label} (Select to Toggle)" \
+            "3" "Check Server IP RBL  (Read-only DNSBL blacklist check)" \
+            "4" "Security Audit       (100% Read-only Zimbra posture check)" \
             "0" "Back")
 
         case "$choice" in
@@ -2509,15 +4740,23 @@ submenu_logs_and_service() {
                     update_cfg_var "MONITOR_ENABLED" "true"
                 fi
                 ;;
-            0|"")
-                break
+            3)
+                local rbl_out
+                rbl_out=$(run_rbl_check "manual" 2>&1 || true)
+                ui_msg_box "SELF-RBL REPUTATION CHECK" "$rbl_out"
                 ;;
+            4)
+                local aud_out
+                aud_out=$(run_security_audit 2>&1 || true)
+                ui_msg_box "READ-ONLY SECURITY AUDIT" "$aud_out"
+                ;;
+            0|"") break ;;
         esac
     done
 }
 
 # ------------------------------------------------------------------------------
-# MAIN CONTROL PANEL (6 CLEAN ITEMS)
+# MAIN CONTROL PANEL (6 CLEAN ITEMS - 100% BACKWARD COMPATIBLE SHORTCUTS)
 # ------------------------------------------------------------------------------
 run_interactive_menu() {
     while true; do
@@ -2542,11 +4781,11 @@ run_interactive_menu() {
         choice=$(ui_select_menu "ZIMBRA SPAM MONITOR v${VERSION}" \
             "Service: ${mon_badge} | Check: ${cron_badge} | Auto-Lock: ${lock_badge} | TG: ${tg_badge} | Mail: ${em_badge}" \
             "1" "Live Status & Queue" \
-            "2" "Alerts & Test          (Telegram / Email / Send Test)" \
-            "3" "Spam Limits & Schedule (Limit: ${WARN_RECIPIENTS}/${CRIT_RECIPIENTS} | ${LOOKBACK_MINUTES}m | Repeat: ${ALERT_COOLDOWN_MINUTES}m)" \
-            "4" "Unlock & Auto-Lock     (Auto-Lock: ${lock_badge})" \
-            "5" "Whitelist              (Trusted Emails & Domains)" \
-            "6" "Logs & Service ON/OFF  (Service: ${mon_badge})" \
+            "2" "Alerts & Test          (Telegram / Email / Webhook / Test)" \
+            "3" "Spam Limits & Schedule (Limit: ${WARN_RECIPIENTS}/${CRIT_RECIPIENTS} | ${LOOKBACK_MINUTES}m | 1h: ${WARN_HOURLY_MESSAGES}/${CRIT_HOURLY_MESSAGES})" \
+            "4" "Unlock & Auto-Lock     (Auto-Lock: ${lock_badge} | Queue Control)" \
+            "5" "Whitelist & Limits     (Trusted & Custom Per-User Limits)" \
+            "6" "Logs, RBL & Audit      (Service: ${mon_badge} | Read-Only Audit)" \
             "0" "Exit")
 
         case "$choice" in
@@ -2576,7 +4815,8 @@ run_interactive_menu() {
 show_help() {
     cat <<EOF
 Zimbra Outbound Spam Monitor v${VERSION}
-Multi-signal outbound spam detection, Telegram & Email alerting, and automatic account locking for Zimbra.
+Ultra-lightweight multi-signal & multi-window outbound spam detection, alerting,
+and single-account auto-locking for Zimbra Collaboration Suite (zero server/OS mutation).
 
 Usage:
   zimbra-spam-monitor                        Open Interactive Control Panel (TUI / Menu)
@@ -2584,9 +4824,12 @@ Usage:
   zimbra-spam-monitor --text-menu            Open Number Selection Menu (Text mode)
   zimbra-spam-monitor --run                  Run background scan cycle (used by Cron)
   zimbra-spam-monitor --status               Show live ${LOOKBACK_MINUTES}-min metrics & Postfix Queue table
-  zimbra-spam-monitor --test                 Send a test notification to Telegram & Email
+  zimbra-spam-monitor --test                 Send a test notification to Telegram, Email & Webhook
   zimbra-spam-monitor --unlock <email>       Unlock a locked Zimbra account & clear prior history
-  zimbra-spam-monitor --whitelist-add <mail> Add an email or @domain.com to Whitelist
+  zimbra-spam-monitor --whitelist-add <item> Add email/@domain (or 'email WARN CRIT') to Whitelist
+  zimbra-spam-monitor --check-rbl            Run read-only DNSBL blacklist check for server IP
+  zimbra-spam-monitor --audit                Run 100% read-only Zimbra anti-spam posture audit
+  zimbra-spam-monitor --version              Show installed version
   zimbra-spam-monitor --help                 Show this help message
 EOF
 }
@@ -2626,12 +4869,19 @@ case "$ACTION" in
         ;;
     --whitelist-add)
         if [[ -z "${2:-}" ]]; then
-            echo "Usage: zimbra-spam-monitor --whitelist-add <email@domain.com>"
+            echo "Usage: zimbra-spam-monitor --whitelist-add <email@domain.com> [warn_limit crit_limit]"
             exit 1
         fi
         load_config
-        echo "${2}" >> "$WHITELIST_FILE"
-        echo "[OK] Added ${2} to whitelist (${WHITELIST_FILE})."
+        shift
+        echo "$*" >> "$WHITELIST_FILE"
+        echo "[OK] Added '$*' to whitelist (${WHITELIST_FILE})."
+        ;;
+    --check-rbl|check-rbl)
+        run_rbl_check "manual"
+        ;;
+    --audit|audit)
+        run_security_audit
         ;;
     --version|-v)
         echo "zimbra-spam-monitor version ${VERSION}"

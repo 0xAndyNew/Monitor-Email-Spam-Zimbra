@@ -1,21 +1,20 @@
 Name:           zimbra-spam-monitor
-Version:        1.2.3
+Version:        1.3.0
 Release:        1
-Summary:        Zimbra Outbound Email Spam Monitor & Alert System (Telegram + Email)
+Summary:        Zimbra Outbound Email Spam Monitor & Alert System (Telegram + Email + Webhook)
 License:        MIT
 Group:          System Environment/Daemons
 BuildArch:      noarch
 Requires:       bash, gawk, curl, crontabs
 
 %description
-Multi-signal outbound spam detection and alerting system for Zimbra Collaboration Suite.
-- Evaluates 8 anti-spam metrics per short check range (default last 5 minutes):
-  Messages Sent, Total Recipients, Unique Recipients, Failed Rate, Distinct Source IPs,
-  External Sender Spoofing, Amavis SPAM/INFECTED & RBL Rejections, and Postfix Queue.
-- Correlates Zimbra Amavis Queue-ID hops and ignores old Postfix queue retries.
-- Sends instant alerts via Telegram Bot API and Email (Local Postfix / External SMTP).
-- Automatically locks compromised accounts (zimbraAccountStatus locked) on Critical threshold.
-- Includes a streamlined 100% ASCII-safe Interactive Control Panel (run: zimbra-spam-monitor).
+Ultra-lightweight multi-signal and multi-window outbound spam detection and alerting
+system for Zimbra Collaboration Suite (strictly read-only against server & OS config).
+- Evaluates 5m burst + 1h/24h low-and-slow limits, /24 source subnets, and Risk Score.
+- Correlates Amavis Queue-ID hops, mailbox.log real Webmail IPs, and audit.log brute-force.
+- Sends reliable Telegram, Email & Webhook alerts with Outbox retry and JSONL event log.
+- Includes Self-RBL reputation check (--check-rbl) and read-only posture audit (--audit).
+- Automatically locks CRITICAL accounts (with per-account cache flush) without JVM bloat.
 
 %install
 mkdir -p %{buildroot}/usr/bin
@@ -35,7 +34,7 @@ mkdir -p /var/lib/zimbra-spam-monitor
 touch /var/log/zimbra-spam-monitor.log
 chmod 0640 /var/log/zimbra-spam-monitor.log
 echo "======================================================================"
-echo " [OK] Installed successfully: zimbra-spam-monitor v1.2.3"
+echo " [OK] Installed successfully: zimbra-spam-monitor v1.3.0"
 echo " -> Run the command below to open the Interactive Control Panel:"
 echo "      zimbra-spam-monitor"
 echo "======================================================================"

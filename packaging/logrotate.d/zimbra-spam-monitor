@@ -1,4 +1,4 @@
-/var/log/zimbra-spam-monitor.log {
+/var/log/zimbra-spam-monitor.log /var/log/zimbra-spam-monitor-events.jsonl {
     weekly
     rotate 8
     compress

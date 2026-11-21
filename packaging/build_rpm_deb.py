@@ -17,16 +17,16 @@ if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
 PKG_NAME = "zimbra-spam-monitor"
-PKG_VERSION = "1.2.3"
+PKG_VERSION = "1.3.0"
 PKG_RELEASE = "1"
-PKG_SUMMARY = "Zimbra Outbound Email Spam Monitor & Alert System (Telegram + Email)"
+PKG_SUMMARY = "Zimbra Outbound Email Spam Monitor & Alert System (Telegram + Email + Webhook)"
 PKG_DESC = (
-    "Multi-signal outbound spam detection and alerting system for Zimbra Collaboration Suite.\n"
-    "- Evaluates 8 anti-spam metrics per short check range (default last 5 minutes).\n"
-    "- Correlates Zimbra Amavis Queue-ID hops and ignores old Postfix queue retries.\n"
-    "- Inspects Postfix mail queue (postqueue) per sender and server-wide.\n"
-    "- Sends instant alerts via Telegram Bot API and Email (Local Postfix / External SMTP).\n"
-    "- Automatically locks compromised accounts (zimbraAccountStatus locked) on Critical."
+    "Ultra-lightweight multi-signal & multi-window outbound spam detection for Zimbra.\n"
+    "- Strictly read-only against mail server and OS configuration (zero server mutation).\n"
+    "- Evaluates 5-min burst + 1h/24h low-and-slow limits, /24 source nets, and Risk Score.\n"
+    "- Correlates Amavis Queue-ID hops, mailbox.log real Webmail IPs, and audit.log brute-force.\n"
+    "- Reliable Telegram, Email & Webhook alerting with Outbox retry, Self-RBL, & JSONL logs.\n"
+    "- Automatically locks CRITICAL accounts (with per-account cache flush) without JVM bloat."
 )
 PKG_MAINTAINER = "Zimbra Admin <179321164+0xAndyNew@users.noreply.github.com>"
 PKG_LICENSE = "MIT"
@@ -51,7 +51,7 @@ chmod 0644 /etc/cron.d/zimbra-spam-monitor 2>/dev/null || true
 chmod 0755 /usr/bin/zimbra-spam-monitor 2>/dev/null || true
 
 echo "======================================================================"
-echo " [OK] Installed successfully: zimbra-spam-monitor v1.2.3"
+echo " [OK] Installed successfully: zimbra-spam-monitor v1.3.0"
 echo "----------------------------------------------------------------------"
 echo " -> Run the command below to open the INTERACTIVE CONTROL PANEL:"
 echo "      zimbra-spam-monitor"
@@ -67,6 +67,7 @@ fi
 if [ "$1" = "purge" ]; then
     rm -rf /etc/zimbra-spam-monitor
     rm -f /var/log/zimbra-spam-monitor.log
+    rm -f /var/log/zimbra-spam-monitor-events.jsonl
 fi
 exit 0
 """
