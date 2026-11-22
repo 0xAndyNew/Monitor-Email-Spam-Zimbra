@@ -1,9 +1,9 @@
-# Zimbra Outbound Spam Monitor (`zimbra-spam-monitor` v1.3.1)
+# Zimbra Outbound Spam Monitor (`zimbra-spam-monitor` v1.3.2)
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Release](https://img.shields.io/github/v/release/0xAndyNew/Monitor-Email-Spam-Zimbra?color=blue)](https://github.com/0xAndyNew/Monitor-Email-Spam-Zimbra/releases)
 [![Platform](https://img.shields.io/badge/platform-Linux%20%7C%20ZCS%208%2C%209%2C%2010-orange.svg)](#)
-[![Tests](https://img.shields.io/badge/tests-15%2F15%20passing-brightgreen.svg)](tests/run_test.sh)
+[![Tests](https://img.shields.io/badge/tests-16%2F16%20passing-brightgreen.svg)](tests/run_test.sh)
 
 Ultra-lightweight multi-signal & multi-window outbound email spam detection, alerting (**Telegram** + **Email** + **Webhook** + **JSONL**), and automatic single-account locking tool for **Zimbra Collaboration Suite (ZCS)** on Linux.
 
@@ -24,22 +24,23 @@ Built specifically for production single-server and multi-domain Zimbra servers 
 
 ## 1. Quick Installation from GitHub Releases (`.rpm` & `.deb`)
 
-Releases page: https://github.com/0xAndyNew/Monitor-Email-Spam-Zimbra/releases/tag/v1.3.1
+Releases page: https://github.com/0xAndyNew/Monitor-Email-Spam-Zimbra/releases/tag/v1.3.2
 
 ### A. RHEL / CentOS / Rocky Linux / AlmaLinux (`.rpm`)
 Run as `root` on your Zimbra server:
 ```bash
-wget -O zimbra-spam-monitor-1.3.1-1.noarch.rpm https://github.com/0xAndyNew/Monitor-Email-Spam-Zimbra/releases/download/v1.3.1/zimbra-spam-monitor-1.3.1-1.noarch.rpm
-rpm -Uvh zimbra-spam-monitor-1.3.1-1.noarch.rpm
+wget -O zimbra-spam-monitor-1.3.2-1.noarch.rpm https://github.com/0xAndyNew/Monitor-Email-Spam-Zimbra/releases/download/v1.3.2/zimbra-spam-monitor-1.3.2-1.noarch.rpm
+rpm -Uvh zimbra-spam-monitor-1.3.2-1.noarch.rpm
 ```
-*(Or: `yum localinstall -y zimbra-spam-monitor-1.3.1-1.noarch.rpm`)*
+*(Or: `yum localinstall -y zimbra-spam-monitor-1.3.2-1.noarch.rpm`)*
 
 ### B. Ubuntu / Debian (`.deb`)
 Run as `root` on your Zimbra server:
 ```bash
-wget -O zimbra-spam-monitor_1.3.1-1_all.deb https://github.com/0xAndyNew/Monitor-Email-Spam-Zimbra/releases/download/v1.3.1/zimbra-spam-monitor_1.3.1-1_all.deb
-dpkg -i zimbra-spam-monitor_1.3.1-1_all.deb
+wget -O zimbra-spam-monitor_1.3.2-1_all.deb https://github.com/0xAndyNew/Monitor-Email-Spam-Zimbra/releases/download/v1.3.2/zimbra-spam-monitor_1.3.2-1_all.deb
+apt install -y ./zimbra-spam-monitor_1.3.2-1_all.deb
 ```
+*(Or: `dpkg -i zimbra-spam-monitor_1.3.2-1_all.deb && apt-get install -f -y`)*
 
 ---
 
@@ -52,7 +53,7 @@ dpkg -i zimbra-spam-monitor_1.3.1-1_all.deb
 | **1** | **Messages Sent** | 5m distinct root `Queue-ID` submitted | `>= 60` msgs | `>= 150` msgs |
 | **2** | **Total Recipients** | 5m deduplicated `(Queue-ID, to=<...>)` deliveries | `>= 100` rcpts | `>= 200` rcpts *(with `Msgs >= 10`)* |
 | **3** | **Unique Recipients** | 5m distinct recipients *(with `Ext Domains >= 5`)* | `>= 80` rcpts | `>= 160` rcpts *(with `Msgs >= 10`)* |
-| **4** | **Failed Rate (%)** | `(Deferred + Bounced + Expired) / Recipients * 100%` | `>= 30%` *(min `20` rcpts)* | `>= 50%` *(min `40` rcpts)* |
+| **4** | **Failed Rate (%)** | `(Deferred + Bounced + Expired) / Recipients * 100%` | `>= 30%` *(min `20` rcpts)* | `>= 50%` *(min `40` rcpts & `Msgs >= 10`)* |
 | **5** | **Distinct Source /24s** | Distinct `/24` IPv4 (`/64` IPv6) nets *(incl. real Webmail `oip=` from `mailbox.log`)* | `>= 3` nets *(min `10` msgs)* | `>= 5` nets *(min `20` msgs)* |
 | **6** | **Sender Spoofing** | Authenticated `sasl_username != external From` *(counted once per message)* | `>= 3` msgs | `>= 10` msgs |
 | **7** | **Amavis SPAM / RBL** | Amavis `SPAM/SPAMMY/INFECTED/BANNED` (`Hits >= 6.0`) or MX `5.7.1/4.7.28`/RBL *(auto-forward safe)* | `>= 3` signals | `>= 10` signals *(SASL or w/ volume/spoof)* |
@@ -63,7 +64,9 @@ dpkg -i zimbra-spam-monitor_1.3.1-1_all.deb
 
 ### Production Accuracy & Reliability Safeguards:
 - **Zero False-Lock Protections**:
-  - Single legitimate CC/BCC announcements (`Msgs < 10`) never trigger `CRITICAL` auto-lock; Spoof & Amavis counts are per unique message (`root_qid`), not multiplied by CC recipients.
+  - Single legitimate CC/BCC announcements (`Msgs < 10`) never trigger `CRITICAL` auto-lock (including on transient DNS/ISP `deferred` spikes); Spoof & Amavis counts are per unique message (`root_qid`), not multiplied by CC recipients.
+  - **Inbound Spoof DoS Immunity**: Explicitly tracks unauthenticated external Internet clients across Amavis `127.0.0.1:10025` re-injection and `postfix/lmtp[` hops so forged inbound spam can never be attributed to or lock an internal mailbox.
+  - **Lock Circuit Breaker (`MAX_LOCKS_PER_CYCLE=5`) & System Account Shield**: Caps new auto-locks per cycle to prevent mass locking during ISP/DNS outages, and protects built-in Zimbra system accounts (`spam.*`, `ham.*`, `virus-quarantine.*`, `galsync.*`) plus optional `PROTECTED_ACCOUNTS` (alert only).
   - Auto-forwarding users receiving spam that remote MX (e.g. Gmail) rejects with `5.7.1` from `webmail/local` origin stay `WARNING` only unless accompanied by SASL, spoofing, or volume signals.
   - Tracks Postfix SMTP (`postfix/smtp[`), delivery error (`postfix/error[`), and single-server internal mailbox delivery post-Amavis (`postfix/lmtp[` on port 7025) while strictly ignoring incoming external deliveries.
   - Mobile 4G/5G users rotating IPs inside the same carrier `/24` subnet count as 1 subnet.
@@ -71,7 +74,7 @@ dpkg -i zimbra-spam-monitor_1.3.1-1_all.deb
   - Held (`!`) queue messages are excluded from Account Queue thresholds so locked accounts stop re-alerting once held.
   - Per-account Custom Limits in `whitelist.conf` (`marketing@company.com 500 1000`) allow higher volume while still catching spoofing or malware, with automatic duplicate removal (`upsert_whitelist_entry`).
 - **Immediate & Resilient Containment**:
-  - **Per-Account Cache Flush**: Immediately runs `zmprov fc account <user>` after locking to terminate active Webmail/SOAP/ActiveSync tokens without impacting other users.
+  - **Single-JVM Lock + Per-Account Cache Flush**: Batches `ma <user> zimbraAccountStatus locked`, status verification, and `fc account <user>` into **one single `zmprov` JVM** (50% lower CPU/RAM spike) to terminate active Webmail/SOAP/ActiveSync tokens immediately.
   - **Decoupled Remediation**: Lock attempts run before alert cooldown -- if `zmprov` fails transiently, the next cycle retries immediately instead of waiting 30 minutes.
   - **Desync Self-Healing**: If an admin manually unlocks an account via Zimbra Web UI and normal traffic resumes, the stale lock record is cleared cleanly; if `CRITICAL` spam resumes, it automatically `RE-LOCK`s.
   - **Spoof-Aware Queue Hold**: When enabled, holds queued messages by both envelope sender and correlated SASL Queue-IDs.
@@ -98,7 +101,7 @@ zimbra-spam-monitor
 
 ```text
 ==============================================================================
- ZIMBRA SPAM MONITOR v1.3.1
+ ZIMBRA SPAM MONITOR v1.3.2
 ------------------------------------------------------------------------------
  Service: ON | Check: Every 5 mins | Auto-Lock: ON | TG: ON | Mail: ON
 ------------------------------------------------------------------------------
@@ -144,7 +147,7 @@ zimbra-spam-monitor --audit                     # 100% read-only Zimbra anti-spa
 ### Sample Live Status Output (`--status`):
 ```text
 ==============================================================================
- ZIMBRA SPAM MONITOR v1.3.1 - LIVE SYSTEM STATUS (LAST 5 MINS)
+ ZIMBRA SPAM MONITOR v1.3.2 - LIVE SYSTEM STATUS (LAST 5 MINS)
 ==============================================================================
  Zimbra Server   : mail.company.com (103.56.158.99)
  Monitor Status  : ON | Range: 5m | Cooldown: 30m | Auto-Lock: true

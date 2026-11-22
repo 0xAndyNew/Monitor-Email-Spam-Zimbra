@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# AUTOMATED TEST SUITE FOR ZIMBRA-SPAM-MONITOR v1.3.1 (15 STAGES)
+# AUTOMATED TEST SUITE FOR ZIMBRA-SPAM-MONITOR v1.3.2 (16 STAGES)
 # Verifies:
 #  1. Bash syntax & static Zero-Server/OS-Mutation safety audit
-#  2. 100% 7-bit ASCII encoding & valid v1.3.1-1 .deb / .rpm binary structures
+#  2. 100% 7-bit ASCII encoding & valid v1.3.2-1 .deb / .rpm binary structures
 #  3. Simulated single-server Zimbra environment (zimbra/mailbox/audit logs + mocks)
 #  4. Multi-signal scan cycle (--run), Amavis 2-hop, cache flush, exact 5m sys_tot
 #  5. Cooldown, Long Queue IDs, decoupled lock retry on zmprov fail, Held exclusion
@@ -17,6 +17,7 @@
 # 13. Self-RBL (127.255.x guard & state-change), --audit, Webhook, JSONL, Outbox retry
 # 14. Admin --unlock (clears rolling history) & --status live dashboard + IP cache
 # 15. Interactive Control Panel (--text-menu) & exact whitelist removal
+# 16. v1.3.2 Hardening: Inbound DoS, 1-msg deferred, Lock cap, System shield, NAT & Cron
 # ==============================================================================
 set -e
 
@@ -31,7 +32,7 @@ if python3 --version >/dev/null 2>&1; then
     PY_CMD="python3"
 fi
 
-echo "=== [1/15] Checking Bash syntax & Zero-Server/OS-Mutation safety audit ==="
+echo "=== [1/16] Checking Bash syntax & Zero-Server/OS-Mutation safety audit ==="
 bash -n "$MONITOR_BIN"
 bash -n "$ROOT_DIR/packaging/build-packages.sh"
 
@@ -62,7 +63,7 @@ for pat, label in forbidden_patterns:
 print(" -> [PASS] Bash syntax valid & 0 forbidden server/OS mutation commands detected.")
 PYEOF
 
-echo "=== [2/15] Verifying 100% ASCII encoding & v1.3.1 .deb / .rpm structures ==="
+echo "=== [2/16] Verifying 100% ASCII encoding & v1.3.2 .deb / .rpm structures ==="
 "$PY_CMD" - "$ROOT_DIR" << 'PYEOF'
 import gzip, struct, sys
 from pathlib import Path
@@ -86,8 +87,8 @@ for f in ascii_files:
     non_ascii = [b for b in raw if b > 127]
     assert not non_ascii, f"Non-ASCII bytes found in {f}"
 
-deb_path = root / "zimbra-spam-monitor_1.3.1-1_all.deb"
-rpm_path = root / "zimbra-spam-monitor-1.3.1-1.noarch.rpm"
+deb_path = root / "zimbra-spam-monitor_1.3.2-1_all.deb"
+rpm_path = root / "zimbra-spam-monitor-1.3.2-1.noarch.rpm"
 
 assert deb_path.exists() and deb_path.stat().st_size > 5000, "Missing or empty .deb"
 assert rpm_path.exists() and rpm_path.stat().st_size > 5000, "Missing or empty .rpm"
@@ -116,10 +117,10 @@ assert cpio_raw.startswith(b"070701"), "Invalid CPIO newc header inside RPM"
 assert b"./usr/bin/zimbra-spam-monitor" in cpio_raw, "Missing binary in RPM CPIO"
 assert b"./etc/zimbra-spam-monitor/config.conf" in cpio_raw, "Missing config.conf in RPM CPIO"
 assert b"TRAILER!!!" in cpio_raw, "Missing CPIO TRAILER"
-print(" -> [PASS] 100% ASCII encoding & valid v1.3.1-1 .deb / .rpm binary structures verified.")
+print(" -> [PASS] 100% ASCII encoding & valid v1.3.2-1 .deb / .rpm binary structures verified.")
 PYEOF
 
-echo "=== [3/15] Setting up simulated single-server Zimbra environment ==="
+echo "=== [3/16] Setting up simulated single-server Zimbra environment ==="
 TEST_TMP=$(mktemp -d 2>/dev/null || echo "/tmp/zsm_test_$$")
 mkdir -p "$TEST_TMP"
 trap 'rm -rf "$TEST_TMP"' EXIT
@@ -396,7 +397,7 @@ run_scan() {
     bash "$MONITOR_BIN" --run
 }
 
-echo "=== [4/15] Running multi-signal scan cycle (--run) ==="
+echo "=== [4/16] Running multi-signal scan cycle (--run) ==="
 run_scan "$FIXED_EPOCH"
 
 # Verify CRITICAL spammers locked + per-account cache flushed!
@@ -438,7 +439,7 @@ grep -q "SYSTEM OUTBOUND (LAST 5 MINS)" "$FAKE_MAIL_OUT"
 grep -q "LOCKED (Auto-locked now via zmprov + cache flushed)" "$FAKE_TG_BODY"
 echo " -> [PASS] Multi-signal detection, cache flush, Origin/Risk Score, DNS IP & zero false positives verified."
 
-echo "=== [5/15] Verifying Cooldown, Long Queue IDs, Decoupled Lock Retry & Held Exclusion ==="
+echo "=== [5/16] Verifying Cooldown, Long Queue IDs, Decoupled Lock Retry & Held Exclusion ==="
 LOCK_CALLS_BEFORE=$(wc -l < "$FAKE_ZMPROV_OUT")
 MAIL_CALLS_BEFORE=$(grep -c -- "---END_MAIL---" "$FAKE_MAIL_OUT")
 
@@ -525,7 +526,7 @@ run_scan "$(( RETRY_T1 + 120 ))" "$EMPTY_PQ"
 grep -q "^ma retry_lock@company.com zimbraAccountStatus locked$" "$FAKE_ZMPROV_OUT"
 echo " -> [PASS] Cooldown, Long Queue IDs, Held exclusion & decoupled lock retry verified."
 
-echo "=== [6/15] Verifying Locked-Account Desync Recovery (Benign Unlock vs RE-LOCK) ==="
+echo "=== [6/16] Verifying Locked-Account Desync Recovery (Benign Unlock vs RE-LOCK) ==="
 # Case 6a: phish_user was locked at FIXED_EPOCH. Suppose admin unlocked externally via Web UI
 # and phish_user sends 3 NORMAL emails 3 hours later -> MUST NOT re-lock, MUST clear stale lock DB!
 DESYNC_T1=$(( FIXED_EPOCH + 10800 ))
@@ -557,7 +558,7 @@ run_scan "$DESYNC_T2" "$EMPTY_PQ"
 grep -q "RE-LOCKED (Still sending after prior lock" "$FAKE_MAIL_OUT"
 echo " -> [PASS] Desync self-healing verified (no false re-lock on benign mail; RE-LOCKED on active CRITICAL spam)."
 
-echo "=== [7/15] Verifying Security Fixes (Command Injection, Hidden Token, Safe Config Writer) ==="
+echo "=== [7/16] Verifying Security Fixes (Command Injection, Hidden Token, Safe Config Writer) ==="
 # 7a: Telegram bot token MUST NEVER appear in curl CLI arguments (ps aux protection)
 if grep -q "SUPER_SECRET_TOKEN" "$FAKE_TG_ARGS"; then
     echo " -> [FAIL] TELEGRAM_BOT_TOKEN leaked onto curl CLI arguments!"
@@ -592,7 +593,7 @@ ZSM_CONFIG_FILE="$SPECIAL_CFG" bash -c '
 ' _ "$COMPLEX_PW"
 echo " -> [PASS] Security fixes verified (Command Injection blocked, token hidden from curl args, special chars safe)."
 
-echo "=== [8/15] Verifying Per-Message Amavis/Spoof Counting, Deduped Retries & status=expired ==="
+echo "=== [8/16] Verifying Per-Message Amavis/Spoof Counting, Deduped Retries & status=expired ==="
 ACC_T=$(( FIXED_EPOCH + 18000 ))
 ACC_STR=$(date -d "@$(( ACC_T - 40 ))" '+%b %e %H:%M:%S')
 # 8a: 1 single email CC to 12 external recipients flagged by Amavis + external spoof = 1 Amavis / 1 Spoof (NOT 12!)
@@ -633,7 +634,7 @@ fi
 grep -q "exp_warn@company.com" "$FAKE_MAIL_OUT"
 echo " -> [PASS] Per-msg Spoof/Amavis, deduped deferred->sent retries, and status=expired verified."
 
-echo "=== [9/15] Verifying Multi-Window Low-and-Slow (1h Rolling Buckets & Idempotency) ==="
+echo "=== [9/16] Verifying Multi-Window Low-and-Slow (1h Rolling Buckets & Idempotency) ==="
 LS_BASE=$(( FIXED_EPOCH + 36000 ))
 # Simulate 12 consecutive 5-minute buckets x 55 msgs each (= 660 msgs in 1h; each 5m is < 60 WARN!)
 for b in $(seq 0 11); do
@@ -660,7 +661,7 @@ if [[ "$SLOW_SUM" != "660" ]]; then
 fi
 echo " -> [PASS] Low-and-slow 1h detection (660 msgs) & idempotent bucket merge verified."
 
-echo "=== [10/15] Verifying Single-Server mailbox.log Real Webmail /24 IPs, 4G Safety & audit.log Brute-Force ==="
+echo "=== [10/16] Verifying Single-Server mailbox.log Real Webmail /24 IPs, 4G Safety & audit.log Brute-Force ==="
 MBOX_T=$(( FIXED_EPOCH + 50000 ))
 MBOX_SYS=$(date -d "@$(( MBOX_T - 40 ))" '+%b %e %H:%M:%S')
 MBOX_ISO=$(date -d "@$(( MBOX_T - 40 ))" '+%Y-%m-%d %H:%M:%S')
@@ -708,7 +709,7 @@ if grep -q "victim_bf@company.com" "$FAKE_ZMPROV_OUT"; then
 fi
 echo " -> [PASS] mailbox.log real Webmail /24 IPs, 4G subnet safety, brute-force summary & auth-after-fail verified."
 
-echo "=== [11/15] Verifying Auto-Forward Safeguard, Spoofed Queue Hold, Internal Malware & Local Pickup ==="
+echo "=== [11/16] Verifying Auto-Forward Safeguard, Spoofed Queue Hold, Internal Malware & Local Pickup ==="
 S11_T=$(( FIXED_EPOCH + 56000 ))
 S11_STR=$(date -d "@$(( S11_T - 30 ))" '+%b %e %H:%M:%S')
 
@@ -781,7 +782,7 @@ if grep -q "local-pickup-uid:33" "$FAKE_ZMPROV_OUT" || grep -q "local-pickup-uid
 fi
 echo " -> [PASS] Auto-forward safeguard, spoofed QID hold, internal Amavis malware & local pickup verified."
 
-echo "=== [12/15] Verifying Custom Limits, Composite Risk Score, LDAP Multi-Domain & Logrotate .1 ==="
+echo "=== [12/16] Verifying Custom Limits, Composite Risk Score, LDAP Multi-Domain & Logrotate .1 ==="
 S12_T=$(( FIXED_EPOCH + 62000 ))
 S12_STR=$(date -d "@$(( S12_T - 30 ))" '+%b %e %H:%M:%S')
 
@@ -865,7 +866,7 @@ grep -q "sales@brand2.vn" "$FAKE_MAIL_OUT"
 grep -q "Messages Sent : 70 msgs" "$FAKE_MAIL_OUT"
 echo " -> [PASS] Custom Limits, Composite Risk Score, LDAP multi-domain cache & logrotate .1 continuity verified."
 
-echo "=== [13/15] Verifying Self-RBL, Read-Only --audit, Webhook, JSONL & Outbox Retry ==="
+echo "=== [13/16] Verifying Self-RBL, Read-Only --audit, Webhook, JSONL & Outbox Retry ==="
 # 13a: Self-RBL QUERY_ERROR (127.255.255.254) MUST NOT report as LISTED!
 touch "$TEST_TMP/rbl_err"
 RBL_ERR_OUT=$(ZSM_CONFIG_FILE="$FAKE_CFG" ZSM_DIG_CMD="$MOCK_DIG" ZSM_HOST_CMD="/nonexistent/host" \
@@ -951,7 +952,7 @@ run_scan "$(( OB_T + 120 ))" "$EMPTY_PQ" "$OB_CFG"
 grep -q "outbox_user@company.com" "$FAKE_TG_BODY"
 echo " -> [PASS] Self-RBL, read-only --audit, Webhook, JSONL & Outbox retry verified."
 
-echo "=== [14/15] Verifying Admin --unlock (Clears Rolling History), --status & 24h IP Cache ==="
+echo "=== [14/16] Verifying Admin --unlock (Clears Rolling History), --status & 24h IP Cache ==="
 UNLOCK_EPOCH=$(( FIXED_EPOCH + 90000 ))
 ZSM_CONFIG_FILE="$FAKE_CFG" \
 ZSM_NOW_EPOCH="$UNLOCK_EPOCH" \
@@ -1001,7 +1002,7 @@ STATUS_MANUAL=$(ZSM_CONFIG_FILE="$CFG_MANUAL_IP" ZSM_NOW_EPOCH="$FIXED_EPOCH" ZS
 echo "$STATUS_MANUAL" | grep -q "Zimbra Server   : mail.company.com (203.0.113.77)"
 echo " -> [PASS] --unlock recovery, --status dashboard, 24h server_ip.cache & manual SERVER_IP verified."
 
-echo "=== [15/15] Verifying Control Panel (--text-menu) & Exact Whitelist Removal ==="
+echo "=== [15/16] Verifying Control Panel (--text-menu) & Exact Whitelist Removal ==="
 # Prepare exact-match whitelist test: admin@company.com AND sub-admin@company.com
 printf "admin@company.com\nsub-admin@company.com\n" > "$FAKE_WL"
 
@@ -1050,7 +1051,111 @@ fi
 grep -q "^vip@company.com 500 1000$" "$FAKE_WL"
 echo " -> [PASS] Control Panel Menu, custom limit add & exact whitelist removal verified."
 
+echo "=== [16/16] Verifying v1.3.2 Hardening: Inbound DoS, 1-Msg Deferred, Lock Cap, System Shield, NAT & Cron ==="
+S16_T=$(( FIXED_EPOCH + 110000 ))
+S16_STR=$(date -d "@$(( S16_T - 30 ))" '+%b %e %H:%M:%S')
+S16_ISO=$(date -d "@$(( S16_T - 30 ))" '+%Y-%m-%d %H:%M:%S')
+: > "$FAKE_MAIL_OUT"
+: > "$FAKE_ZMPROV_OUT"
+
+# 16a: Remote DoS attempt - 160 forged inbound spam emails from external Internet IP -> Amavis 10025 -> LMTP 7025
+# MUST NOT be attributed to ceo_safe@company.com and MUST NOT lock!
+for i in $(seq 1 160); do
+    printf "%s mail postfix/smtpd[2001]: QDOSIN%03d: client=evil.bot[45.33.1.2]\n" "$S16_STR" "$i" >> "$FAKE_LOG"
+    printf "%s mail postfix/qmgr[2002]: QDOSIN%03d: from=<ceo_safe@company.com>, size=1400, nrcpt=1 (queue active)\n" "$S16_STR" "$i" >> "$FAKE_LOG"
+    printf "%s mail postfix/amavisd/smtpd[2003]: QDOSOUT%03d: client=localhost[127.0.0.1]\n" "$S16_STR" "$i" >> "$FAKE_LOG"
+    printf "%s mail postfix/qmgr[2002]: QDOSOUT%03d: from=<ceo_safe@company.com>, size=2000, nrcpt=1 (queue active)\n" "$S16_STR" "$i" >> "$FAKE_LOG"
+    printf "%s mail amavis[2004]: (2004-%03d) Passed SPAMMY {RelayedTaggedInbound}, [45.33.1.2]:12345 <ceo_safe@company.com> -> <staff@company.com>, Queue-ID: QDOSIN%03d, Hits: 9.2\n" "$S16_STR" "$i" "$i" >> "$FAKE_LOG"
+    printf "%s mail postfix/smtp[2005]: QDOSIN%03d: to=<staff@company.com>, relay=127.0.0.1[127.0.0.1]:10024, delay=0.2, status=sent (250 2.0.0 from MTA(smtp:[127.0.0.1]:10025): 250 2.0.0 Ok: queued as QDOSOUT%03d)\n" "$S16_STR" "$i" "$i" >> "$FAKE_LOG"
+    printf "%s mail postfix/lmtp[2006]: QDOSOUT%03d: to=<staff@company.com>, relay=mail.company.com[10.2.1.23]:7025, delay=0.1, status=sent (250 2.1.5 Delivery OK)\n" "$S16_STR" "$i" >> "$FAKE_LOG"
+done
+
+# 16b: Single legitimate BCC email (msgs=1) to 45 recipients with 30 deferred (66.7% fail) -> WARNING only, NOT locked!
+printf "%s mail postfix/submission/smtpd[2001]: Q1DEF001: client=office[192.0.2.88], sasl_method=LOGIN, sasl_username=bcc_defer@company.com\n" "$S16_STR" >> "$FAKE_LOG"
+printf "%s mail postfix/qmgr[2002]: Q1DEF001: from=<bcc_defer@company.com>, size=3000, nrcpt=45 (queue active)\n" "$S16_STR" >> "$FAKE_LOG"
+for i in $(seq 1 45); do
+    if (( i <= 30 )); then
+        printf "%s mail postfix/smtp[2005]: Q1DEF001: to=<p%d@partner.org>, relay=mx.partner.org[1.2.3.4]:25, delay=0.5, status=deferred (421 temporary DNS/network hiccup)\n" "$S16_STR" "$i" >> "$FAKE_LOG"
+    else
+        printf "%s mail postfix/smtp[2005]: Q1DEF001: to=<p%d@partner.org>, relay=mx.partner.org[1.2.3.4]:25, delay=0.5, status=sent (250 OK)\n" "$S16_STR" "$i" >> "$FAKE_LOG"
+    fi
+done
+
+# 16c: Protected Zimbra system account (spam.xyz999@company.com) sends 160 msgs -> alert only, NOT locked!
+for i in $(seq 1 160); do
+    printf "%s mail postfix/submission/smtpd[2001]: QSYS%03d: client=localhost[127.0.0.1], sasl_method=LOGIN, sasl_username=spam.xyz999@company.com\n" "$S16_STR" "$i" >> "$FAKE_LOG"
+    printf "%s mail postfix/smtp[2005]: QSYS%03d: to=<ext%d@gmail.com>, relay=mx.gmail.com[1.2.3.4]:25, delay=0.2, status=sent (250 OK)\n" "$S16_STR" "$i" "$i" >> "$FAKE_LOG"
+done
+
+# 16d: Circuit Breaker MAX_LOCKS_PER_CYCLE=2 with 4 CRITICAL spammers -> locks ONLY 2, caps remaining 2!
+for u in 1 2 3 4; do
+    for i in $(seq 1 160); do
+        printf "%s mail postfix/submission/smtpd[2001]: QCAP%dX%03d: client=bot[203.0.113.%d], sasl_method=LOGIN, sasl_username=cap%d@company.com\n" "$S16_STR" "$u" "$i" "$u" "$u" >> "$FAKE_LOG"
+        printf "%s mail postfix/smtp[2005]: QCAP%dX%03d: to=<t%d@gmail.com>, relay=mx.gmail.com[1.2.3.4]:25, delay=0.2, status=sent (250 OK)\n" "$S16_STR" "$u" "$i" "$i" >> "$FAKE_LOG"
+    done
+done
+
+# 16e: Office NAT AUTH_AFTER_FAIL safeguard - colleague_a fails 6x on office IP, colleague_b succeeds -> NO alert for colleague_b!
+for i in $(seq 1 6); do
+    printf "%s,100 WARN  [qtp1-9] [name=colleague_a@company.com;ip=127.0.0.1;oip=198.51.100.77;] security - cmd=Auth; account=colleague_a@company.com; protocol=soap; error=authentication failed for [colleague_a@company.com], invalid password;\n" "$S16_ISO" >> "$FAKE_AUDIT_LOG"
+done
+printf "%s,500 INFO  [qtp1-9] [name=colleague_b@company.com;ip=127.0.0.1;oip=198.51.100.77;] security - cmd=Auth; account=colleague_b@company.com; protocol=soap;\n" "$S16_ISO" >> "$FAKE_AUDIT_LOG"
+
+CAP_CFG="$TEST_TMP/cap.conf"
+cp "$FAKE_CFG" "$CAP_CFG"
+sed -i 's|^MAX_LOCKS_PER_CYCLE=.*|MAX_LOCKS_PER_CYCLE=2|' "$CAP_CFG"
+sed -i 's|^CRIT_MESSAGES_SENT=.*|CRIT_MESSAGES_SENT=150|' "$CAP_CFG"
+sed -i 's|^WARN_MESSAGES_SENT=.*|WARN_MESSAGES_SENT=60|' "$CAP_CFG"
+
+run_scan "$S16_T" "$EMPTY_PQ" "$CAP_CFG"
+
+# Verify 16a: ceo_safe completely immune to inbound spoofed spam
+if grep -q "ceo_safe@company.com" "$FAKE_MAIL_OUT" || grep -q "ceo_safe@company.com" "$FAKE_ZMPROV_OUT"; then
+    echo " -> [FAIL] Inbound spoofed spam via Amavis/LMTP falsely impacted ceo_safe@company.com!"
+    exit 1
+fi
+
+# Verify 16b: single-message deferred BCC stays WARNING, never locked
+grep -q "bcc_defer@company.com" "$FAKE_MAIL_OUT"
+if grep -q "bcc_defer@company.com" "$FAKE_ZMPROV_OUT"; then
+    echo " -> [FAIL] Single deferred BCC email falsely auto-locked bcc_defer@company.com!"
+    exit 1
+fi
+
+# Verify 16c: protected Zimbra system account alerted but NOT locked
+grep -q "spam.xyz999@company.com" "$FAKE_MAIL_OUT"
+grep -q "Protected system account - alert only" "$FAKE_MAIL_OUT"
+if grep -q "spam.xyz999@company.com" "$FAKE_ZMPROV_OUT"; then
+    echo " -> [FAIL] Protected Zimbra system account spam.xyz999@company.com was falsely locked!"
+    exit 1
+fi
+
+# Verify 16d: MAX_LOCKS_PER_CYCLE=2 capped locks at exactly 2 out of 4 CRITICAL accounts
+CAP_LOCK_CNT=$(grep -c "ma cap[1-4]@company.com zimbraAccountStatus locked" "$FAKE_ZMPROV_OUT" || true)
+if [[ "$CAP_LOCK_CNT" -ne 2 ]]; then
+    echo " -> [FAIL] MAX_LOCKS_PER_CYCLE=2 locked ${CAP_LOCK_CNT} accounts instead of 2!"
+    exit 1
+fi
+grep -q "Safety cap: MAX_LOCKS_PER_CYCLE=2 reached" "$FAKE_MAIL_OUT"
+
+# Verify 16e: colleague_b on shared office NAT IP did NOT receive false AUTH_AFTER_FAIL alert
+if grep -q "colleague_b@company.com" "$FAKE_MAIL_OUT"; then
+    echo " -> [FAIL] Office NAT colleague_b@company.com triggered false AUTH_AFTER_FAIL alert!"
+    exit 1
+fi
+
+# Verify 16f: Fresh default cron file reports "Every 5 mins", NOT "Paused"
+CRON_MENU_OUT=$(printf "0\n" | ZSM_CONFIG_FILE="$FAKE_CFG" ZSM_CRON_FILE="$ROOT_DIR/packaging/cron.d/zimbra-spam-monitor" \
+    ZSM_DIG_CMD="$MOCK_DIG" ZSM_HOSTNAME_CMD="$MOCK_HOSTNAME" ZSM_HOSTNAME="mail.company.com" \
+    ZSM_UI_MODE="text" bash "$MONITOR_BIN" --text-menu 2>&1 || true)
+echo "$CRON_MENU_OUT" | grep -q "Check: Every 5 mins"
+if echo "$CRON_MENU_OUT" | grep -q "Check: Paused"; then
+    echo " -> [FAIL] Default cron.d file falsely displayed 'Check: Paused'!"
+    exit 1
+fi
+echo " -> [PASS] Inbound DoS immunity, 1-msg deferred guard, lock cap, system shield, NAT guard & cron status verified."
+
 echo ""
 echo "======================================================================"
-echo " ALL AUTOMATED TESTS (15/15) PASSED 100%!"
+echo " ALL AUTOMATED TESTS (16/16) PASSED 100%!"
 echo "======================================================================"

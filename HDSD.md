@@ -1,4 +1,4 @@
-# Hướng Dẫn Sử Dụng & Vận Hành Zimbra Outbound Spam Monitor (`v1.3.1`)
+# Hướng Dẫn Sử Dụng & Vận Hành Zimbra Outbound Spam Monitor (`v1.3.2`)
 
 Tài liệu này cung cấp cẩm nang chi tiết từ cài đặt, cấu hình, vận hành hằng ngày đến quy trình xử lý sự cố (SOP) dành cho Quản trị viên hệ thống (Sysadmin) vận hành máy chủ mail **Zimbra Collaboration Suite (ZCS 8 / 9 / 10)** trên Linux (RHEL, CentOS, Rocky Linux, AlmaLinux, Ubuntu, Debian).
 
@@ -38,22 +38,23 @@ Tài liệu này cung cấp cẩm nang chi tiết từ cài đặt, cấu hình,
 ## 2. Cài Đặt & Triển Khai Nhanh
 
 Ứng dụng được đóng gói sẵn dưới dạng `.rpm` và `.deb` tại trang GitHub Releases:
-👉 https://github.com/0xAndyNew/Monitor-Email-Spam-Zimbra/releases/tag/v1.3.1
+👉 https://github.com/0xAndyNew/Monitor-Email-Spam-Zimbra/releases/tag/v1.3.2
 
 ### A. Dành cho RHEL / CentOS / Rocky Linux / AlmaLinux (`.rpm`)
 Chạy với quyền `root` trên máy chủ Zimbra:
 ```bash
-wget -O zimbra-spam-monitor-1.3.1-1.noarch.rpm https://github.com/0xAndyNew/Monitor-Email-Spam-Zimbra/releases/download/v1.3.1/zimbra-spam-monitor-1.3.1-1.noarch.rpm
-rpm -Uvh zimbra-spam-monitor-1.3.1-1.noarch.rpm
+wget -O zimbra-spam-monitor-1.3.2-1.noarch.rpm https://github.com/0xAndyNew/Monitor-Email-Spam-Zimbra/releases/download/v1.3.2/zimbra-spam-monitor-1.3.2-1.noarch.rpm
+rpm -Uvh zimbra-spam-monitor-1.3.2-1.noarch.rpm
 ```
-*(Hoặc dùng `dnf localinstall -y zimbra-spam-monitor-1.3.1-1.noarch.rpm`)*
+*(Hoặc dùng `dnf localinstall -y zimbra-spam-monitor-1.3.2-1.noarch.rpm`)*
 
 ### B. Dành cho Ubuntu / Debian (`.deb`)
 Chạy với quyền `root` trên máy chủ Zimbra:
 ```bash
-wget -O zimbra-spam-monitor_1.3.1-1_all.deb https://github.com/0xAndyNew/Monitor-Email-Spam-Zimbra/releases/download/v1.3.1/zimbra-spam-monitor_1.3.1-1_all.deb
-dpkg -i zimbra-spam-monitor_1.3.1-1_all.deb
+wget -O zimbra-spam-monitor_1.3.2-1_all.deb https://github.com/0xAndyNew/Monitor-Email-Spam-Zimbra/releases/download/v1.3.2/zimbra-spam-monitor_1.3.2-1_all.deb
+apt install -y ./zimbra-spam-monitor_1.3.2-1_all.deb
 ```
+*(Hoặc dùng `dpkg -i zimbra-spam-monitor_1.3.2-1_all.deb && apt-get install -f -y` để tự cài thêm `gawk` nếu máy chưa có)*
 
 ### Cơ chế tự động kích hoạt sau khi cài đặt:
 - File nhị phân điều khiển chính: `/usr/bin/zimbra-spam-monitor`
@@ -104,7 +105,7 @@ Hệ thống tự động mở giao diện điều khiển bằng phím mũi tê
 
 ```text
 ==============================================================================
- ZIMBRA SPAM MONITOR v1.3.1
+ ZIMBRA SPAM MONITOR v1.3.2
 ------------------------------------------------------------------------------
  Service: ON | Check: Every 5 mins | Auto-Lock: ON | TG: ON | Mail: ON
 ------------------------------------------------------------------------------
@@ -160,7 +161,9 @@ Sysadmin có thể thực hiện mọi thao tác nhanh bằng một dòng lệnh
 | **11** | **Composite Risk Score** | Điểm rủi ro đa tiêu chí kết hợp (0 - 100) | `>= 60` điểm | `>= 85` điểm |
 
 ### Các Lớp Bảo Vệ Chống Khóa Nhầm Tuyệt Đối:
-- **Gửi thông báo nội bộ / BCC hợp lệ**: Người dùng gửi 1 email cho 200 đối tác cùng lúc (`Msgs = 1 < 10`) sẽ chỉ bị cảnh báo `WARNING`, **không bao giờ bị khóa tài khoản**.
+- **Gửi thông báo nội bộ / BCC hợp lệ**: Người dùng gửi 1 email cho 200 đối tác cùng lúc (`Msgs = 1 < 10`) — kể cả khi đường truyền/DNS chập chờn gây `deferred` — sẽ chỉ bị cảnh báo `WARNING`, **không bao giờ bị khóa tài khoản**.
+- **Miễn nhiễm tấn công ép khóa từ bên ngoài (Inbound Spoof DoS)**: Tách biệt hoàn toàn luồng thư chiều đến từ Internet kể cả khi đi qua Amavis (`127.0.0.1:10025`) và `postfix/lmtp[`, đảm bảo kẻ tấn công bên ngoài giả mạo `From` nội bộ không bao giờ có thể ép khóa tài khoản người dùng.
+- **Cầu chì giới hạn khóa (`MAX_LOCKS_PER_CYCLE=5`) & Bảo vệ tài khoản hệ thống**: Nếu có sự cố mạng/DNS diện rộng làm nhiều tài khoản vượt ngưỡng cùng lúc, hệ thống chỉ khóa tối đa 5 tài khoản/chu kỳ rồi chuyển sang chế độ cảnh báo; đồng thời luôn bảo vệ các tài khoản hệ thống Zimbra (`spam.*`, `ham.*`, `virus-quarantine.*`, `galsync.*`) và danh sách `PROTECTED_ACCOUNTS` tùy chọn.
 - **Chuyển tiếp thư tự động (Auto-Forward)**: Khi người dùng chuyển tiếp mail ra Gmail và Gmail phản hồi mã lỗi `5.7.1` (do nội dung gốc là spam), hệ thống nhận diện xuất xứ từ Webmail/Local và chỉ gửi `WARNING`, không khóa tài khoản.
 - **Mạng 4G/5G xoay IP liên tục**: Khi người dùng dùng 4G đổi IP liên tục trong cùng dải `/24` của nhà mạng, hệ thống gom chung thành 1 dải mạng duy nhất.
 - **Thư gửi lại (Deferred Retries)**: Postfix thử gửi lại thư cũ từ 30 phút trước sẽ không bị cộng dồn thành spam mới của chu kỳ 5 phút hiện tại.

@@ -7,3 +7,13 @@
     notifempty
     create 0640 root root
 }
+
+/var/lib/zimbra-spam-monitor/attacker_ips.log {
+    weekly
+    rotate 4
+    compress
+    delaycompress
+    missingok
+    notifempty
+    copytruncate
+}

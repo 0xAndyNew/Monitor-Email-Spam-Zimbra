@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # ==============================================================================
 # ZIMBRA OUTBOUND SPAM MONITOR & ALERT SYSTEM (zimbra-spam-monitor)
-# Version: 1.3.1
+# Version: 1.3.2
 # Supported OS: RHEL / CentOS / Rocky / AlmaLinux (.rpm) & Ubuntu / Debian (.deb)
 #
 # Safety Guarantee:
@@ -10,7 +10,7 @@
 # - Only writes to its own config/state/log files and locks confirmed CRITICAL
 #   compromised accounts (with optional per-account cache flush & queue hold).
 #
-# Key Capabilities (v1.3.1):
+# Key Capabilities (v1.3.2):
 # 1. Ultra-low CPU/RAM engine: Early timestamp pruning, per-second mktime() cache,
 #    C-speed grep pre-filter for mailbox/audit logs, single-pass whitelist load,
 #    24h Server IP & LDAP Multi-Domain cache (zero periodic JVM), self nice/ionice.
@@ -31,8 +31,9 @@
 # ==============================================================================
 
 set -u
+export LC_COLLATE=C LC_NUMERIC=C
 
-VERSION="1.3.1"
+VERSION="1.3.2"
 DEFAULT_CONFIG_FILE="/etc/zimbra-spam-monitor/config.conf"
 CONFIG_FILE="${ZSM_CONFIG_FILE:-$DEFAULT_CONFIG_FILE}"
 CRON_FILE="${ZSM_CRON_FILE:-/etc/cron.d/zimbra-spam-monitor}"
@@ -117,7 +118,10 @@ AUTO_LOCK_ON_CRITICAL="true"
 FLUSH_CACHE_ON_LOCK="true"
 LOCK_RELOCK_GRACE_SECONDS=120
 AUTO_HOLD_QUEUE_ON_CRITICAL="false"
+MAX_LOCKS_PER_CYCLE=5
+PROTECTED_ACCOUNTS=""
 ZMPROV_TIMEOUT_SECONDS=120
+POSTQUEUE_TIMEOUT_SECONDS=30
 
 # Telegram notifications
 TELEGRAM_ENABLED="true"
@@ -360,7 +364,10 @@ AUTO_LOCK_ON_CRITICAL="${AUTO_LOCK_ON_CRITICAL}"
 FLUSH_CACHE_ON_LOCK="${FLUSH_CACHE_ON_LOCK}"
 LOCK_RELOCK_GRACE_SECONDS=${LOCK_RELOCK_GRACE_SECONDS}
 AUTO_HOLD_QUEUE_ON_CRITICAL="${AUTO_HOLD_QUEUE_ON_CRITICAL}"
+MAX_LOCKS_PER_CYCLE=${MAX_LOCKS_PER_CYCLE}
+PROTECTED_ACCOUNTS="${PROTECTED_ACCOUNTS}"
 ZMPROV_TIMEOUT_SECONDS=${ZMPROV_TIMEOUT_SECONDS}
+POSTQUEUE_TIMEOUT_SECONDS=${POSTQUEUE_TIMEOUT_SECONDS}
 TELEGRAM_ENABLED="${TELEGRAM_ENABLED}"
 TELEGRAM_BOT_TOKEN="${TELEGRAM_BOT_TOKEN}"
 TELEGRAM_CHAT_ID="${TELEGRAM_CHAT_ID}"
@@ -493,6 +500,18 @@ record_attacker_ip() {
     ts_str=$(date -d "@$now_ts" '+%Y-%m-%d %H:%M:%S' 2>/dev/null || date '+%Y-%m-%d %H:%M:%S')
     mkdir -p "$STATE_DIR" 2>/dev/null || true
     printf '%s|%s|%s|%s\n' "$ts_str" "$ip" "$acct" "$reason" >> "$STATE_DIR/attacker_ips.log" 2>/dev/null || true
+}
+
+trim_attacker_ip_log() {
+    local ip_log="$STATE_DIR/attacker_ips.log"
+    [[ ! -f "$ip_log" ]] && return 0
+    local lines=0
+    lines=$(wc -l < "$ip_log" 2>/dev/null | tr -d ' ' || echo "0")
+    if [[ "$lines" =~ ^[0-9]+$ ]] && (( lines > 6000 )); then
+        local tmp_trim
+        tmp_trim=$(make_safe_tmp "zsm_iptrim")
+        tail -n 5000 "$ip_log" > "$tmp_trim" 2>/dev/null && mv -f "$tmp_trim" "$ip_log" 2>/dev/null || rm -f "$tmp_trim"
+    fi
 }
 
 read_localconfig_key() {
@@ -1149,8 +1168,30 @@ format_already_locked_msg() {
     fi
 }
 
+is_protected_system_account() {
+    local acct="${1,,}"
+    local local_part="${acct%@*}"
+    case "$local_part" in
+        spam.*|ham.*|virus-quarantine.*|galsync.*)
+            return 0
+            ;;
+    esac
+    if [[ -n "${PROTECTED_ACCOUNTS:-}" ]]; then
+        local p
+        for p in ${PROTECTED_ACCOUNTS//,/ }; do
+            p="${p,,}"
+            [[ -z "$p" ]] && continue
+            if [[ "$p" == "$acct" ]] || [[ "$p" == @* && "$acct" == *"$p" ]]; then
+                return 0
+            fi
+        done
+    fi
+    return 1
+}
+
+# Return codes for lock_flush: 0 = locked+flushed, 10 = locked (flush failed), 127 = zmprov missing, other = failed
 zmprov_account_action() {
-    local action="$1"   # "lock", "unlock", or "flush"
+    local action="$1"   # "lock", "lock_flush", "unlock", or "flush"
     local account="$2"
 
     if ! is_valid_email_account "$account"; then
@@ -1160,22 +1201,52 @@ zmprov_account_action() {
 
     if [[ -n "$ZSM_ZMPROV_CMD" ]]; then
         case "$action" in
-            lock)   run_with_timeout "$ZMPROV_TIMEOUT_SECONDS" "$ZSM_ZMPROV_CMD" ma "$account" zimbraAccountStatus locked >/dev/null 2>&1 ;;
-            unlock) run_with_timeout "$ZMPROV_TIMEOUT_SECONDS" "$ZSM_ZMPROV_CMD" ma "$account" zimbraAccountStatus active >/dev/null 2>&1 ;;
-            flush)  run_with_timeout "$ZMPROV_TIMEOUT_SECONDS" "$ZSM_ZMPROV_CMD" fc account "$account" >/dev/null 2>&1 ;;
+            lock)
+                run_with_timeout "$ZMPROV_TIMEOUT_SECONDS" "$ZSM_ZMPROV_CMD" ma "$account" zimbraAccountStatus locked >/dev/null 2>&1
+                return $?
+                ;;
+            lock_flush)
+                run_with_timeout "$ZMPROV_TIMEOUT_SECONDS" "$ZSM_ZMPROV_CMD" ma "$account" zimbraAccountStatus locked >/dev/null 2>&1 || return $?
+                if run_with_timeout "$ZMPROV_TIMEOUT_SECONDS" "$ZSM_ZMPROV_CMD" fc account "$account" >/dev/null 2>&1; then
+                    return 0
+                fi
+                return 10
+                ;;
+            unlock)
+                run_with_timeout "$ZMPROV_TIMEOUT_SECONDS" "$ZSM_ZMPROV_CMD" ma "$account" zimbraAccountStatus active >/dev/null 2>&1
+                return $?
+                ;;
+            flush)
+                run_with_timeout "$ZMPROV_TIMEOUT_SECONDS" "$ZSM_ZMPROV_CMD" fc account "$account" >/dev/null 2>&1
+                return $?
+                ;;
         esac
-        return $?
+        return 1
     fi
 
     if [[ ! -x /opt/zimbra/bin/zmprov ]]; then
         return 127
     fi
 
-    # Pass validated account via stdin to eliminate all shell quote/command injection vectors
+    # Pass validated account via stdin to eliminate all shell quote/command injection vectors.
+    # For lock_flush, batch lock + verify + flush into 1 single JVM invocation (50% less CPU/RAM).
     case "$action" in
         lock)
             printf '%s\n' "$account" | run_with_timeout "$ZMPROV_TIMEOUT_SECONDS" \
                 su - zimbra -c 'IFS= read -r a && exec /opt/zimbra/bin/zmprov ma "$a" zimbraAccountStatus locked' >/dev/null 2>&1
+            ;;
+        lock_flush)
+            local zm_out="" zm_rc=0
+            zm_out=$(printf 'ma %s zimbraAccountStatus locked\nga %s zimbraAccountStatus\nfc account %s\n' "$account" "$account" "$account" | \
+                run_with_timeout "$ZMPROV_TIMEOUT_SECONDS" su - zimbra -c 'exec /opt/zimbra/bin/zmprov' 2>&1) || zm_rc=$?
+            if printf '%s\n' "$zm_out" | grep -q 'zimbraAccountStatus: locked'; then
+                if printf '%s\n' "$zm_out" | grep -q 'ERROR:'; then
+                    return 10
+                fi
+                return 0
+            fi
+            (( zm_rc == 0 )) && zm_rc=1
+            return "$zm_rc"
             ;;
         unlock)
             printf '%s\n' "$account" | run_with_timeout "$ZMPROV_TIMEOUT_SECONDS" \
@@ -1188,13 +1259,19 @@ zmprov_account_action() {
     esac
 }
 
-# Return codes: 0 = locked/already locked/disabled cleanly; 1 = lock attempted and FAILED (will retry next cycle)
+# Return codes: 0 = locked/already locked/disabled/protected cleanly; 1 = lock attempted and FAILED (will retry next cycle)
 lock_zimbra_account() {
     local account="$1"
     local force_relock="${2:-false}"
 
     if ! is_valid_email_account "$account"; then
         echo "NOT LOCKED (Invalid or non-mailbox identity - manual check required)"
+        return 0
+    fi
+
+    if is_protected_system_account "$account"; then
+        log_msg "WARN" "Skipped auto-lock for protected/system account: ${account} (alert only)"
+        echo "NOT LOCKED (Protected system account - alert only)"
         return 0
     fi
 
@@ -1218,16 +1295,20 @@ lock_zimbra_account() {
         log_msg "CRITICAL" "Auto-locking compromised spam account: $account"
     fi
 
-    zmprov_account_action "lock" "$account"
-    local rc=$?
+    local rc=0 flush_note=""
+    if [[ "$FLUSH_CACHE_ON_LOCK" == "true" ]]; then
+        zmprov_account_action "lock_flush" "$account" || rc=$?
+        if (( rc == 0 )); then
+            flush_note=" + cache flushed"
+        elif (( rc == 10 )); then
+            rc=0
+        fi
+    else
+        zmprov_account_action "lock" "$account" || rc=$?
+    fi
+
     if (( rc == 0 )); then
         record_locked_account "$account"
-        local flush_note=""
-        if [[ "$FLUSH_CACHE_ON_LOCK" == "true" ]]; then
-            if zmprov_account_action "flush" "$account"; then
-                flush_note=" + cache flushed"
-            fi
-        fi
         if [[ "$force_relock" == "true" ]]; then
             echo "RE-LOCKED (Still sending after prior lock - re-locked via zmprov${flush_note})"
         else
@@ -1262,7 +1343,7 @@ hold_sender_queue() {
     [[ -z "$pq_bin" || -z "$ps_bin" ]] && return 0
 
     local qids_to_hold
-    qids_to_hold=$("$pq_bin" -p 2>/dev/null | awk -v target="${sender,,}" -v qmap="$qid_map_file" '
+    qids_to_hold=$(run_with_timeout "$POSTQUEUE_TIMEOUT_SECONDS" "$pq_bin" -p 2>/dev/null | awk -v target="${sender,,}" -v qmap="$qid_map_file" '
         BEGIN {
             if (qmap != "") {
                 while ((getline line < qmap) > 0) {
@@ -1307,7 +1388,7 @@ release_sender_held_queue() {
     [[ -z "$pq_bin" || -z "$ps_bin" ]] && echo "0" && return 1
 
     local qids_held
-    qids_held=$("$pq_bin" -p 2>/dev/null | awk -v target="${sender,,}" '
+    qids_held=$(run_with_timeout "$POSTQUEUE_TIMEOUT_SECONDS" "$pq_bin" -p 2>/dev/null | awk -v target="${sender,,}" '
         /^[0-9A-Za-z]+![[:space:]]+[0-9]+[[:space:]]/ {
             qid = $1; sub(/!$/, "", qid)
             if (tolower($7) == target) print qid
@@ -1775,7 +1856,7 @@ stream_zimbra_log_window() {
         if [[ -n "$prev_log" ]]; then
             tail -n "$LOG_TAIL_LINES" "$prev_log" 2>/dev/null
         fi
-        cat "$ZIMBRA_LOG_FILE" 2>/dev/null
+        tail -n "$LOG_MAX_TAIL_LINES" "$ZIMBRA_LOG_FILE" 2>/dev/null
         return 0
     fi
 
@@ -1861,7 +1942,7 @@ analyze_aux_zimbra_logs() {
         tail -n "$AUX_LOG_TAIL_LINES" "$ZIMBRA_AUDIT_LOG_FILE" 2>/dev/null | \
             grep -E "cmd=Auth|authentication failed|invalid password" 2>/dev/null | \
             "$awk_bin" -v win_cutoff="$win_cutoff" -v now_epoch="$now_epoch" -v local_ips="$local_ips" \
-                -v fail_min="$AUTH_FAIL_BEFORE_SUCCESS_MIN" -v web_out="$webmail_ips_out" '
+                -v fail_min="$AUTH_FAIL_BEFORE_SUCCESS_MIN" -v ip_fail_thresh="$WARN_AUTH_FAIL_PER_IP" -v web_out="$webmail_ips_out" '
             BEGIN {
                 n = split(local_ips, arr, /[[:space:],]+/)
                 for (i = 1; i <= n; i++) if (arr[i] != "") is_lip[arr[i]] = 1
@@ -1901,10 +1982,11 @@ analyze_aux_zimbra_logs() {
                     fail_ip[cip]++
                     if (acct != "") fail_pair[acct "|" cip]++
                 } else if (index($0, "cmd=Auth") > 0 && acct != "" && index(acct, "@") > 0) {
-                    # Successful auth: check if this IP had prior failures in this window
+                    # Successful auth: flag if THIS account failed >= fail_min from this IP,
+                    # OR if this IP exceeded mass brute-force threshold (prevents office NAT false alerts)
                     fp = fail_pair[acct "|" cip] + 0
                     fi = fail_ip[cip] + 0
-                    if (fp >= fail_min || fi >= fail_min) {
+                    if (fp >= fail_min || fi >= ip_fail_thresh) {
                         fc = (fp >= fail_min ? fp : fi)
                         if (!(acct in compromised) || fc > comp_cnt[acct]) {
                             compromised[acct] = cip
@@ -2167,7 +2249,10 @@ analyze_zimbra_log() {
                 aqid = ""
                 if (match($0, /Queue-ID: [0-9A-Za-z]+/)) {
                     aqid = substr($0, RSTART + 10, RLENGTH - 10)
-                    q_amavis_spam[aqid] = 1
+                    is_amavis_inbound = (index($0, "Inbound}") > 0 && index($0, "ORIGINATING") == 0 && index($0, "MYNETS") == 0 && !(aqid in q_sasl))
+                    if (!is_amavis_inbound) {
+                        q_amavis_spam[aqid] = 1
+                    }
                 }
                 if (index($0, "Blocked ") > 0 && (index($0, "ORIGINATING") > 0 || index($0, "MYNETS") > 0 || (aqid != "" && (aqid in q_sasl)))) {
                     asender = ""
@@ -2223,8 +2308,9 @@ analyze_zimbra_log() {
             next
         }
 
-        # 3. Local Zimbra Webmail / Trusted Submission (non-SASL smtpd)
+        # 3. Local Zimbra Webmail / Trusted Submission vs External Inbound (non-SASL smtpd)
         if ((index($0, "postfix/smtpd[") > 0 || index($0, "/smtpd[") > 0) && index($0, ": client=") > 0) {
+            is_filter_reinject = (index($0, "amavisd/smtpd[") > 0 || index($0, "dkimmilter/smtpd[") > 0)
             qid = ""
             if (match($0, /: [0-9A-Za-z]+: client=/)) {
                 qid = substr($0, RSTART + 2, RLENGTH - 11)
@@ -2236,12 +2322,17 @@ analyze_zimbra_log() {
                     cip = substr(cip, RSTART + 1, RLENGTH - 2)
                 }
             }
-            if (qid != "" && (cip in is_local_ip)) {
-                q_local_client[qid] = 1
-                if (!(qid in q_root)) q_root[qid] = qid
-                if (!(qid in q_birth_ts)) q_birth_ts[qid] = ts
-                if (!(qid in q_birth_hms) && line_hms != "") q_birth_hms[qid] = line_hms
-                if (!(qid in q_ip)) q_ip[qid] = "webmail/local"
+            if (qid != "" && !is_filter_reinject) {
+                if (cip in is_local_ip) {
+                    q_local_client[qid] = 1
+                    if (!(qid in q_root)) q_root[qid] = qid
+                    if (!(qid in q_birth_ts)) q_birth_ts[qid] = ts
+                    if (!(qid in q_birth_hms) && line_hms != "") q_birth_hms[qid] = line_hms
+                    if (!(qid in q_ip)) q_ip[qid] = "webmail/local"
+                } else if (cip != "") {
+                    # Unauthenticated external Internet inbound client -> never attribute to internal user
+                    q_ext_client[qid] = 1
+                }
             }
             next
         }
@@ -2303,6 +2394,10 @@ analyze_zimbra_log() {
                     if (qid in q_from) q_from[qid2] = q_from[qid]
                     if (qid in q_ip) q_ip[qid2] = q_ip[qid]
                     if (qid in q_local_client) q_local_client[qid2] = q_local_client[qid]
+                    if (qid in q_ext_client) {
+                        q_ext_client[qid2] = 1
+                        delete q_local_client[qid2]
+                    }
                     if (qid in q_pickup_uid) q_pickup_uid[qid2] = q_pickup_uid[qid]
                     if (qid in q_birth_ts) q_birth_ts[qid2] = q_birth_ts[qid]
                     if (qid in q_birth_hms) q_birth_hms[qid2] = q_birth_hms[qid]
@@ -2317,6 +2412,11 @@ analyze_zimbra_log() {
             sasl_user = (qid in q_sasl ? q_sasl[qid] : "")
             env_from  = (qid in q_from ? q_from[qid] : "")
             root_qid  = (qid in q_root ? q_root[qid] : qid)
+
+            # Never attribute unauthenticated external Internet inbound mail (even if spoofed From) to internal users
+            if (sasl_user == "" && ((qid in q_ext_client) || (root_qid in q_ext_client))) {
+                next
+            }
 
             rcpt = ""
             if (match($0, /to=<[^>]+>/)) {
@@ -2595,7 +2695,7 @@ analyze_postfix_queue() {
     pq_bin=$(find_postqueue_bin)
     [[ -z "$pq_bin" ]] && return 0
 
-    "$pq_bin" -p 2>/dev/null | awk -v sum_out="$summary_file" '
+    run_with_timeout "$POSTQUEUE_TIMEOUT_SECONDS" "$pq_bin" -p 2>/dev/null | awk -v sum_out="$summary_file" '
     BEGIN {
         total_q = 0; active_q = 0; hold_q = 0; def_q = 0
         cur_sender = ""
@@ -2981,16 +3081,18 @@ process_brute_force_alerts() {
     while IFS='|' read -r bip bcnt; do
         [[ -z "$bip" ]] && continue
         total_fails=$(( total_fails + bcnt ))
-        record_attacker_ip "$bip" "auth-bruteforce" "Failed logins (${bcnt} in ${LOOKBACK_MINUTES}m)"
         if (( shown < 10 )); then
             top_lines="${top_lines}  - ${bip}: ${bcnt} failed logins"$'\n'
             top_html="${top_html}  <code>$(html_escape "$bip")</code>: <b>${bcnt}</b> fails"$'\n'
             shown=$(( shown + 1 ))
         fi
     done < "$tmp_bf"
-    rm -f "$tmp_bf"
 
     if should_send_alert "__BRUTE_FORCE_SUMMARY__" "WARNING" "$AUTH_ALERT_COOLDOWN_MINUTES"; then
+        while IFS='|' read -r bip bcnt; do
+            [[ -z "$bip" ]] && continue
+            record_attacker_ip "$bip" "auth-bruteforce" "Failed logins (${bcnt} in ${LOOKBACK_MINUTES}m)"
+        done < "$tmp_bf"
         log_msg "WARNING" "Auth brute-force detected: ${total_ips} attacking IP(s), ${total_fails} failed logins in ${LOOKBACK_MINUTES}m"
         local tg_msg mail_body gjson wh_json
         tg_msg=$(cat <<EOF
@@ -3029,6 +3131,7 @@ EOF
             record_alert_state "__BRUTE_FORCE_SUMMARY__" "WARNING"
         fi
     fi
+    rm -f "$tmp_bf"
 }
 
 maybe_send_daily_summary() {
@@ -3264,6 +3367,7 @@ run_monitor_cycle() {
 
     local alerts_triggered=0
     local detail_alerts_sent=0
+    local locks_performed_in_cycle=0
     local overflow_count=0
     local overflow_lines=""
     local overflow_html=""
@@ -3344,7 +3448,8 @@ run_monitor_cycle() {
             fi
 
             # 4. Failed Rate ((Deferred + Bounced + Expired) / Recipients %)
-            if (( rcpts >= CRIT_MIN_RECIPIENTS_FOR_FAIL_RATE && fail_pct_x10 >= CRIT_FAILED_RATE_PCT * 10 )); then
+            # Requires CRIT_MIN_MESSAGES_FOR_BULK so 1 single BCC email deferred by a DNS/ISP hiccup stays WARNING
+            if (( rcpts >= CRIT_MIN_RECIPIENTS_FOR_FAIL_RATE && msgs >= CRIT_MIN_MESSAGES_FOR_BULK && fail_pct_x10 >= CRIT_FAILED_RATE_PCT * 10 )); then
                 severity="CRITICAL"; has_non_spam_crit=1
                 reasons=$(append_reason "$reasons" "Failed Rate (${fail_pct_str}%>=${CRIT_FAILED_RATE_PCT}%)")
             elif (( rcpts >= MIN_RECIPIENTS_FOR_FAIL_RATE && fail_pct_x10 >= WARN_FAILED_RATE_PCT * 10 )); then
@@ -3534,7 +3639,23 @@ run_monitor_cycle() {
         local lock_rc=0
         local held_now=0
         if [[ "$severity" == "CRITICAL" ]]; then
-            action_taken=$(lock_zimbra_account "$sender" "$need_force_relock") || lock_rc=$?
+            local need_new_lock=0
+            if [[ "$AUTO_LOCK_ON_CRITICAL" == "true" ]] && is_valid_email_account "$sender" && ! is_protected_system_account "$sender"; then
+                if [[ "$need_force_relock" == "true" ]] || ! is_account_already_locked "$sender"; then
+                    need_new_lock=1
+                fi
+            fi
+
+            if (( need_new_lock == 1 && MAX_LOCKS_PER_CYCLE > 0 && locks_performed_in_cycle >= MAX_LOCKS_PER_CYCLE )); then
+                action_taken="NOT LOCKED (Safety cap: MAX_LOCKS_PER_CYCLE=${MAX_LOCKS_PER_CYCLE} reached - check for outage)"
+                log_msg "WARN" "Skipped auto-lock for ${sender}: MAX_LOCKS_PER_CYCLE (${MAX_LOCKS_PER_CYCLE}) reached in this cycle"
+            else
+                action_taken=$(lock_zimbra_account "$sender" "$need_force_relock") || lock_rc=$?
+                if (( need_new_lock == 1 && lock_rc == 0 )); then
+                    locks_performed_in_cycle=$(( locks_performed_in_cycle + 1 ))
+                fi
+            fi
+
             held_now=$(hold_sender_queue "$sender" "$tmp_qid_map" "false")
             if [[ "$held_now" =~ ^[0-9]+$ ]] && (( held_now > 0 )); then
                 action_taken="${action_taken} | Held ${held_now} queued"
@@ -3771,6 +3892,7 @@ EOF
     # 6. Post-scan checks (run AFTER remediation so DNS latency never delays account locking)
     run_rbl_check "auto"
     maybe_send_daily_summary "$tmp_roll_sum" "$srv_host" "$srv_ip" "$total_queue"
+    trim_attacker_ip_log
 
     printf '%s\n' "$now_epoch" > "$last_run_file" 2>/dev/null || true
     _cleanup_run_cycle
@@ -4018,12 +4140,12 @@ get_current_cron_interval() {
         echo "Not configured"
         return
     fi
-    if grep -q "^#.*zimbra-spam-monitor" "$CRON_FILE" 2>/dev/null; then
+    local spec
+    spec=$(awk '/zimbra-spam-monitor/ && !/^[[:space:]]*#/ {print $1; exit}' "$CRON_FILE" 2>/dev/null || true)
+    if [[ -z "$spec" ]]; then
         echo "Paused"
         return
     fi
-    local spec
-    spec=$(awk '/zimbra-spam-monitor/ && !/^#/ {print $1}' "$CRON_FILE" 2>/dev/null | head -n 1)
     case "$spec" in
         "*"|"*/1") echo "Every 1 min" ;;
         "*/2")     echo "Every 2 mins" ;;
@@ -4431,6 +4553,8 @@ submenu_thresholds() {
                         update_cfg_num "CRIT_QUEUE_PER_USER" 60
                         update_cfg_num "WARN_HOURLY_MESSAGES" 150
                         update_cfg_num "CRIT_HOURLY_MESSAGES" 300
+                        update_cfg_num "WARN_HOURLY_RECIPIENTS" 250
+                        update_cfg_num "CRIT_HOURLY_RECIPIENTS" 500
                         ui_msg_box "PRESET APPLIED" "Applied STRICT profile (Warn >= 50 | Lock >= 100 emails in ${LOOKBACK_MINUTES}m)."
                         ;;
                     2)
@@ -4439,6 +4563,8 @@ submenu_thresholds() {
                         update_cfg_num "CRIT_QUEUE_PER_USER" 100
                         update_cfg_num "WARN_HOURLY_MESSAGES" 300
                         update_cfg_num "CRIT_HOURLY_MESSAGES" 600
+                        update_cfg_num "WARN_HOURLY_RECIPIENTS" 500
+                        update_cfg_num "CRIT_HOURLY_RECIPIENTS" 1000
                         ui_msg_box "PRESET APPLIED" "Applied NORMAL profile (Warn >= 100 | Lock >= 200 emails in ${LOOKBACK_MINUTES}m)."
                         ;;
                     3)
@@ -4447,6 +4573,8 @@ submenu_thresholds() {
                         update_cfg_num "CRIT_QUEUE_PER_USER" 200
                         update_cfg_num "WARN_HOURLY_MESSAGES" 600
                         update_cfg_num "CRIT_HOURLY_MESSAGES" 1200
+                        update_cfg_num "WARN_HOURLY_RECIPIENTS" 1000
+                        update_cfg_num "CRIT_HOURLY_RECIPIENTS" 2000
                         ui_msg_box "PRESET APPLIED" "Applied HIGH-VOLUME profile (Warn >= 200 | Lock >= 400 emails in ${LOOKBACK_MINUTES}m)."
                         ;;
                 esac

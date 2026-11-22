@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-`zimbra-spam-monitor` (v1.3.1) is an ultra-lightweight, multi-signal & multi-window outbound email spam detection, alerting (Telegram + Email + Webhook + JSONL), and single-account auto-locking tool for Zimbra Collaboration Suite (ZCS) on Linux. It operates without persistent background daemons via cron checks, minimizes CPU/RAM with early timestamp pruning and per-second `mktime()` caching, and avoids periodic Zimbra JVM (`zmprov`) calls.
+`zimbra-spam-monitor` (v1.3.2) is an ultra-lightweight, multi-signal & multi-window outbound email spam detection, alerting (Telegram + Email + Webhook + JSONL), and single-account auto-locking tool for Zimbra Collaboration Suite (ZCS) on Linux. It operates without persistent background daemons via cron checks, minimizes CPU/RAM with early timestamp pruning and per-second `mktime()` caching, and avoids periodic Zimbra JVM (`zmprov`) calls.
 
 ## Strict Safety Invariant (Zero Mail Server / OS Mutation)
 
@@ -23,7 +23,7 @@ bash tests/run_test.sh
 
 The 15 stages cover:
 1. Bash syntax (`bash -n`) & static Zero-Server/OS-Mutation safety audit
-2. 100% 7-bit ASCII encoding & `.deb`/`.rpm` `v1.3.1-1` binary structure inspection
+2. 100% 7-bit ASCII encoding & `.deb`/`.rpm` `v1.3.2-1` binary structure inspection
 3. Simulated single-server Zimbra environment (`zimbra.log`, `mailbox.log`, `audit.log` + mocks)
 4. Multi-signal scan (`--run`), Amavis 2-hop correlation, `zmprov fc account`, exact 5m `sys_tot`
 5. Cooldown, Long Queue IDs, decoupled lock retry on `zmprov` failure, Held (`!`) queue exclusion
@@ -37,6 +37,7 @@ The 15 stages cover:
 13. Self-RBL (`127.255.255.x` query-error guard & state-change alerting), read-only `--audit`, Webhook, JSONL, Outbox retry
 14. Admin `--unlock` (clears rolling history), `--status` dashboard & 24h `server_ip.cache`
 15. Interactive Control Panel (`--text-menu`) & exact whitelist removal
+16. v1.3.2 safety hardening: inbound LMTP spoof DoS immunity, single-msg deferred guard, `MAX_LOCKS_PER_CYCLE` circuit breaker, protected system account shield, office NAT `AUTH_AFTER_FAIL` guard & cron status fix
 
 ### Syntax & Packaging
 
@@ -47,8 +48,8 @@ python3 packaging/build_rpm_deb.py
 ```
 
 Generated packages in repository root:
-- `zimbra-spam-monitor_1.3.1-1_all.deb`
-- `zimbra-spam-monitor-1.3.1-1.noarch.rpm`
+- `zimbra-spam-monitor_1.3.2-1_all.deb`
+- `zimbra-spam-monitor-1.3.2-1.noarch.rpm`
 
 ### Local CLI & Mock Environment Variables
 
@@ -70,13 +71,13 @@ Available mock/override environment variables:
 ### File Organization
 
 - `src/zimbra-spam-monitor`: Monolithic Bash executable containing CLI, TUI, ultra-low-RAM log analysis engine, remediation, outbox/alerting, Self-RBL, and read-only `--audit`.
-- `config/config.conf`: Default configuration template (all v1.3.1 knobs have safe defaults in script for seamless upgrades).
+- `config/config.conf`: Default configuration template (all v1.3.2 knobs have safe defaults in script for seamless upgrades).
 - `config/whitelist.conf`: Supports both full bypass (`email` / `@domain`) and Per-Account Custom Limits (`email WARN CRIT`).
 - `packaging/build_rpm_deb.py`: Pure-Python builder creating `.deb` (ar + tar.gz) and `.rpm` (RPM v4 + CPIO).
 - `packaging/zimbra-spam-monitor.spec`: RPM spec file for `rpmbuild`.
 - `packaging/cron.d/zimbra-spam-monitor`: Default 5-minute cron schedule.
 - `packaging/logrotate.d/zimbra-spam-monitor`: Rotates both `/var/log/zimbra-spam-monitor.log` and `/var/log/zimbra-spam-monitor-events.jsonl`.
-- `tests/run_test.sh`: 15-stage self-contained integration & security test suite.
+- `tests/run_test.sh`: 16-stage self-contained integration & security test suite.
 
 ### Critical Production Invariants
 

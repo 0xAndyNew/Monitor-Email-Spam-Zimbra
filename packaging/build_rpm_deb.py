@@ -17,7 +17,7 @@ if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
 PKG_NAME = "zimbra-spam-monitor"
-PKG_VERSION = "1.3.1"
+PKG_VERSION = "1.3.2"
 PKG_RELEASE = "1"
 PKG_SUMMARY = "Zimbra Outbound Email Spam Monitor & Alert System (Telegram + Email + Webhook)"
 PKG_DESC = (
@@ -51,7 +51,7 @@ chmod 0644 /etc/cron.d/zimbra-spam-monitor 2>/dev/null || true
 chmod 0755 /usr/bin/zimbra-spam-monitor 2>/dev/null || true
 
 echo "======================================================================"
-echo " [OK] Installed successfully: zimbra-spam-monitor v1.3.1"
+echo " [OK] Installed successfully: zimbra-spam-monitor v1.3.2"
 echo "----------------------------------------------------------------------"
 echo " -> Run the command below to open the INTERACTIVE CONTROL PANEL:"
 echo "      zimbra-spam-monitor"
